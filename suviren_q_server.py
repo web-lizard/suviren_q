@@ -70,6 +70,11 @@ class RenderRequest(BaseModel):
     font: str | None = None
 
 
+
+class SaveChaptersRequest(BaseModel):
+    path: str = "_suviren_q_build/chapters.manual.json"
+    chapters: list[dict[str, Any]]
+
 def resolve_path(value: str | None) -> Path | None:
     if not value:
         return None
@@ -257,6 +262,30 @@ def get_job(job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
 
+
+
+@app.post("/api/save-chapters")
+def save_chapters(data: SaveChaptersRequest) -> dict[str, Any]:
+    p = resolve_path(data.path)
+    if not p:
+        raise HTTPException(status_code=400, detail="Invalid chapters path")
+
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        p.write_text(
+            json.dumps(data.chapters, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+            newline="\n",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Cannot save chapters: {exc}")
+
+    return {
+        "ok": True,
+        "path": str(p),
+        "count": len(data.chapters),
+    }
 
 @app.get("/api/chapters")
 def get_chapters(path: str = "_suviren_q_build/chapters.detected.json") -> dict[str, Any]:
