@@ -11,3 +11,24 @@ _suviren_q_build/
 *.mkv
 __pycache__/
 *.pyc
+# suviren-q local/build files
+_suviren_q_local/
+
+# Python
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Media and heavy files
+*.aac
+*.ogg
+
+# REAPER projects usually contain local paths and private project data
+*.rpp
+node_modules/
+ui/node_modules/
+ui/dist/
+.env
+.env.local
