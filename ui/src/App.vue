@@ -289,7 +289,8 @@ function runPreview() {
     cover: form.cover,
     chapters: form.chapters,
     background: form.background || null,
-    font: form.font || null
+    font: form.font || null,
+    waveform: form.waveform
   })
 }
 
@@ -412,6 +413,14 @@ onMounted(async () => {
             <option value="cyber-zina">cyber-zina</option>
             <option value="imperial-dark">imperial-dark</option>
             <option value="clean-audiobook">clean-audiobook</option>
+          </select>
+        </label>
+
+        <label>
+          <span>Waveform MP4</span>
+          <select v-model="form.waveform">
+            <option value="ffmpeg">ffmpeg live wave</option>
+            <option value="static">static panel only</option>
           </select>
         </label>
       </aside>

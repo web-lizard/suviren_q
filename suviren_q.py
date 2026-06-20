@@ -1037,8 +1037,45 @@ def render_segment(
     width: int,
     height: int,
     dry_run: bool = False,
+    waveform: str = "static",
 ) -> None:
     ensure_dir(out.parent)
+
+    if waveform == "ffmpeg":
+        wave_height = max(110, int(height * 0.14))
+        wave_y = height - wave_height - int(height * 0.045)
+
+        filter_complex = (
+            f"[0:v]scale={width}:{height},format=rgba[base];"
+            f"[1:a]showwaves=s={width}x{wave_height}:mode=cline:rate={fps}:"
+            f"colors=0x7fffe0|0xb69aff,format=rgba,colorchannelmixer=aa=0.72[wave];"
+            f"[base][wave]overlay=x=0:y={wave_y}:format=auto,format=yuv420p[v]"
+        )
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1",
+            "-framerate", str(fps),
+            "-i", str(panel),
+            "-ss", f"{start:.3f}",
+            "-t", f"{duration:.3f}",
+            "-i", str(audio),
+            "-filter_complex", filter_complex,
+            "-map", "[v]",
+            "-map", "1:a:0",
+            "-shortest",
+            "-r", str(fps),
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "20",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            str(out),
+        ]
+        run_cmd(cmd, dry_run=dry_run)
+        return
+
     cmd = [
         "ffmpeg", "-y",
         "-loop", "1",
@@ -1259,6 +1296,7 @@ def cmd_render(args: argparse.Namespace) -> None:
             width=args.width,
             height=args.height,
             dry_run=args.dry_run,
+            waveform=args.waveform,
         )
         segments.append(segment)
 
@@ -1328,6 +1366,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     p_render.add_argument("--min-item-length", type=float, default=30.0)
     p_render.add_argument("--out", required=True, help="Output MP4")
     p_render.add_argument("--fps", type=int, default=DEFAULT_FPS)
+    p_render.add_argument("--waveform", choices=["static", "ffmpeg"], default="static", help="Audio visualization mode")
     p_render.add_argument("--dry-run", action="store_true")
     add_visual_args(p_render)
     p_render.set_defaults(func=cmd_render)

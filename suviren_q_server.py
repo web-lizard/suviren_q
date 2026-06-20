@@ -59,6 +59,7 @@ class PreviewRequest(BaseModel):
     chapters: str = "_suviren_q_build/chapters.detected.json"
     background: str | None = None
     font: str | None = None
+    waveform: str = "static"
 
 
 class RenderRequest(BaseModel):
@@ -68,6 +69,7 @@ class RenderRequest(BaseModel):
     out: str = "intimny_protokol_video.mp4"
     background: str | None = None
     font: str | None = None
+    waveform: str = "static"
 
 
 
@@ -250,6 +252,9 @@ def render(data: RenderRequest) -> dict[str, str]:
 
     if data.font:
         cmd += ["--font", str(resolve_path(data.font))]
+
+    if data.waveform:
+        cmd += ["--waveform", data.waveform]
 
     job_id = start_job("render", cmd)
     return {"job_id": job_id}
