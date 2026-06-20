@@ -16,9 +16,9 @@ const logOpen = ref(true)
 const manualPath = '_suviren_q_build/chapters.manual.json'
 
 const form = reactive({
-  rpp: 'зина книга вступление.rpp',
-  rpp_track: 'КНИГА ОЗВУЧКА',
-  chapter_pattern: 'Глава',
+  rpp: '???? ????? ??????????.rpp',
+  rpp_track: '????? ???????',
+  chapter_pattern: '?????',
   add_intro: true,
   origin: 'project',
   offset: 0,
@@ -328,7 +328,221 @@ onMounted(async () => {
 
       <div class="top-actions">
         <div class="status-pill" :class="{ ok: apiOk, bad: !apiOk }">
-          <span>Название</span>
+          <span></span>
+          API {{ apiOk ? 'online' : 'offline' }}
+        </div>
+
+        <button @click="runInspect">??????? ?????</button>
+        <button @click="runPreview">Preview PNG</button>
+        <button class="primary" @click="runRender">Render MP4</button>
+      </div>
+    </header>
+
+    <section class="workspace">
+      <aside class="left-panel panel">
+        <div class="panel-title">
+          <h2>??????</h2>
+          <small>?????????</small>
+        </div>
+
+        <label>
+          <span>REAPER .rpp</span>
+          <input v-model="form.rpp" />
+        </label>
+
+        <label>
+          <span>??????? ????</span>
+          <input v-model="form.rpp_track" />
+        </label>
+
+        <label>
+          <span>??????? ?????</span>
+          <input v-model="form.chapter_pattern" />
+        </label>
+
+        <div class="field-grid">
+          <label>
+            <span>Origin</span>
+            <select v-model="form.origin">
+              <option value="project">project</option>
+              <option value="first-chapter">first-chapter</option>
+            </select>
+          </label>
+
+          <label>
+            <span>Offset</span>
+            <input v-model="form.offset" type="number" step="0.001" />
+          </label>
+        </div>
+
+        <label class="checkbox">
+          <input v-model="form.add_intro" type="checkbox" />
+          <span>?????????? ?? ?????? ?????</span>
+        </label>
+
+        <div class="panel-separator"></div>
+
+        <label>
+          <span>Audio</span>
+          <input v-model="form.audio" />
+        </label>
+
+        <label>
+          <span>Cover</span>
+          <input v-model="form.cover" />
+        </label>
+
+        <label>
+          <span>Background</span>
+          <input v-model="form.background" placeholder="???????????" />
+        </label>
+
+        <label>
+          <span>Chapters JSON</span>
+          <input v-model="form.chapters" />
+        </label>
+
+        <label>
+          <span>Output MP4</span>
+          <input v-model="form.out" />
+        </label>
+
+        <label>
+          <span>Theme</span>
+          <select v-model="form.theme">
+            <option value="cyber-zina">cyber-zina</option>
+            <option value="imperial-dark">imperial-dark</option>
+            <option value="clean-audiobook">clean-audiobook</option>
+          </select>
+        </label>
+
+        <label>
+          <span>Waveform MP4</span>
+          <select v-model="form.waveform">
+            <option value="ffmpeg">ffmpeg live wave</option>
+            <option value="static">static panel only</option>
+          </select>
+        </label>
+      </aside>
+
+      <section class="center-stage">
+        <div class="viewer-toolbar">
+          <div>
+            <div class="kicker">Program monitor</div>
+            <strong>{{ selectedChapter ? shortTitle(selectedChapter.title) : '??? ?????' }}</strong>
+          </div>
+
+          <div class="viewer-meta">
+            <span>{{ chapters.length }} ??????</span>
+            <span>{{ formatClock(totalDuration) }}</span>
+            <span>{{ statusLabel }}</span>
+          </div>
+        </div>
+
+        <div class="viewer">
+          <div class="video-frame">
+            <div class="bg-orb one"></div>
+            <div class="bg-orb two"></div>
+
+            <div class="book-cover">
+              <div class="cover-inner">
+                <div class="cover-label">???????? ????????</div>
+                <div class="cover-main">????</div>
+                <div class="cover-foot">??????????</div>
+              </div>
+            </div>
+
+            <div class="now-playing">
+              <div class="kicker">?????? ??????</div>
+              <h2>{{ selectedChapter ? shortTitle(selectedChapter.title) : '?????? ????? ?? ?????????' }}</h2>
+
+              <div class="time-row">
+                <span>{{ selectedChapter ? formatClock(getStartSeconds(selectedChapter)) : '00:00:00' }}</span>
+                <span>{{ formatClock(selectedDuration) }}</span>
+                <span>{{ selectedChapter ? formatClock(getEndSeconds(selectedChapter)) : '00:00:00' }}</span>
+              </div>
+
+              <div class="waveform">
+                <i v-for="n in 72" :key="n" :style="{ '--i': n }"></i>
+              </div>
+
+              <div class="toc-preview">
+                <div
+                  v-for="item in visibleToc"
+                  :key="item.index"
+                  class="toc-row"
+                  :class="{ active: item.index === selectedIndex }"
+                >
+                  <b>{{ String(item.index + 1).padStart(2, '0') }}</b>
+                  <span>{{ shortTitle(item.chapter.title) }}</span>
+                  <em>{{ formatClock(getStartSeconds(item.chapter)) }}</em>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="timeline-panel panel">
+          <div class="timeline-head">
+            <div>
+              <div class="kicker">Timeline</div>
+              <strong>????? ???????</strong>
+            </div>
+
+            <div class="timeline-buttons">
+              <button @click="loadChapters">Reload</button>
+              <button @click="saveManualChapters">Save manual JSON</button>
+            </div>
+          </div>
+
+          <div class="time-ruler">
+            <span>00:00:00</span>
+            <span>{{ formatClock(totalDuration / 4) }}</span>
+            <span>{{ formatClock(totalDuration / 2) }}</span>
+            <span>{{ formatClock(totalDuration * 0.75) }}</span>
+            <span>{{ formatClock(totalDuration) }}</span>
+          </div>
+
+          <div class="timeline-scroll">
+            <div class="track-row chapters-track">
+              <button
+                v-for="seg in timelineSegments"
+                :key="seg.index"
+                class="clip"
+                :class="{ active: seg.index === selectedIndex }"
+                :style="{ width: seg.width + '%' }"
+                @click="selectChapter(seg.index)"
+                :title="shortTitle(seg.chapter.title)"
+              >
+                <span>{{ seg.index + 1 }}</span>
+              </button>
+            </div>
+
+            <div class="track-row voice-track">
+              <div
+                v-for="seg in timelineSegments"
+                :key="'v' + seg.index"
+                class="voice-block"
+                :style="{ width: seg.width + '%' }"
+              ></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="right-panel panel">
+        <div class="panel-title">
+          <h2>Inspector</h2>
+          <small>????? {{ selectedIndex + 1 }}</small>
+        </div>
+
+        <div v-if="!selectedChapter" class="empty">
+          ??????? ??????? ????? ?? RPP.
+        </div>
+
+        <template v-else>
+          <label>
+            <span>????????</span>
             <textarea v-model="draft.title" @change="applyDraft"></textarea>
           </label>
 
@@ -356,19 +570,19 @@ onMounted(async () => {
           </div>
 
           <div class="inspector-actions">
-            <button @click="selectChapter(selectedIndex - 1)">Назад</button>
-            <button @click="selectChapter(selectedIndex + 1)">Далее</button>
+            <button @click="selectChapter(selectedIndex - 1)">?????</button>
+            <button @click="selectChapter(selectedIndex + 1)">?????</button>
           </div>
 
           <button class="wide primary" @click="saveManualChapters">
-            Сохранить ручную карту
+            ????????? ?????? ?????
           </button>
 
           <div class="panel-separator"></div>
 
           <div class="file-box">
             <div class="kicker">Build files</div>
-            <div v-if="!buildFiles.length" class="empty small">Пока пусто.</div>
+            <div v-if="!buildFiles.length" class="empty small">???? ?????.</div>
             <div v-for="file in buildFiles.slice(0, 9)" :key="file.path" class="file-row">
               <span>{{ file.path }}</span>
               <em>{{ Math.round(file.size / 1024) }} KB</em>
@@ -380,12 +594,12 @@ onMounted(async () => {
 
     <section class="log-panel panel" :class="{ collapsed: !logOpen }">
       <button class="log-toggle" @click="logOpen = !logOpen">
-        Журнал: {{ statusLabel }}
+        ??????: {{ statusLabel }}
       </button>
 
       <div v-if="logOpen">
         <div v-if="lastError" class="error">{{ lastError }}</div>
-        <pre>{{ jobLog.length ? jobLog.join('\n') : 'Готов к работе. Запусти извлечение глав или рендер.' }}</pre>
+        <pre>{{ jobLog.length ? jobLog.join('\n') : '????? ? ??????. ??????? ?????????? ???? ??? ??????.' }}</pre>
       </div>
     </section>
   </main>
