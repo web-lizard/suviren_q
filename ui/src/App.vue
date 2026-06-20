@@ -16,9 +16,9 @@ const logOpen = ref(true)
 const manualPath = '_suviren_q_build/chapters.manual.json'
 
 const form = reactive({
-  rpp: '???? ????? ??????????.rpp',
-  rpp_track: '????? ???????',
-  chapter_pattern: '?????',
+  rpp: '\u0437\u0438\u043d\u0430 \u043a\u043d\u0438\u0433\u0430 \u0432\u0441\u0442\u0443\u043f\u043b\u0435\u043d\u0438\u0435.rpp',
+  rpp_track: '\u041a\u041d\u0418\u0413\u0410 \u041e\u0417\u0412\u0423\u0427\u041a\u0410',
+  chapter_pattern: '\u0413\u043b\u0430\u0432\u0430',
   add_intro: true,
   origin: 'project',
   offset: 0,
@@ -28,7 +28,8 @@ const form = reactive({
   chapters: '_suviren_q_build/chapters.detected.json',
   out: 'intimny_protokol_video.mp4',
   font: '',
-  theme: 'cyber-zina'
+  theme: 'cyber-zina',
+  waveform: 'ffmpeg'
 })
 
 const draft = reactive({
@@ -38,10 +39,10 @@ const draft = reactive({
 })
 
 const statusLabel = computed(() => {
-  if (jobStatus.value === 'running') return '???????????'
-  if (jobStatus.value === 'done') return '??????'
-  if (jobStatus.value === 'failed') return '??????'
-  return '????????'
+  if (jobStatus.value === 'running') return 'Running'
+  if (jobStatus.value === 'done') return 'Done'
+  if (jobStatus.value === 'failed') return 'Failed'
+  return 'Idle'
 })
 
 const selectedChapter = computed(() => chapters.value[selectedIndex.value] || null)
@@ -68,12 +69,7 @@ const timelineSegments = computed(() => {
   return chapters.value.map((ch, index) => {
     const duration = Math.max(1, getEndSeconds(ch) - getStartSeconds(ch))
     const width = Math.max(1.2, duration / totalDuration.value * 100)
-    return {
-      chapter: ch,
-      index,
-      duration,
-      width
-    }
+    return { chapter: ch, index, duration, width }
   })
 })
 
@@ -225,7 +221,7 @@ async function saveManualChapters() {
     form.chapters = manualPath
     lastError.value = ''
     jobLog.value = [
-      `[suviren-q] manual chapters saved`,
+      '[suviren-q] manual chapters saved',
       `[path] ${data.path}`,
       `[count] ${data.count}`
     ]
@@ -289,8 +285,7 @@ function runPreview() {
     cover: form.cover,
     chapters: form.chapters,
     background: form.background || null,
-    font: form.font || null,
-    waveform: form.waveform
+    font: form.font || null
   })
 }
 
@@ -302,7 +297,8 @@ function runRender() {
     chapters: form.chapters,
     out: form.out,
     background: form.background || null,
-    font: form.font || null
+    font: form.font || null,
+    waveform: form.waveform
   })
 }
 
@@ -332,7 +328,7 @@ onMounted(async () => {
           API {{ apiOk ? 'online' : 'offline' }}
         </div>
 
-        <button @click="runInspect">??????? ?????</button>
+        <button @click="runInspect">Extract chapters</button>
         <button @click="runPreview">Preview PNG</button>
         <button class="primary" @click="runRender">Render MP4</button>
       </div>
@@ -341,8 +337,8 @@ onMounted(async () => {
     <section class="workspace">
       <aside class="left-panel panel">
         <div class="panel-title">
-          <h2>??????</h2>
-          <small>?????????</small>
+          <h2>Project</h2>
+          <small>sources</small>
         </div>
 
         <label>
@@ -351,12 +347,12 @@ onMounted(async () => {
         </label>
 
         <label>
-          <span>??????? ????</span>
+          <span>Chapter track</span>
           <input v-model="form.rpp_track" />
         </label>
 
         <label>
-          <span>??????? ?????</span>
+          <span>Chapter pattern</span>
           <input v-model="form.chapter_pattern" />
         </label>
 
@@ -377,7 +373,7 @@ onMounted(async () => {
 
         <label class="checkbox">
           <input v-model="form.add_intro" type="checkbox" />
-          <span>?????????? ?? ?????? ?????</span>
+          <span>Add intro before first chapter</span>
         </label>
 
         <div class="panel-separator"></div>
@@ -394,7 +390,7 @@ onMounted(async () => {
 
         <label>
           <span>Background</span>
-          <input v-model="form.background" placeholder="???????????" />
+          <input v-model="form.background" placeholder="optional" />
         </label>
 
         <label>
@@ -429,11 +425,11 @@ onMounted(async () => {
         <div class="viewer-toolbar">
           <div>
             <div class="kicker">Program monitor</div>
-            <strong>{{ selectedChapter ? shortTitle(selectedChapter.title) : '??? ?????' }}</strong>
+            <strong>{{ selectedChapter ? shortTitle(selectedChapter.title) : 'No chapter' }}</strong>
           </div>
 
           <div class="viewer-meta">
-            <span>{{ chapters.length }} ??????</span>
+            <span>{{ chapters.length }} blocks</span>
             <span>{{ formatClock(totalDuration) }}</span>
             <span>{{ statusLabel }}</span>
           </div>
@@ -446,15 +442,15 @@ onMounted(async () => {
 
             <div class="book-cover">
               <div class="cover-inner">
-                <div class="cover-label">???????? ????????</div>
-                <div class="cover-main">????</div>
-                <div class="cover-foot">??????????</div>
+                <div class="cover-label">Intimate Protocol</div>
+                <div class="cover-main">ZINA</div>
+                <div class="cover-foot">audiobook</div>
               </div>
             </div>
 
             <div class="now-playing">
-              <div class="kicker">?????? ??????</div>
-              <h2>{{ selectedChapter ? shortTitle(selectedChapter.title) : '?????? ????? ?? ?????????' }}</h2>
+              <div class="kicker">Now playing</div>
+              <h2>{{ selectedChapter ? shortTitle(selectedChapter.title) : 'Select a chapter on timeline' }}</h2>
 
               <div class="time-row">
                 <span>{{ selectedChapter ? formatClock(getStartSeconds(selectedChapter)) : '00:00:00' }}</span>
@@ -486,7 +482,7 @@ onMounted(async () => {
           <div class="timeline-head">
             <div>
               <div class="kicker">Timeline</div>
-              <strong>????? ???????</strong>
+              <strong>Voice track</strong>
             </div>
 
             <div class="timeline-buttons">
@@ -533,16 +529,16 @@ onMounted(async () => {
       <aside class="right-panel panel">
         <div class="panel-title">
           <h2>Inspector</h2>
-          <small>????? {{ selectedIndex + 1 }}</small>
+          <small>chapter {{ selectedIndex + 1 }}</small>
         </div>
 
         <div v-if="!selectedChapter" class="empty">
-          ??????? ??????? ????? ?? RPP.
+          Extract chapters from RPP first.
         </div>
 
         <template v-else>
           <label>
-            <span>????????</span>
+            <span>Title</span>
             <textarea v-model="draft.title" @change="applyDraft"></textarea>
           </label>
 
@@ -570,19 +566,19 @@ onMounted(async () => {
           </div>
 
           <div class="inspector-actions">
-            <button @click="selectChapter(selectedIndex - 1)">?????</button>
-            <button @click="selectChapter(selectedIndex + 1)">?????</button>
+            <button @click="selectChapter(selectedIndex - 1)">Prev</button>
+            <button @click="selectChapter(selectedIndex + 1)">Next</button>
           </div>
 
           <button class="wide primary" @click="saveManualChapters">
-            ????????? ?????? ?????
+            Save manual chapters
           </button>
 
           <div class="panel-separator"></div>
 
           <div class="file-box">
             <div class="kicker">Build files</div>
-            <div v-if="!buildFiles.length" class="empty small">???? ?????.</div>
+            <div v-if="!buildFiles.length" class="empty small">No files yet.</div>
             <div v-for="file in buildFiles.slice(0, 9)" :key="file.path" class="file-row">
               <span>{{ file.path }}</span>
               <em>{{ Math.round(file.size / 1024) }} KB</em>
@@ -594,12 +590,12 @@ onMounted(async () => {
 
     <section class="log-panel panel" :class="{ collapsed: !logOpen }">
       <button class="log-toggle" @click="logOpen = !logOpen">
-        ??????: {{ statusLabel }}
+        Log: {{ statusLabel }}
       </button>
 
       <div v-if="logOpen">
         <div v-if="lastError" class="error">{{ lastError }}</div>
-        <pre>{{ jobLog.length ? jobLog.join('\n') : '????? ? ??????. ??????? ?????????? ???? ??? ??????.' }}</pre>
+        <pre>{{ jobLog.length ? jobLog.join('\n') : 'Ready. Extract chapters or render.' }}</pre>
       </div>
     </section>
   </main>
