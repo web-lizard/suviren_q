@@ -324,6 +324,51 @@ def build_files() -> dict[str, Any]:
     return {"files": result}
 
 
+# suviren-q layout API
+from pathlib import Path as _SQPath
+import json as _sq_json
+from fastapi import Body as _SQBody
+
+_SQ_ROOT = _SQPath(__file__).resolve().parent
+_SQ_BUILD_DIR = _SQ_ROOT / "_suviren_q_build"
+_SQ_LAYOUT_PATH = _SQ_BUILD_DIR / "layout.json"
+
+@app.get("/api/layout")
+def api_get_layout():
+    if not _SQ_LAYOUT_PATH.exists():
+        return {
+            "exists": False,
+            "path": str(_SQ_LAYOUT_PATH),
+            "layout": None,
+        }
+
+    try:
+        return {
+            "exists": True,
+            "path": str(_SQ_LAYOUT_PATH),
+            "layout": _sq_json.loads(_SQ_LAYOUT_PATH.read_text(encoding="utf-8")),
+        }
+    except Exception as exc:
+        return {
+            "exists": False,
+            "path": str(_SQ_LAYOUT_PATH),
+            "layout": None,
+            "error": str(exc),
+        }
+
+
+@app.post("/api/layout")
+def api_save_layout(payload: dict = _SQBody(...)):
+    _SQ_BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    _SQ_LAYOUT_PATH.write_text(
+        _sq_json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {
+        "ok": True,
+        "path": str(_SQ_LAYOUT_PATH),
+    }
+
 if __name__ == "__main__":
     import uvicorn
 
