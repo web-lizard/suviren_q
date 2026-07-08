@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 suviren-q: La Queue Souveraine
-MVP CLI for audiobook YouTube video assembly from audio + cover + REAPER RPP chapters.
+Audiobook → YouTube video builder with GPU-accelerated rendering.
 
 Commands:
-  install      - check/install Python deps and ffmpeg availability
-  inspect-rpp  - inspect REAPER .rpp and extract chapter timings
-  preview      - render PNG panels only
-  render       - render MP4 segments and concat final video
+  install          - check/install Python deps and ffmpeg availability
+  inspect-rpp      - inspect REAPER .rpp and extract chapter timings
+  preview          - render PNG panels only
+  render           - render MP4 segments and concat final video
+  serve            - start the API server
 
 Python 3.10+
 """
@@ -19,11 +20,13 @@ import argparse
 import csv
 import json
 import math
+import multiprocessing
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Optional
@@ -35,27 +38,58 @@ DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
 DEFAULT_FPS = 30
 
+# ── GPU encoder map ──────────────────────────────────────────────
+GPU_ENCODERS: dict[str, dict[str, Any]] = {
+    "nvidia_nvenc": {
+        "codec": "h264_nvenc",
+        "check_bin": "nvidia-smi",
+        "preset": "p7",
+        "tune": "hq",
+        "rc": "vbr",
+        "cq": 19,
+        "b_pyramid": 1,
+        "gpu": 0,
+        "label": "NVIDIA NVENC",
+    },
+    "amd_amf": {
+        "codec": "h264_amf",
+        "check_bin": "clinfo",
+        "check_sub": "amd",
+        "preset": "quality",
+        "rc": "cbr",
+        "cq": 20,
+        "gpu": 0,
+        "label": "AMD AMF",
+    },
+    "intel_qsv": {
+        "codec": "h264_qsv",
+        "check_bin": "vainfo",
+        "preset": "veryslow",
+        "global_quality": 20,
+        "gpu": 0,
+        "label": "Intel QSV",
+    },
+}
 
-# -----------------------------
-# Logging
-# -----------------------------
+DEFAULT_PRESET = "fast"      # fallback software preset
+
+
+# ── Logging ──────────────────────────────────────────────────────
 
 def log(msg: str) -> None:
-    print(f"[suviren-q] {msg}")
+    print(f"[suviren-q] {msg}", flush=True)
 
 
 def warn(msg: str) -> None:
-    print(f"[suviren-q][WARN] {msg}")
+    print(f"[suviren-q][WARN] {msg}", flush=True)
 
 
 def fail(msg: str, code: int = 1) -> None:
-    print(f"[suviren-q][ERROR] {msg}", file=sys.stderr)
+    print(f"[suviren-q][ERROR] {msg}", file=sys.stderr, flush=True)
     raise SystemExit(code)
 
 
-# -----------------------------
-# Models
-# -----------------------------
+# ── Models ───────────────────────────────────────────────────────
 
 @dataclass
 class Chapter:
@@ -159,9 +193,7 @@ class RppReport:
         }
 
 
-# -----------------------------
-# Generic helpers
-# -----------------------------
+# ── Generic helpers ──────────────────────────────────────────────
 
 def build_dir(base: Optional[Path] = None) -> Path:
     base = base or Path.cwd()
@@ -212,7 +244,6 @@ def parse_time_value(value: Any) -> float:
         return 0.0
     if re.fullmatch(r"-?\d+(?:\.\d+)?", s):
         return float(s)
-    # HH:MM:SS(.mmm) or MM:SS(.mmm)
     parts = s.split(":")
     try:
         if len(parts) == 3:
@@ -229,13 +260,17 @@ def parse_time_value(value: Any) -> float:
     raise ValueError(f"Cannot parse time value: {value!r}")
 
 
-def run_cmd(cmd: list[str], *, dry_run: bool = False) -> None:
+def run_cmd(cmd: list[str], *, dry_run: bool = False, capture: bool = False) -> Optional[str]:
     printable = " ".join(quote_for_log(x) for x in cmd)
     log(printable)
     if dry_run:
-        return
+        return None
     try:
+        if capture:
+            res = subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            return res.stdout
         subprocess.run(cmd, check=True)
+        return None
     except FileNotFoundError:
         fail(f"Command not found: {cmd[0]}")
     except subprocess.CalledProcessError as e:
@@ -284,9 +319,83 @@ def ensure_pillow(auto_install: bool = False) -> None:
         fail("Pillow installation failed. Try manually: python -m pip install pillow")
 
 
-# -----------------------------
-# ffprobe
-# -----------------------------
+# ── GPU detection ────────────────────────────────────────────────
+
+def detect_gpu_encoder() -> tuple[str, dict[str, Any]]:
+    """Auto-detect best GPU encoder; fallback to software libx264."""
+    for enc_name, enc in GPU_ENCODERS.items():
+        check = shutil.which(enc["check_bin"])
+        if not check:
+            continue
+        if enc_name == "nvidia_nvenc":
+            # nvidia-smi exists → NVENC
+            log(f"GPU encoder detected: {enc['label']}")
+            return enc_name, enc
+        if enc_name == "amd_amf":
+            # clinfo exists → check for AMD
+            try:
+                out = subprocess.run([check], capture_output=True, text=True, timeout=5)
+                if "amd" in out.stdout.lower() or "amd" in out.stderr.lower():
+                    log(f"GPU encoder detected: {enc['label']}")
+                    return enc_name, enc
+            except Exception:
+                continue
+        if enc_name == "intel_qsv":
+            log(f"GPU encoder detected: {enc['label']}")
+            return enc_name, enc
+
+    log("No GPU encoder detected; using software libx264")
+    return "software", {
+        "codec": "libx264",
+        "preset": DEFAULT_PRESET,
+        "crf": 20,
+        "label": "Software (libx264)",
+    }
+
+
+def encoder_ffmpeg_args(
+    enc: dict[str, Any],
+    width: int,
+    height: int,
+    fps: int,
+) -> list[str]:
+    """Build encoder-specific ffmpeg arguments."""
+    codec = enc["codec"]
+    args: list[str] = []
+
+    if codec == "libx264":
+        args += ["-c:v", "libx264", "-preset", enc.get("preset", DEFAULT_PRESET)]
+        args += ["-crf", str(enc.get("crf", 20))]
+    elif codec == "h264_nvenc":
+        args += ["-c:v", "h264_nvenc"]
+        args += ["-preset", enc.get("preset", "p7")]
+        args += ["-rc", enc.get("rc", "vbr")]
+        args += ["-cq", str(enc.get("cq", 19))]
+        args += ["-b:v", "0"]
+        if enc.get("b_pyramid"):
+            args += ["-b-pyramid", "1"]
+        if enc.get("gpu") is not None:
+            args += ["-gpu", str(enc["gpu"])]
+    elif codec == "h264_amf":
+        args += ["-c:v", "h264_amf"]
+        args += ["-quality", enc.get("preset", "quality")]
+        args += ["-rc", enc.get("rc", "cbr")]
+        args += ["-qp_i", str(enc.get("cq", 20))]
+        args += ["-qp_p", str(enc.get("cq", 20))]
+    elif codec == "h264_qsv":
+        args += ["-c:v", "h264_qsv"]
+        args += ["-preset", enc.get("preset", "veryslow")]
+        if "global_quality" in enc:
+            args += ["-global_quality", str(enc["global_quality"])]
+
+    # Common args
+    args += ["-r", str(fps)]
+    args += ["-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"]
+    args += ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
+    return args
+
+
+# ── ffprobe ──────────────────────────────────────────────────────
 
 def ffprobe_duration(path: Path) -> Optional[float]:
     if not path.exists():
@@ -312,9 +421,7 @@ def ffprobe_duration(path: Path) -> Optional[float]:
         return None
 
 
-# -----------------------------
-# Chapter JSON / CSV
-# -----------------------------
+# ── Chapter JSON / CSV ───────────────────────────────────────────
 
 def load_chapters(path: Path) -> list[Chapter]:
     if not path.exists():
@@ -377,9 +484,7 @@ def save_youtube_chapters(path: Path, chapters: list[Chapter]) -> None:
     log(f"Saved YouTube chapters TXT: {path}")
 
 
-# -----------------------------
-# REAPER RPP parser
-# -----------------------------
+# ── REAPER RPP parser ────────────────────────────────────────────
 
 def strip_reaper_quotes(s: str) -> str:
     s = s.strip()
@@ -393,199 +498,109 @@ def extract_quoted_or_token(rest: str) -> str:
     if not rest:
         return ""
     if rest.startswith('"'):
-        # REAPER strings are usually simple quoted strings. Escaped quotes are rare here.
         out = []
         escaped = False
         for ch in rest[1:]:
             if escaped:
                 out.append(ch)
                 escaped = False
-            elif ch == "\\":
-                # Keep backslashes in Windows paths, unless they escape a quote.
+            elif ch == '\\':
                 escaped = True
-                out.append(ch)
             elif ch == '"':
                 break
             else:
                 out.append(ch)
-        return "".join(out).strip()
-    return rest.split()[0].strip()
-
-
-def parse_name_line(line: str) -> Optional[str]:
-    m = re.match(r"^\s*NAME\s+(.+?)\s*$", line)
-    if not m:
-        return None
-    return strip_reaper_quotes(m.group(1))
-
-
-def parse_file_line(line: str) -> Optional[str]:
-    m = re.match(r"^\s*FILE\s+(.+?)\s*(?:\d+)?\s*$", line)
-    if not m:
-        return None
-    return extract_quoted_or_token(m.group(1))
-
-
-def parse_marker_line(line: str, line_no: int) -> Optional[RppMarker]:
-    s = line.strip()
-    if not s.startswith("MARKER"):
-        return None
-    # Common forms vary. We safely parse first number as position and quoted name if present.
-    # Examples usually contain: MARKER id pos "name" ...
-    parts = re.findall(r'"[^"]*"|\S+', s)
-    if len(parts) < 3:
-        return None
-    pos = None
-    for token in parts[1:]:
-        token_clean = token.strip('"')
-        if re.fullmatch(r"-?\d+(?:\.\d+)?", token_clean):
-            # First numeric token after marker id is often id, second is position.
-            if pos is None:
-                pos = token_clean
-            else:
-                pos = token_clean
-                break
-    if pos is None:
-        return None
-    name = ""
-    for token in parts:
-        if token.startswith('"') and token.endswith('"'):
-            name = strip_reaper_quotes(token)
-            break
-    # Region detection is intentionally conservative. Some RPP versions store marker/region flags differently.
-    # If a line contains REGION literally or has an obvious extra end value, it goes to regions.
-    kind = "region" if "REGION" in s.upper() else "marker"
-    return RppMarker(kind=kind, position=safe_float(pos), name=name, raw=s, line=line_no)
+        return "".join(out)
+    return rest.split()[0]
 
 
 def parse_rpp(path: Path) -> RppReport:
     if not path.exists():
         fail(f"RPP file not found: {path}")
-    text = path.read_text(encoding="utf-8", errors="replace")
-    lines = text.splitlines()
+    log(f"Parsing RPP: {path}")
 
     tracks: list[RppTrack] = []
     markers: list[RppMarker] = []
     regions: list[RppMarker] = []
-
     current_track: Optional[RppTrack] = None
-    in_item = False
-    item_depth = 0
-    item_line = 0
-    item_position: Optional[float] = None
-    item_length: Optional[float] = None
-    item_name = ""
-    item_file = ""
+    current_item: Optional[RppItem] = None
+
+    lines = path.read_text(encoding="utf-8-sig").splitlines()
 
     for line_no, line in enumerate(lines, start=1):
         stripped = line.strip()
-
-        marker = parse_marker_line(line, line_no)
-        if marker:
-            if marker.kind == "region":
-                regions.append(marker)
-            else:
-                markers.append(marker)
+        if not stripped:
+            continue
 
         if stripped.startswith("<TRACK"):
-            current_track = RppTrack(name=f"TRACK_{len(tracks)+1}", line=line_no, items=[])
+            current_track = RppTrack(name="", line=line_no, items=[])
             tracks.append(current_track)
-            in_item = False
-            item_depth = 0
+            m = re.search(r'NAME\s+"([^"]*)"', line)
+            if m:
+                current_track.name = m.group(1)
             continue
 
-        if current_track and not in_item:
-            name = parse_name_line(line)
-            if name is not None and current_track.name.startswith("TRACK_"):
-                current_track.name = name
-                continue
-
-        if current_track and stripped == "<ITEM":
-            in_item = True
-            item_depth = 1
-            item_line = line_no
-            item_position = None
-            item_length = None
-            item_name = ""
-            item_file = ""
+        if stripped.startswith(">") and current_track is not None:
+            current_track = None
             continue
 
-        if current_track and in_item:
-            # Parse only the first item NAME, before/inside source this normally remains stable.
-            if item_position is None:
-                m = re.match(r"^\s*POSITION\s+(-?\d+(?:\.\d+)?)", line)
-                if m:
-                    item_position = float(m.group(1))
-                    continue
-            if item_length is None:
-                m = re.match(r"^\s*LENGTH\s+(-?\d+(?:\.\d+)?)", line)
-                if m:
-                    item_length = float(m.group(1))
-                    continue
-            if not item_name:
-                name = parse_name_line(line)
-                if name is not None:
-                    item_name = name
-                    continue
-            if not item_file:
-                file_value = parse_file_line(line)
-                if file_value is not None:
-                    item_file = file_value
-                    continue
+        if stripped.startswith("<ITEM") and current_track is not None:
+            current_item = RppItem(track=current_track.name, position=0.0, length=0.0, line=line_no)
+            current_track.items.append(current_item)
+            m = re.search(r'POSITION\s+([\d.]+)', line)
+            if m:
+                current_item.position = float(m.group(1))
+            m = re.search(r'LENGTH\s+([\d.]+)', line)
+            if m:
+                current_item.length = float(m.group(1))
+            m = re.search(r'NAME\s+"([^"]*)"', line)
+            if m:
+                current_item.name = m.group(1)
+            # peek next lines for filename
+            continue
 
-            if stripped.startswith("<") and stripped != "<ITEM":
-                item_depth += 1
-            elif stripped == ">":
-                item_depth -= 1
-                if item_depth <= 0:
-                    if item_position is not None and item_length is not None:
-                        current_track.items.append(RppItem(
-                            track=current_track.name,
-                            position=item_position,
-                            length=item_length,
-                            name=item_name,
-                            file=item_file,
-                            line=item_line,
-                        ))
+        if stripped.startswith(">") and current_item is not None:
+            current_item = None
+            continue
+
+        if current_item is not None:
+            if stripped.startswith("FILE"):
+                parts = stripped.split(None, 1)
+                if len(parts) >= 2:
+                    current_item.file = extract_quoted_or_token(parts[1])
+            elif stripped.startswith("NAME"):
+                pass  # already captured; names can also be on sub-lines
+
+        if stripped.startswith("MARKER"):
+            parts = stripped.split()
+            if len(parts) >= 3 and parts[1].isdigit():
+                marker_kind = parts[2]
+                marker_position = 0.0
+                marker_name = ""
+                for part in parts[3:]:
+                    m = re.match(r"([\d.]+)", part)
+                    if m:
+                        marker_position = float(m.group(1))
                     else:
-                        warn(f"Skipped ITEM without POSITION/LENGTH near line {item_line}")
-                    in_item = False
-                    item_depth = 0
+                        marker_name = extract_quoted_or_token(part)
+                markers.append(RppMarker(kind=marker_kind, position=marker_position, name=marker_name, raw=stripped, line=line_no))
 
-    return RppReport(path=str(path), tracks=tracks, markers=markers, regions=regions)
+        if re.match(r'^\d+\s+"', stripped) or re.match(r'^\d+\s+\d+', stripped):
+            if "MARKER" not in stripped and "REGION" not in stripped and len(stripped.split()) >= 3:
+                pass  # skip non-marker lines that look like numbers
+
+    return RppReport(
+        path=str(path),
+        tracks=tracks,
+        markers=markers,
+        regions=regions,
+    )
 
 
-def clean_chapter_title(name: str) -> str:
-    title = Path(name.replace("\\", "/")).name
-    title = re.sub(r"\.(mp3|wav|m4a|flac|aac|ogg)$", "", title, flags=re.I)
-    title = re.sub(r"^\s*\d+\s*[-_.–—]+\s*", "", title).strip()
-    return title or name.strip() or "Без названия"
-
-
-def chapter_score(item: RppItem, pattern: str) -> int:
-    hay = f"{item.track}\n{item.name}\n{item.file}".lower()
-    p = pattern.lower().strip()
-    score = 0
-    if p and p in hay:
-        score += 100
-    if "глава" in hay:
-        score += 80
-    if "chapter" in hay:
-        score += 60
-    if re.search(r"(^|\D)\d{1,3}\s*[-_.–—]+\s*(глава|chapter)", hay):
-        score += 40
-    if item.length >= 60:
-        score += 20
-    if item.length >= 300:
-        score += 20
-    if any(x in hay for x in ["music", "музык", "zino", "logic", "smiley", "glitch", "bump", "theme"]):
-        score -= 70
-    return score
-
+# ── Chapter detection from RPP ───────────────────────────────────
 
 def detect_chapters_from_rpp(
     report: RppReport,
-    *,
     audio_duration: Optional[float] = None,
     rpp_track: str = "КНИГА ОЗВУЧКА",
     chapter_pattern: str = "Глава",
@@ -595,276 +610,188 @@ def detect_chapters_from_rpp(
     end_mode: str = "next-start",
     min_item_length: float = 30.0,
 ) -> list[Chapter]:
-    # MVP priority for this project: items on a chosen track.
-    track_filter = (rpp_track or "").lower().strip()
-    pattern = (chapter_pattern or "").lower().strip()
+    track: Optional[RppTrack] = None
+    for t in report.tracks:
+        if rpp_track.lower() in t.name.lower():
+            track = t
+            break
+    if not track:
+        warn(f"Track '{rpp_track}' not found. Using first track with chapter-like items.")
+        for t in report.tracks:
+            for it in t.items:
+                if chapter_pattern.lower() in it.name.lower():
+                    track = t
+                    break
+            if track:
+                break
+    if not track:
+        fail(f"No track with items matching chapter pattern '{chapter_pattern}'")
 
-    items: list[RppItem] = []
-    for tr in report.tracks:
-        if track_filter and track_filter not in tr.name.lower():
-            continue
-        for item in tr.items:
-            hay = f"{item.name}\n{item.file}".lower()
-            if pattern and pattern not in hay:
-                continue
-            if item.length < min_item_length:
-                continue
-            items.append(item)
+    log(f"Using track: '{track.name}' ({len(track.items)} items)")
 
+    # Filter items by name containing chapter_pattern
+    items = [it for it in track.items if chapter_pattern.lower() in it.name.lower() and it.length >= min_item_length]
     if not items:
-        warn("No chapter items found by track/pattern. Falling back to scored item candidates.")
-        candidates: list[tuple[int, RppItem]] = []
-        for tr in report.tracks:
-            for item in tr.items:
-                if item.length < min_item_length:
-                    continue
-                score = chapter_score(item, chapter_pattern)
-                if score >= 80:
-                    candidates.append((score, item))
-        candidates.sort(key=lambda x: (-x[0], x[1].position))
-        items = [it for _, it in candidates]
+        # fallback: all items in track
+        items = [it for it in track.items if it.length >= min_item_length]
 
-    if not items:
-        warn("No item-based chapters found. Trying markers.")
-        return detect_chapters_from_markers(report.markers, audio_duration=audio_duration, offset=offset)
-
-    items.sort(key=lambda i: i.position)
-    base_shift = 0.0
-    if origin == "first-chapter":
-        base_shift = -items[0].position
-        log(f"Origin first-chapter: applying base shift {base_shift:.3f}s")
-    total_shift = base_shift + offset
-    if abs(offset) > 0.0001:
-        log(f"Manual offset: {offset:.3f}s")
+    items.sort(key=lambda it: it.position)
 
     chapters: list[Chapter] = []
-
-    if add_intro and origin == "project":
-        intro_end = max(0.0, items[0].position + total_shift)
-        if intro_end > 1.0:
-            chapters.append(Chapter(
-                title="Вступление",
-                start_seconds=0.0,
-                end_seconds=intro_end,
-                source="rpp:intro-gap",
-                track=items[0].track,
-            ))
-
-    for idx, item in enumerate(items):
-        start = item.position + total_shift
-        if end_mode == "item-end":
-            end = item.end + total_shift
+    for i, it in enumerate(items):
+        title = it.name.strip() if it.name.strip() else f"Chapter {i+1}"
+        start = it.position + offset
+        if end_mode == "next-start" and i + 1 < len(items):
+            end = items[i + 1].position + offset
         else:
-            if idx + 1 < len(items):
-                end = items[idx + 1].position + total_shift
-            else:
-                end = item.end + total_shift
-                if audio_duration is not None and audio_duration > start:
-                    # If audio is rendered from project start, use full audio end if it is close or later.
-                    if origin == "project":
-                        end = min(audio_duration, max(end, item.end + total_shift))
-                    else:
-                        end = min(audio_duration, end)
-        start = max(0.0, start)
-        end = max(start + 0.01, end)
-        title_src = item.name or item.file
+            end = it.end + offset
         chapters.append(Chapter(
-            title=clean_chapter_title(title_src),
-            start_seconds=start,
-            end_seconds=end,
-            source="rpp:item",
-            raw_name=item.name,
-            file=item.file,
-            track=item.track,
+            title=title,
+            start_seconds=max(0.0, start),
+            end_seconds=max(0.0, end),
+            source="rpp",
+            raw_name=it.name,
+            file=it.file,
+            track=it.track,
         ))
 
-    return normalize_chapters(chapters)
+    # Shift timeline origin
+    if origin == "first-chapter" and chapters:
+        shift = chapters[0].start_seconds
+        for ch in chapters:
+            ch.start_seconds = max(0.0, ch.start_seconds - shift)
+            ch.end_seconds = max(0.0, ch.end_seconds - shift)
+
+    # Add intro if requested
+    if add_intro and origin == "project" and chapters and chapters[0].start_seconds > 2.0:
+        intro = Chapter(
+            title="Intro",
+            start_seconds=0.0,
+            end_seconds=chapters[0].start_seconds,
+            source="auto_intro",
+        )
+        chapters.insert(0, intro)
+
+    # Ensure last chapter extends to audio duration
+    if audio_duration is not None and chapters:
+        last = chapters[-1]
+        if last.end_seconds < audio_duration:
+            if audio_duration - last.end_seconds < 600:
+                last.end_seconds = audio_duration
+            else:
+                warn("Audio is much longer than last chapter, not extending")
+
+    chapters = normalize_chapters(chapters)
+    log(f"Detected {len(chapters)} chapters from RPP")
+    return chapters
 
 
-def detect_chapters_from_markers(markers: list[RppMarker], *, audio_duration: Optional[float], offset: float = 0.0) -> list[Chapter]:
-    good = [m for m in markers if m.name and ("глава" in m.name.lower() or "chapter" in m.name.lower())]
-    good.sort(key=lambda m: m.position)
-    chapters: list[Chapter] = []
-    for i, m in enumerate(good):
-        start = max(0.0, m.position + offset)
-        if i + 1 < len(good):
-            end = max(start + 0.01, good[i + 1].position + offset)
-        else:
-            end = audio_duration if audio_duration and audio_duration > start else start + 60.0
-        chapters.append(Chapter(title=clean_chapter_title(m.name), start_seconds=start, end_seconds=end, source="rpp:marker"))
-    return normalize_chapters(chapters)
+# ── Style presets ───────────────────────────────────────────────
 
+STYLE_PRESETS: dict[str, dict[str, Any]] = {
+    "deep-purple": {
+        "label": "Deep Purple",
+        "bg": (20, 18, 28),
+        "accent": (140, 60, 180),
+        "accent2": (180, 80, 220),
+        "text": (220, 220, 240),
+        "text_dim": (140, 140, 160),
+        "progress_bg": (40, 38, 48),
+        "waveform": (60, 55, 75),
+        "title_glow": True,
+    },
+    "obsidian": {
+        "label": "Obsidian",
+        "bg": (16, 16, 18),
+        "accent": (255, 165, 0),
+        "accent2": (255, 200, 50),
+        "text": (230, 230, 235),
+        "text_dim": (120, 120, 130),
+        "progress_bg": (35, 35, 40),
+        "waveform": (55, 55, 60),
+        "title_glow": False,
+    },
+    "emerald": {
+        "label": "Emerald",
+        "bg": (10, 22, 18),
+        "accent": (60, 210, 130),
+        "accent2": (100, 230, 170),
+        "text": (210, 230, 220),
+        "text_dim": (120, 150, 140),
+        "progress_bg": (25, 45, 38),
+        "waveform": (35, 65, 55),
+        "title_glow": False,
+    },
+    "rose": {
+        "label": "Rose",
+        "bg": (26, 14, 18),
+        "accent": (220, 80, 120),
+        "accent2": (240, 120, 160),
+        "text": (230, 215, 220),
+        "text_dim": (150, 120, 130),
+        "progress_bg": (48, 30, 36),
+        "waveform": (68, 50, 56),
+        "title_glow": True,
+    },
+    "ocean": {
+        "label": "Ocean",
+        "bg": (10, 18, 30),
+        "accent": (60, 160, 220),
+        "accent2": (100, 200, 255),
+        "text": (210, 220, 235),
+        "text_dim": (110, 140, 165),
+        "progress_bg": (22, 38, 55),
+        "waveform": (35, 55, 75),
+        "title_glow": False,
+    },
+    "mono": {
+        "label": "Monochrome",
+        "bg": (20, 20, 22),
+        "accent": (180, 180, 190),
+        "accent2": (220, 220, 230),
+        "text": (200, 200, 210),
+        "text_dim": (120, 120, 130),
+        "progress_bg": (40, 40, 44),
+        "waveform": (55, 55, 60),
+        "title_glow": False,
+    },
+    "midnight": {
+        "label": "Midnight",
+        "bg": (8, 8, 14),
+        "accent": (100, 80, 220),
+        "accent2": (140, 120, 255),
+        "text": (200, 200, 220),
+        "text_dim": (90, 90, 120),
+        "progress_bg": (22, 22, 38),
+        "waveform": (35, 35, 55),
+        "title_glow": True,
+    },
+}
 
-def analyze_chapter_gaps(chapters: list[Chapter]) -> list[dict[str, Any]]:
-    gaps = []
-    for prev, nxt in zip(chapters, chapters[1:]):
-        gap = nxt.start_seconds - prev.end_seconds
-        if abs(gap) > 0.001:
-            gaps.append({
-                "after": prev.title,
-                "before": nxt.title,
-                "gap_seconds": round(gap, 3),
-                "kind": "gap" if gap > 0 else "overlap",
-            })
-    return gaps
+# ── Panel drawing ────────────────────────────────────────────────
 
-
-# -----------------------------
-# Pillow panels
-# -----------------------------
-
-def import_pillow():
+def rgb_or_default(color: Optional[str], default: tuple[int, int, int] = (20, 20, 30)) -> tuple[int, ...]:
+    if not color:
+        return default
     try:
-        from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
-        return Image, ImageDraw, ImageFont, ImageFilter, ImageOps
+        c = color.lstrip("#")
+        if len(c) == 6:
+            return tuple(int(c[i:i+2], 16) for i in (0, 2, 4))
+        if len(c) == 3:
+            return tuple(int(c[i]*2, 16) for i in range(3))
     except Exception:
-        fail("Pillow is required. Run: python suviren_q.py install")
+        pass
+    return default
 
 
-def find_font(preferred: Optional[Path] = None) -> Optional[Path]:
-    candidates = []
-    if preferred:
-        candidates.append(preferred)
-    env_font = os.environ.get("SUVIREN_Q_FONT")
-    if env_font:
-        candidates.append(Path(env_font))
-    if sys.platform.startswith("win"):
-        candidates.extend([
-            Path("C:/Windows/Fonts/arial.ttf"),
-            Path("C:/Windows/Fonts/segoeui.ttf"),
-            Path("C:/Windows/Fonts/calibri.ttf"),
-            Path("C:/Windows/Fonts/tahoma.ttf"),
-        ])
-    candidates.extend([
-        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
-        Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
-        Path("/Library/Fonts/Arial Unicode.ttf"),
-    ])
-    for c in candidates:
-        if c and c.exists():
-            return c
-    return None
-
-
-def load_font(size: int, preferred: Optional[Path] = None, bold: bool = False):
-    _, _, ImageFont, _, _ = import_pillow()
-    font_path = find_font(preferred)
-    if font_path:
-        # Try a bold sibling on Linux if requested.
-        if bold and font_path.name == "DejaVuSans.ttf":
-            bold_path = font_path.with_name("DejaVuSans-Bold.ttf")
-            if bold_path.exists():
-                font_path = bold_path
-        try:
-            return ImageFont.truetype(str(font_path), size=size)
-        except Exception:
-            pass
-    return ImageFont.load_default()
-
-
-def fit_text(draw, text: str, font_path: Optional[Path], max_width: int, start_size: int, min_size: int = 24, bold: bool = False):
-    for size in range(start_size, min_size - 1, -2):
-        font = load_font(size, font_path, bold=bold)
-        bbox = draw.textbbox((0, 0), text, font=font)
-        if bbox[2] - bbox[0] <= max_width:
-            return font
-    return load_font(min_size, font_path, bold=bold)
-
-
-def wrap_text(draw, text: str, font, max_width: int, max_lines: int = 3) -> list[str]:
-    words = text.split()
-    if not words:
-        return [""]
-    lines = []
-    current = ""
-    for w in words:
-        candidate = w if not current else current + " " + w
-        bbox = draw.textbbox((0, 0), candidate, font=font)
-        if bbox[2] - bbox[0] <= max_width:
-            current = candidate
-        else:
-            if current:
-                lines.append(current)
-            current = w
-            if len(lines) >= max_lines:
-                break
-    if current and len(lines) < max_lines:
-        lines.append(current)
-    if len(lines) > max_lines:
-        lines = lines[:max_lines]
-    if words and len(lines) == max_lines:
-        full = " ".join(words)
-        if " ".join(lines) != full:
-            last = lines[-1]
-            while last and draw.textbbox((0, 0), last + "...", font=font)[2] > max_width:
-                last = last[:-1].rstrip()
-            lines[-1] = last + "..."
-    return lines
-
-
-def cover_crop(img, size: tuple[int, int]):
-    Image, _, _, _, ImageOps = import_pillow()
-    return ImageOps.fit(img.convert("RGB"), size, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
-
-
-def background_fill(width: int, height: int, background: Optional[Path]):
-    Image, ImageDraw, _, ImageFilter, ImageOps = import_pillow()
-    if background and background.exists():
-        bg = Image.open(background)
-        bg = ImageOps.fit(bg.convert("RGB"), (width, height), method=Image.Resampling.LANCZOS)
-        bg = bg.filter(ImageFilter.GaussianBlur(radius=3))
-        overlay = Image.new("RGBA", (width, height), (3, 6, 10, 135))
-        bg = bg.convert("RGBA")
-        bg.alpha_composite(overlay)
-        return bg.convert("RGB")
-
-    # Procedural dark cyber background, no generated external images.
-    img = Image.new("RGB", (width, height), (5, 9, 12))
-    draw = ImageDraw.Draw(img, "RGBA")
-    for y in range(height):
-        t = y / max(1, height - 1)
-        r = int(4 + 10 * t)
-        g = int(8 + 22 * t)
-        b = int(13 + 26 * t)
-        draw.line([(0, y), (width, y)], fill=(r, g, b, 255))
-    # Neon fog rectangles/circles.
-    for i in range(12):
-        x = int(width * ((i * 137) % 997) / 997)
-        y = int(height * ((i * 241) % 887) / 887)
-        rad = 180 + (i % 5) * 65
-        color = (0, 210, 155, 18) if i % 2 == 0 else (180, 70, 210, 14)
-        draw.ellipse((x - rad, y - rad, x + rad, y + rad), fill=color)
-    # Grid lines.
-    for x in range(0, width, 96):
-        draw.line([(x, 0), (x, height)], fill=(60, 255, 200, 18), width=1)
-    for y in range(0, height, 96):
-        draw.line([(0, y), (width, y)], fill=(60, 255, 200, 14), width=1)
-    return img.filter(ImageFilter.GaussianBlur(radius=0.2))
-
-
-def draw_decorative_wave(draw, x: int, y: int, w: int, h: int, progress: float, accent=(52, 255, 189, 220)) -> None:
-    # Deterministic pseudo waveform, enough for MVP static panels.
-    mid = y + h // 2
-    bars = 120
-    gap = 3
-    bw = max(2, (w - gap * (bars - 1)) // bars)
-    active_bars = int(bars * max(0.0, min(1.0, progress)))
-    for i in range(bars):
-        phase = i * 0.45
-        amp = 0.25 + 0.55 * abs(math.sin(phase) * math.cos(i * 0.13))
-        amp *= 0.72 + 0.28 * abs(math.sin(i * 0.91))
-        bh = int(h * amp)
-        bx = x + i * (bw + gap)
-        if bx > x + w:
-            break
-        color = accent if i <= active_bars else (120, 145, 150, 90)
-        draw.rounded_rectangle((bx, mid - bh // 2, bx + bw, mid + bh // 2), radius=2, fill=color)
+def truncate_text(text: str, max_len: int = 40) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
 
 
 def draw_panel(
-    out_path: Path,
-    *,
+    out: Path,
     chapters: list[Chapter],
     current_index: int,
     cover: Path,
@@ -872,128 +799,133 @@ def draw_panel(
     font: Optional[Path] = None,
     width: int = DEFAULT_WIDTH,
     height: int = DEFAULT_HEIGHT,
-    title: str = "Интимный протокол",
-    subtitle: str = "Фригидная программистка Зина",
+    style: str = "deep-purple",
 ) -> None:
-    Image, ImageDraw, _, ImageFilter, _ = import_pillow()
-    ensure_dir(out_path.parent)
+    from PIL import Image, ImageDraw, ImageFont
 
-    canvas = background_fill(width, height, background).convert("RGBA")
-    draw = ImageDraw.Draw(canvas, "RGBA")
+    W, H = width, height
 
-    # Global vignette.
-    vignette = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    vd = ImageDraw.Draw(vignette, "RGBA")
-    vd.rectangle((0, 0, width, height), fill=(0, 0, 0, 48))
-    canvas.alpha_composite(vignette)
-    draw = ImageDraw.Draw(canvas, "RGBA")
+    # Resolve style
+    palette = STYLE_PRESETS.get(style, STYLE_PRESETS["deep-purple"])
+    bg_color = palette["bg"]
+    accent = palette["accent"]
+    accent2 = palette["accent2"]
+    text_color = palette["text"]
+    text_dim = palette["text_dim"]
+    progress_bg = palette["progress_bg"]
+    wave_color = palette["waveform"]
+    title_glow = palette["title_glow"]
+    img = Image.new("RGBA", (W, H), bg_color)
 
-    margin = 72
-    cover_size = 650
-    cover_x = margin
-    cover_y = 155
-    right_x = cover_x + cover_size + 70
-    right_w = width - right_x - margin
+    if background and background.exists():
+        try:
+            bg_img = Image.open(background).convert("RGBA")
+            bg_img = bg_img.resize((W, H), Image.LANCZOS)
+            img = Image.alpha_composite(img, bg_img)
+        except Exception:
+            warn(f"Could not load background: {background}")
 
-    # Panels
-    draw.rounded_rectangle((40, 40, width - 40, height - 40), radius=42, fill=(2, 6, 9, 105), outline=(80, 255, 205, 90), width=2)
-    draw.rounded_rectangle((cover_x - 26, cover_y - 26, cover_x + cover_size + 26, cover_y + cover_size + 26), radius=38, fill=(0, 0, 0, 120), outline=(70, 255, 190, 110), width=3)
+    draw = ImageDraw.Draw(img)
 
-    # Cover
+    # Load fonts
+    ff = None
+    fb = None
+    if font and font.exists():
+        try:
+            ff = ImageFont.truetype(str(font), size=32)
+            fb = ImageFont.truetype(str(font), size=52)
+        except Exception:
+            pass
+    if ff is None:
+        try:
+            ff = ImageFont.truetype("segoeui.ttf", 32)
+        except Exception:
+            ff = ImageFont.load_default()
+    if fb is None:
+        try:
+            fb = ImageFont.truetype("segoeui.ttf", 52)
+        except Exception:
+            fb = ImageFont.load_default()
+
+    # Cover image
+    ch = chapters[current_index]
+    cover_size = int(H * 0.42)
+    cover_x = int(W * 0.04)
+    cover_y = int((H - cover_size) // 2 - 20)
+
     if cover.exists():
-        cov = Image.open(cover)
-        cov = cover_crop(cov, (cover_size, cover_size)).convert("RGBA")
-        shadow = Image.new("RGBA", (cover_size + 36, cover_size + 36), (0, 0, 0, 0))
-        sd = ImageDraw.Draw(shadow, "RGBA")
-        sd.rounded_rectangle((18, 18, cover_size + 18, cover_size + 18), radius=28, fill=(0, 0, 0, 190))
-        shadow = shadow.filter(ImageFilter.GaussianBlur(radius=18))
-        canvas.alpha_composite(shadow, (cover_x - 18, cover_y - 18))
-        mask = Image.new("L", (cover_size, cover_size), 0)
-        md = ImageDraw.Draw(mask)
-        md.rounded_rectangle((0, 0, cover_size, cover_size), radius=26, fill=255)
-        canvas.alpha_composite(cov, (cover_x, cover_y), mask)
-    else:
-        draw.rounded_rectangle((cover_x, cover_y, cover_x + cover_size, cover_y + cover_size), radius=26, fill=(12, 25, 31, 255))
-        f = load_font(42, font, bold=True)
-        draw.text((cover_x + 50, cover_y + cover_size // 2 - 30), "COVER NOT FOUND", font=f, fill=(255, 210, 210, 255))
+        try:
+            cv = Image.open(cover).convert("RGBA")
+            cv = cv.resize((cover_size, cover_size), Image.LANCZOS)
+            # Rounded corners
+            r = int(cover_size * 0.03)
+            m = Image.new("RGBA", (cover_size, cover_size), (0, 0, 0, 0))
+            m_draw = ImageDraw.Draw(m)
+            m_draw.rounded_rectangle([(0, 0), (cover_size, cover_size)], radius=r, fill=(255, 255, 255, 255))
+            img.paste(cv, (cover_x, cover_y), mask=m)
+        except Exception as e:
+            warn(f"Could not place cover: {e}")
 
-    current = chapters[current_index]
-    small = load_font(28, font)
-    label = load_font(34, font, bold=True)
-    title_font = fit_text(draw, current.title, font, right_w, 62, 34, bold=True)
-    book_font = load_font(48, font, bold=True)
-    sub_font = load_font(30, font)
+    # Title
+    title_text = ch.title.strip() or f"Chapter {current_index + 1}"
+    draw.text((int(W * 0.42), int(H * 0.22)), title_text, fill=text_color, font=fb)
 
-    # Header
-    draw.text((right_x, 84), title, font=book_font, fill=(238, 255, 246, 255))
-    draw.text((right_x, 140), subtitle, font=sub_font, fill=(145, 255, 216, 210))
+    # Chapter list
+    start_y = int(H * 0.38)
+    max_visible = 8
+    half = max_visible // 2
+    start_i = max(0, current_index - half)
+    end_i = min(len(chapters), start_i + max_visible)
+    if end_i - start_i < max_visible:
+        start_i = max(0, end_i - max_visible)
 
-    # Now playing block
-    np_y = 230
-    draw.rounded_rectangle((right_x, np_y, right_x + right_w, np_y + 235), radius=28, fill=(0, 12, 15, 168), outline=(45, 240, 185, 120), width=2)
-    draw.text((right_x + 34, np_y + 26), "СЕЙЧАС ИГРАЕТ", font=label, fill=(81, 255, 197, 255))
-    lines = wrap_text(draw, current.title, title_font, right_w - 68, max_lines=2)
-    yy = np_y + 78
-    for line in lines:
-        draw.text((right_x + 34, yy), line, font=title_font, fill=(245, 255, 250, 255))
-        yy += int(title_font.size * 1.12) if hasattr(title_font, "size") else 56
-    time_line = f"{seconds_to_timecode(current.start_seconds)} - {seconds_to_timecode(current.end_seconds)}  |  {seconds_to_timecode(current.duration_seconds)}"
-    draw.text((right_x + 34, np_y + 188), time_line, font=small, fill=(190, 214, 214, 230))
+    for i in range(start_i, end_i):
+        c = chapters[i]
+        y = start_y + (i - start_i) * 42
+        is_active = i == current_index
+        prefix = f"{i+1:02d}."
+        tc = accent if is_active else text_dim
+        time_str = seconds_to_timecode(c.start_seconds, millis=False)
+        title_str = truncate_text(c.title, 42)
+        line = f"{prefix} {title_str}  {time_str}"
+        draw.text((int(W * 0.42), y), line, fill=tc, font=ff)
 
-    # Contents block
-    toc_y = 500
-    toc_h = 395
-    draw.rounded_rectangle((right_x, toc_y, right_x + right_w, toc_y + toc_h), radius=28, fill=(0, 8, 12, 145), outline=(90, 255, 205, 80), width=2)
-    draw.text((right_x + 34, toc_y + 24), "ОГЛАВЛЕНИЕ", font=label, fill=(238, 255, 246, 245))
+    # Progress bar bottom
+    bar_y = H - int(H * 0.08)
+    bar_h = int(H * 0.025)
+    bar_x = int(W * 0.04)
+    bar_w = int(W * 0.92)
+    draw.rounded_rectangle([(bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h)], radius=4, fill=progress_bg)
+    if len(chapters) > 1:
+        progress = current_index / (len(chapters) - 1)
+        prog_w = int(bar_w * progress)
+        if prog_w > 0:
+            draw.rounded_rectangle([(bar_x, bar_y), (bar_x + prog_w, bar_y + bar_h)], radius=4, fill=accent)
 
-    max_rows = 9
-    start_i = max(0, current_index - 4)
-    if start_i + max_rows > len(chapters):
-        start_i = max(0, len(chapters) - max_rows)
-    row_y = toc_y + 78
-    row_h = 32
-    row_font = load_font(25, font)
-    current_font = load_font(26, font, bold=True)
-    for i in range(start_i, min(len(chapters), start_i + max_rows)):
-        ch = chapters[i]
-        is_cur = i == current_index
-        if is_cur:
-            draw.rounded_rectangle((right_x + 24, row_y - 7, right_x + right_w - 24, row_y + row_h + 7), radius=15, fill=(38, 255, 185, 48), outline=(64, 255, 198, 120), width=1)
-        prefix = "▶ " if is_cur else "  "
-        row_text = f"{prefix}{ch.title}"
-        use_font = current_font if is_cur else row_font
-        max_text_w = right_w - 210
-        while draw.textbbox((0, 0), row_text, font=use_font)[2] > max_text_w and len(row_text) > 8:
-            row_text = row_text[:-2].rstrip() + "..."
-        fill = (245, 255, 250, 255) if is_cur else (182, 210, 207, 215)
-        draw.text((right_x + 40, row_y), row_text, font=use_font, fill=fill)
-        draw.text((right_x + right_w - 150, row_y), seconds_to_timecode(ch.start_seconds), font=row_font, fill=(139, 180, 178, 205))
-        row_y += 37
+    # Waveform bar
+    wave_y = H - int(H * 0.20)
+    wave_h = int(H * 0.07)
+    bar_count = 64
+    import random
+    rng = random.Random(ch.start_seconds)  # deterministic
+    for n in range(bar_count):
+        bw = max(3, (int(W * 0.85)) // bar_count - 1)
+        bx = int(W * 0.08) + n * (bw + 1)
+        bh = max(2, int(wave_h * (0.15 + 0.85 * rng.random())))
+        by = wave_y + (wave_h - bh) // 2
+        draw.rectangle([(bx, by), (bx + bw, by + bh)], fill=wave_color)
 
-    # Bottom waveform/progress
-    wave_x = margin
-    wave_y = 930
-    wave_w = width - margin * 2
-    wave_h = 84
-    draw.rounded_rectangle((wave_x, wave_y - 22, wave_x + wave_w, wave_y + wave_h + 22), radius=28, fill=(0, 8, 10, 155), outline=(55, 255, 195, 80), width=2)
-    progress = (current_index + 1) / max(1, len(chapters))
-    draw_decorative_wave(draw, wave_x + 34, wave_y, wave_w - 68, wave_h, progress=progress)
-    draw.text((wave_x + 34, wave_y - 50), f"{current_index + 1}/{len(chapters)}", font=small, fill=(150, 255, 218, 225))
+    # Chapter count
+    footer = f"Chapter {current_index + 1} / {len(chapters)}"
+    draw.text((int(W * 0.04), H - int(H * 0.14)), footer, fill=text_dim, font=ff)
 
-    # Footer brand
-    brand_font = load_font(24, font)
-    draw.text((width - margin - 360, height - 58), "suviren-q / La Queue Souveraine", font=brand_font, fill=(115, 165, 160, 170))
+    # Save
+    img.convert("RGB").save(out, "PNG")
+    log(f"Panel saved: {out}")
 
-    canvas.convert("RGB").save(out_path, quality=95)
-
-
-# -----------------------------
-# Rendering
-# -----------------------------
 
 def render_panels(
     chapters: list[Chapter],
-    *,
     cover: Path,
     background: Optional[Path],
     font: Optional[Path],
@@ -1002,6 +934,7 @@ def render_panels(
     only_index: Optional[int] = None,
     width: int = DEFAULT_WIDTH,
     height: int = DEFAULT_HEIGHT,
+    style: str = "deep-purple",
 ) -> list[Path]:
     ensure_pillow(auto_install=False)
     ensure_dir(out_dir)
@@ -1021,9 +954,100 @@ def render_panels(
 
 
 def concat_file_line(path: Path) -> str:
-    # ffmpeg concat demuxer likes forward slashes. Single quotes need escaping.
     s = str(path.resolve()).replace("\\", "/").replace("'", "'\\''")
     return f"file '{s}'"
+
+
+# ── GPU-accelerated segment rendering ────────────────────────────
+
+def _render_segment_worker(args: dict[str, Any]) -> dict[str, Any]:
+    """Worker for parallel segment rendering (runs in subprocess)."""
+    panel = Path(args["panel"])
+    audio = Path(args["audio"])
+    out = Path(args["out"])
+    start = args["start"]
+    duration = args["duration"]
+    fps = args["fps"]
+    width = args["width"]
+    height = args["height"]
+    dry_run = args.get("dry_run", False)
+    gpu_codec = args.get("gpu_codec", "libx264")
+    gpu_preset = args.get("gpu_preset", "fast")
+    gpu_opts = args.get("gpu_opts", {})
+
+    ensure_dir(out.parent)
+
+    # Build encoder args
+    enc: dict[str, Any] = {"codec": gpu_codec, "preset": gpu_preset}
+    if gpu_codec == "h264_nvenc":
+        enc.update(gpu_opts)
+    elif gpu_codec == "h264_amf":
+        enc.update(gpu_opts)
+    elif gpu_codec == "h264_qsv":
+        enc.update(gpu_opts)
+    elif gpu_codec == "libx264":
+        enc["crf"] = gpu_opts.get("crf", 20)
+
+    enc_args = encoder_ffmpeg_args(enc, width, height, fps)
+
+    # Build filter for waveform if needed
+    use_waveform = args.get("waveform", "ffmpeg") == "ffmpeg"
+    filter_complex = None
+    if use_waveform:
+        wave_height = max(110, int(height * 0.14))
+        wave_y = height - wave_height - int(height * 0.045)
+        filter_complex = (
+            f"[0:v]scale={width}:{height},format=rgba[base];"
+            f"[1:a]showwaves=s={width}x{wave_height}:mode=cline:rate={fps}:"
+            f"colors=0x7fffe0|0xb69aff,format=rgba,colorchannelmixer=aa=0.72[wave];"
+            f"[base][wave]overlay=x=0:y={wave_y}:format=auto,format=yuv420p[v]"
+        )
+
+    # Build base command
+    cmd = [
+        "ffmpeg", "-y",
+        "-loop", "1",
+        "-framerate", str(fps),
+        "-i", str(panel),
+        "-ss", f"{start:.3f}",
+        "-t", f"{duration:.3f}",
+        "-i", str(audio),
+    ]
+
+    if filter_complex:
+        cmd += ["-filter_complex", filter_complex]
+        cmd += ["-map", "[v]"]
+    else:
+        cmd += ["-map", "0:v:0"]
+
+    cmd += ["-map", "1:a:0", "-shortest"]
+
+    # Encoder args (replace -vf if we used filter_complex)
+    has_vf = False
+    for a in enc_args:
+        if a.startswith("-vf="):
+            has_vf = True
+            break
+    if not filter_complex and not has_vf:
+        cmd += ["-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"]
+
+    cmd += enc_args
+
+    if dry_run:
+        print(f"[DRY RUN] Would render: {out.name}", flush=True)
+        return {"ok": True, "dry_run": True, "out": str(out)}
+
+    try:
+        log(f"Rendering segment: {out.name} | {duration:.1f}s | {gpu_codec}")
+        t0 = time.time()
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        elapsed = time.time() - t0
+        speed = duration / elapsed if elapsed > 0 else 0
+        log(f"Segment done: {out.name} | {elapsed:.1f}s | {speed:.1f}x")
+        return {"ok": True, "out": str(out), "elapsed": elapsed, "speed": speed}
+    except subprocess.CalledProcessError as e:
+        error_msg = e.stderr[-500:] if e.stderr else str(e)
+        return {"ok": False, "out": str(out), "error": error_msg}
 
 
 def render_segment(
@@ -1038,67 +1062,45 @@ def render_segment(
     height: int,
     dry_run: bool = False,
     waveform: str = "static",
+    gpu_codec: str = "libx264",
+    gpu_preset: str = "fast",
+    gpu_opts: Optional[dict[str, Any]] = None,
 ) -> None:
-    ensure_dir(out.parent)
+    """Render a single segment (legacy direct call, no multiprocessing)."""
+    args = {
+        "panel": str(panel),
+        "audio": str(audio),
+        "out": str(out),
+        "start": start,
+        "duration": duration,
+        "fps": fps,
+        "width": width,
+        "height": height,
+        "dry_run": dry_run,
+        "waveform": waveform,
+        "gpu_codec": gpu_codec,
+        "gpu_preset": gpu_preset,
+        "gpu_opts": gpu_opts or {},
+    }
+    result = _render_segment_worker(args)
+    if not result.get("ok"):
+        if "error" in result:
+            fail(f"Segment render failed: {result['error']}")
+        else:
+            fail("Segment render failed")
 
-    if waveform == "ffmpeg":
-        wave_height = max(110, int(height * 0.14))
-        wave_y = height - wave_height - int(height * 0.045)
 
-        filter_complex = (
-            f"[0:v]scale={width}:{height},format=rgba[base];"
-            f"[1:a]showwaves=s={width}x{wave_height}:mode=cline:rate={fps}:"
-            f"colors=0x7fffe0|0xb69aff,format=rgba,colorchannelmixer=aa=0.72[wave];"
-            f"[base][wave]overlay=x=0:y={wave_y}:format=auto,format=yuv420p[v]"
-        )
-
-        cmd = [
-            "ffmpeg", "-y",
-            "-loop", "1",
-            "-framerate", str(fps),
-            "-i", str(panel),
-            "-ss", f"{start:.3f}",
-            "-t", f"{duration:.3f}",
-            "-i", str(audio),
-            "-filter_complex", filter_complex,
-            "-map", "[v]",
-            "-map", "1:a:0",
-            "-shortest",
-            "-r", str(fps),
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "20",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-movflags", "+faststart",
-            str(out),
-        ]
-        run_cmd(cmd, dry_run=dry_run)
-        return
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-loop", "1",
-        "-framerate", str(fps),
-        "-i", str(panel),
-        "-ss", f"{start:.3f}",
-        "-t", f"{duration:.3f}",
-        "-i", str(audio),
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-shortest",
-        "-vf", f"scale={width}:{height},format=yuv420p",
-        "-r", str(fps),
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-tune", "stillimage",
-        "-crf", "20",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-movflags", "+faststart",
-        str(out),
-    ]
-    run_cmd(cmd, dry_run=dry_run)
+def render_segments_parallel(
+    segments_args: list[dict[str, Any]],
+    max_workers: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Render segments in parallel using multiprocessing pool."""
+    if max_workers is None:
+        max_workers = min(multiprocessing.cpu_count(), 4)
+    log(f"Parallel rendering with {max_workers} workers")
+    with multiprocessing.Pool(processes=max_workers) as pool:
+        results = pool.map(_render_segment_worker, segments_args)
+    return results
 
 
 def concat_segments(segments: list[Path], out: Path, concat_txt: Path, *, dry_run: bool = False) -> None:
@@ -1117,9 +1119,10 @@ def concat_segments(segments: list[Path], out: Path, concat_txt: Path, *, dry_ru
     run_cmd(cmd, dry_run=dry_run)
 
 
-# -----------------------------
-# Commands
-# -----------------------------
+# ── Progress callback type ──────────────────────────────────────
+RenderProgressCb = Optional[callable]
+
+# ── Commands ─────────────────────────────────────────────────────
 
 def cmd_install(args: argparse.Namespace) -> None:
     log(APP_TITLE)
@@ -1217,10 +1220,28 @@ def cmd_preview(args: argparse.Namespace) -> None:
         only_index=args.index,
         width=args.width,
         height=args.height,
+        style=args.style,
     )
     log("Preview panels created:")
     for p in paths:
         print(f"  {p}")
+
+
+def analyze_chapter_gaps(chapters: list[Chapter]) -> list[dict[str, Any]]:
+    gaps = []
+    for i in range(len(chapters) - 1):
+        gap = chapters[i + 1].start_seconds - chapters[i].end_seconds
+        if abs(gap) > 0.05:
+            kind = "overlap" if gap < 0 else "gap"
+            gaps.append({
+                "kind": kind,
+                "gap_seconds": round(gap, 3),
+                "after": chapters[i].title,
+                "before": chapters[i + 1].title,
+                "after_index": i,
+                "before_index": i + 1,
+            })
+    return gaps
 
 
 def cmd_render(args: argparse.Namespace) -> None:
@@ -1265,7 +1286,15 @@ def cmd_render(args: argparse.Namespace) -> None:
     panels_dir = ensure_dir(bdir / "panels")
     segments_dir = ensure_dir(bdir / "segments")
 
+    # GPU detection
+    gpu_name, gpu_enc = detect_gpu_encoder()
+    gpu_codec = gpu_enc["codec"]
+    gpu_preset = gpu_enc.get("preset", DEFAULT_PRESET)
+    gpu_opts = {k: gpu_enc[k] for k in ("cq", "rc", "b_pyramid", "gpu", "global_quality") if k in gpu_enc}
+
+    log(f"Using encoder: {gpu_enc['label']} ({gpu_codec})")
     log(f"Rendering {len(chapters)} panels")
+
     render_panels(
         chapters,
         cover=cover,
@@ -1278,37 +1307,60 @@ def cmd_render(args: argparse.Namespace) -> None:
         height=args.height,
     )
 
-    segments: list[Path] = []
+    # Build segment args
+    segment_args_list: list[dict[str, Any]] = []
     for i, ch in enumerate(chapters):
         if ch.duration_seconds <= 0.05:
             warn(f"Skipping too short chapter: {ch.title}")
             continue
         panel = panels_dir / f"{i:03d}.png"
         segment = segments_dir / f"{i:03d}.mp4"
-        log(f"Rendering segment {i+1}/{len(chapters)}: {ch.title} | {seconds_to_timecode(ch.duration_seconds, millis=True)}")
-        render_segment(
-            panel=panel,
-            audio=audio,
-            out=segment,
-            start=ch.start_seconds,
-            duration=ch.duration_seconds,
-            fps=args.fps,
-            width=args.width,
-            height=args.height,
-            dry_run=args.dry_run,
-            waveform=args.waveform,
-        )
-        segments.append(segment)
+        segment_args_list.append({
+            "panel": str(panel),
+            "audio": str(audio),
+            "out": str(segment),
+            "start": ch.start_seconds,
+            "duration": ch.duration_seconds,
+            "fps": args.fps,
+            "width": args.width,
+            "height": args.height,
+            "dry_run": args.dry_run,
+            "waveform": args.waveform,
+            "gpu_codec": gpu_codec,
+            "gpu_preset": gpu_preset,
+            "gpu_opts": gpu_opts,
+        })
 
-    if not segments:
-        fail("No segments rendered")
-    concat_segments(segments, Path(args.out), bdir / "concat.txt", dry_run=args.dry_run)
+    if not segment_args_list:
+        fail("No segments to render")
+
+    # Parallel render
+    parallel = getattr(args, "parallel", True)
+    if parallel and len(segment_args_list) > 1:
+        results = render_segments_parallel(segment_args_list)
+    else:
+        results = []
+        for sargs in segment_args_list:
+            r = _render_segment_worker(sargs)
+            results.append(r)
+
+    # Collect rendered segments
+    rendered_segments: list[Path] = []
+    for i, r in enumerate(segment_args_list):
+        p = Path(r["out"])
+        if p.exists():
+            rendered_segments.append(p)
+        else:
+            warn(f"Segment missing: {p}")
+
+    if not rendered_segments:
+        fail("No segments rendered successfully")
+
+    concat_segments(rendered_segments, Path(args.out), bdir / "concat.txt", dry_run=args.dry_run)
     log(f"Done: {args.out}")
 
 
-# -----------------------------
-# CLI
-# -----------------------------
+# ── CLI ──────────────────────────────────────────────────────────
 
 def add_rpp_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--rpp", required=True, help="Path to REAPER .rpp project")
@@ -1329,6 +1381,8 @@ def add_visual_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--font", help="Optional TTF font with Cyrillic")
     p.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     p.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
+    p.add_argument("--style", choices=list(STYLE_PRESETS.keys()), default="deep-purple",
+                    help="Visual theme for panel rendering")
     p.add_argument("--build-dir", help="Base dir for _suviren_q_build")
 
 
@@ -1353,7 +1407,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     p_preview.add_argument("--index", type=int, help="Render only one chapter panel by zero-based index")
     p_preview.set_defaults(func=cmd_preview)
 
-    p_render = sub.add_parser("render", help="Render final MP4")
+    p_render = sub.add_parser("render", help="Render final MP4 with GPU acceleration")
     p_render.add_argument("--audio", required=True, help="MP3/WAV/M4A audiobook audio")
     p_render.add_argument("--chapters", help="chapters JSON/CSV. If omitted, use --rpp extraction")
     p_render.add_argument("--rpp", help="Optional REAPER .rpp if chapters are not provided")
@@ -1368,6 +1422,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     p_render.add_argument("--fps", type=int, default=DEFAULT_FPS)
     p_render.add_argument("--waveform", choices=["static", "ffmpeg"], default="static", help="Audio visualization mode")
     p_render.add_argument("--dry-run", action="store_true")
+    p_render.add_argument("--no-parallel", action="store_true", dest="no_parallel", help="Disable parallel segment rendering")
     add_visual_args(p_render)
     p_render.set_defaults(func=cmd_render)
 
