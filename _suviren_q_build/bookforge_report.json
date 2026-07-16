@@ -1,0 +1,91 @@
+{
+  "report_generated": "2026-07-16 14:26:36",
+  "project_name": "ЗИНА. Книга",
+  "environment": {
+    "python_executable": "C:\\Users\\Ярослав\\AppData\\Local\\Programs\\Python\\Python311\\python.exe",
+    "python_version": "3.11.9",
+    "ffmpeg_path": "C:\\Users\\Ярослав\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-8.1.1-full_build\\bin\\ffmpeg.EXE",
+    "ffprobe_path": "C:\\Users\\Ярослав\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-8.1.1-full_build\\bin\\ffprobe.EXE",
+    "project_root": "d:\\PYTHON\\suviren_q",
+    "data_dir": "data",
+    "build_dir": "d:\\PYTHON\\suviren_q\\_suviren_q_build"
+  },
+  "files": {
+    "audio": {
+      "path": "data\\ЗИНА. Книга. final lfast version.mp3",
+      "exists": true,
+      "size_mb": 2173.43,
+      "duration_seconds": 56975.064,
+      "duration_str": "15:49:35"
+    },
+    "cover": {
+      "path": "data\\zina-cover.png",
+      "exists": true,
+      "width": 1055,
+      "height": 1491,
+      "size_mb": 2.18
+    },
+    "background": {
+      "path": "data\\background.png",
+      "exists": true,
+      "width": 1672,
+      "height": 941,
+      "size_mb": 2.4
+    },
+    "rpp": {
+      "path": "data\\ЗИНА. Книга.rpp",
+      "exists": true,
+      "size_mb": 0.14
+    },
+    "chapters": {
+      "path": "d:\\PYTHON\\suviren_q\\_suviren_q_build\\chapters.detected.json",
+      "exists": true,
+      "count": 37,
+      "first": "Вступление от автора",
+      "last": "Эпилог. Идемпотентность и импотентность",
+      "total_duration_seconds": 56930.933999999994,
+      "total_duration_str": "15:48:50"
+    },
+    "layout": {
+      "path": "d:\\PYTHON\\suviren_q\\_suviren_q_build\\layout.json",
+      "exists": true,
+      "preset_name": "zina-noir"
+    },
+    "waveform": {
+      "path": "d:\\PYTHON\\suviren_q\\_suviren_q_build\\waveform.json",
+      "exists": false
+    },
+    "preview": {
+      "path": "d:\\PYTHON\\suviren_q\\_suviren_q_build\\preview.png",
+      "exists": false
+    },
+    "preview_contact": {
+      "path": "d:\\PYTHON\\suviren_q\\_suviren_q_build\\preview_contact.png",
+      "exists": true,
+      "width": 1920,
+      "height": 1080,
+      "size_mb": 1.59
+    },
+    "test_output": {
+      "path": "d:\\PYTHON\\suviren_q\\_suviren_q_build\\test_60sec.mp4",
+      "exists": false
+    },
+    "full_output": {
+      "path": "d:\\PYTHON\\suviren_q\\_suviren_q_build\\zina_book_youtube_full.mp4",
+      "exists": false
+    }
+  },
+  "readiness": {
+    "status": "READY",
+    "missing": [],
+    "warnings": [
+      "waveform not generated (run 'waveform')",
+      "preview.png not generated (run 'preview')"
+    ]
+  },
+  "next_commands": [
+    "python bookforge.py preview --contact --open",
+    "python bookforge.py render-test --overwrite",
+    "python bookforge.py render-full  # only after test passes"
+  ]
+}

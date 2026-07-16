@@ -156,19 +156,39 @@ def _score_by_name(path: Path, keywords: list[str]) -> int:
 def _pick_best_audio(candidates: list[Path]) -> Optional[Path]:
     if not candidates:
         return None
-    # Priority 1: "final" and "lfast" keywords (final mastered version)
-    FINAL_KEYWORDS = ["final", "lfast", "master", "итог", "финал"]
+    # Priority 0: exact match for the known final file
+    EXACT_FINAL = "ЗИНА. Книга. final last version"
+    for p in candidates:
+        if p.stem == EXACT_FINAL:
+            return p  # Absolute priority — exact match wins immediately
+    # Priority keywords in order (higher = earlier in list = higher priority)
+    PRIORITY_KEYWORDS = [
+        "final last",
+        "final",
+        "master",
+        "full",
+        "complete",
+        "version",
+    ]
+    # Blacklist: avoid old/legacy files if better alternatives exist
+    BLACKLIST = ["zinaida"]
     scored = []
     for p in candidates:
         name = p.stem.lower()
-        # High priority for final/mastered audio
-        final_score = 0
-        for kw in FINAL_KEYWORDS:
+        # Check blacklist — apply heavy penalty
+        blacklist_penalty = 0
+        for bl in BLACKLIST:
+            if bl in name:
+                blacklist_penalty = 10000  # Effectively last unless only option
+        # Score based on priority keyword position
+        kw_score = 0
+        for idx, kw in enumerate(PRIORITY_KEYWORDS):
             if kw in name:
-                final_score += 50
+                # Higher priority keywords get exponentially higher score
+                kw_score = max(kw_score, (len(PRIORITY_KEYWORDS) - idx) * 100)
         keyword_score = _score_by_name(p, AUDIO_KEYWORDS)
-        size_score = p.stat().st_size / 1_000_000
-        total = final_score + keyword_score + size_score
+        size_score = p.stat().st_size / 1_000_000  # Larger files preferred
+        total = kw_score + keyword_score + size_score - blacklist_penalty
         scored.append((p, total))
     scored.sort(key=lambda x: -x[1])
     return scored[0][0]
@@ -651,14 +671,9 @@ def generate_waveform(audio_path: Path, samples: int = 2000) -> Optional[dict]:
         with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as tmp:
             raw_path = tmp.name
 
-        cmd = [
-            ffmpeg, "-y", "-v", "error",
-            "-i", str(audio_path),
-            "-ac", "1", "-ar", str(LOW_AR),
-            "-f", "s16le",
-            raw_path,
-        ]
-        subprocess.run(cmd, check=True, capture_output=True, timeout=600)
+        # Use shell=True on Windows to handle cyrillic filenames (ffmpeg 69 error)
+        cmd_str = f'"{ffmpeg}" -y -v error -i "{audio_path}" -ac 1 -ar {LOW_AR} -f s16le "{raw_path}"'
+        subprocess.run(cmd_str, check=True, capture_output=True, timeout=600, shell=True)
 
         raw_size = Path(raw_path).stat().st_size
         total_raw_samples = raw_size // bytes_per_sample

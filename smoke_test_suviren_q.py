@@ -78,6 +78,8 @@ def run(cmd: list[str | Path], cwd: Path = ROOT, timeout: int = 60) -> subproces
     printable = " ".join(f'"{x}"' if " " in str(x) else str(x) for x in cmd)
     print(f"[run] {printable}")
 
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
     proc = subprocess.run(
         [str(x) for x in cmd],
         cwd=str(cwd),
@@ -87,10 +89,14 @@ def run(cmd: list[str | Path], cwd: Path = ROOT, timeout: int = 60) -> subproces
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         timeout=timeout,
+        env=env,
     )
 
-    if proc.stdout.strip():
-        print(proc.stdout.strip())
+    out = proc.stdout.strip()
+    if out:
+        # Replace non-ASCII chars for Windows console (charmap/cp866 issues)
+        safe = out.encode("ascii", "replace").decode("ascii")
+        print(safe)
 
     if proc.returncode != 0:
         raise TestFail(f"Command failed with code {proc.returncode}: {printable}")
