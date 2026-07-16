@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "project_name": "ЗИНА. Книга",
+  "data_dir": "data",
+  "build_dir": "d:\\PYTHON\\suviren_q\\_suviren_q_build",
+  "audio": "data\\ЗИНА. Книга. final lfast version.mp3",
+  "cover": "data\\zina-cover.png",
+  "background": "data\\background.png",
+  "rpp": "data\\ЗИНА. Книга.rpp",
+  "chapters": "d:\\PYTHON\\suviren_q\\_suviren_q_build\\chapters.detected.json",
+  "layout": "d:\\PYTHON\\suviren_q\\_suviren_q_build\\layout.json",
+  "waveform": "d:\\PYTHON\\suviren_q\\_suviren_q_build\\waveform.json",
+  "outputs": {
+    "preview": "d:\\PYTHON\\suviren_q\\_suviren_q_build\\preview.png",
+    "contact": "d:\\PYTHON\\suviren_q\\_suviren_q_build\\preview_contact.png",
+    "test": "d:\\PYTHON\\suviren_q\\_suviren_q_build\\test_60sec.mp4",
+    "full": "d:\\PYTHON\\suviren_q\\_suviren_q_build\\zina_book_youtube_full.mp4"
+  },
+  "quality": "youtube_high"
+}

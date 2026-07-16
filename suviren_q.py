@@ -76,16 +76,38 @@ DEFAULT_PRESET = "fast"      # fallback software preset
 
 # ── Logging ──────────────────────────────────────────────────────
 
+# Fix Windows console encoding for Russian/Cyrillic output
+if sys.platform.startswith("win"):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError):
+        pass
+    try:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError):
+        pass
+
+
+def _safe_print(text: str, file=None, flush: bool = False) -> None:
+    """Print with fallback for Windows console encoding issues."""
+    out = file or sys.stdout
+    try:
+        print(text, file=out, flush=flush)
+    except UnicodeEncodeError:
+        out.buffer.write(text.encode('utf-8', errors='replace') + b'\n')
+        out.buffer.flush()
+
+
 def log(msg: str) -> None:
-    print(f"[suviren-q] {msg}", flush=True)
+    _safe_print(f"[suviren-q] {msg}", flush=True)
 
 
 def warn(msg: str) -> None:
-    print(f"[suviren-q][WARN] {msg}", flush=True)
+    _safe_print(f"[suviren-q][WARN] {msg}", flush=True)
 
 
 def fail(msg: str, code: int = 1) -> None:
-    print(f"[suviren-q][ERROR] {msg}", file=sys.stderr, flush=True)
+    _safe_print(f"[suviren-q][ERROR] {msg}", file=sys.stderr, flush=True)
     raise SystemExit(code)
 
 
@@ -397,28 +419,118 @@ def encoder_ffmpeg_args(
 
 # ── ffprobe ──────────────────────────────────────────────────────
 
+def _ffmpeg_parse_duration(path: Path) -> Optional[float]:
+    """Parse Duration line from ffmpeg -i (works on all file sizes)."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    try:
+        # ffmpeg -i writes Duration to stderr, exit code may be 1 (no output specified)
+        cmd = [ffmpeg, "-v", "info", "-i", str(path), "-f", "null", "-"]
+        res = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+        # Duration line format: "Duration: HH:MM:SS.xx, start: ..."
+        out = res.stderr or ""
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", out)
+        if m:
+            h, mn, s = m.group(1), m.group(2), m.group(3)
+            dur = float(h) * 3600 + float(mn) * 60 + float(s)
+            log(f"Audio duration: {seconds_to_timecode(dur, millis=True)} ({dur:.3f}s)")
+            return dur
+        # If Duration not found, maybe the file is corrupt
+        warn(f"Could not find Duration in ffmpeg -i output for {path.name}")
+        return None
+    except subprocess.TimeoutExpired:
+        warn(f"ffmpeg -i timed out for {path.name} (120s)")
+        return None
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        warn(f"ffmpeg -i failed: {e}")
+        return None
+
+
+def _estimate_duration_from_bitrate(path: Path) -> Optional[float]:
+    """Estimate duration from file size and average bitrate (last resort).
+
+    For very large mp3 files (>1.5 GB) where ffprobe/ffmpeg fail to parse
+    VBR headers, we estimate duration from file size assuming ~320 kbps
+    (high-quality VBR mp3). The expected 15:48:50 → 56930s × 320000/8 ≈ 2.28 GB.
+    """
+    try:
+        size_bytes = path.stat().st_size
+        if size_bytes <= 0:
+            return None
+
+        bitrate: float = 320000  # default for high-quality VBR mp3
+
+        # Try ffprobe bitrate first (fast if available)
+        br_cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=bit_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ]
+        br_res = subprocess.run(br_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        br_str = br_res.stdout.strip()
+        if br_str and br_str != "N/A" and br_str != "0":
+            if br_str != "N/A":
+                bitrate = float(br_str)
+
+        # For very large files (>1.5 GB) where bitrate can't be read, use 320k
+        if size_bytes > 1_500_000_000 and (not br_str or br_str in ("N/A", "0")):
+            bitrate = 320000
+
+        dur = size_bytes / (bitrate / 8)
+        if 3600 < dur < 200000:  # Sanity: 1h to 55h
+            log(f"Audio duration (estimated at {int(bitrate/1000)}kbps): {seconds_to_timecode(dur, millis=True)} ({dur:.3f}s)")
+            return dur
+        return None
+    except Exception:
+        return None
+
+
 def ffprobe_duration(path: Path) -> Optional[float]:
     if not path.exists():
         warn(f"Audio not found for duration check: {path}")
         return None
     check_binary("ffprobe", required=True)
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        str(path),
-    ]
+
+    # Method 1: ffprobe format=duration (fast, but may fail on huge mp3 >2GB)
     try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ]
         res = subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
         value = res.stdout.strip()
-        if not value:
-            return None
-        dur = float(value)
-        log(f"Audio duration: {seconds_to_timecode(dur, millis=True)} ({dur:.3f}s)")
+        if value and value != "N/A":
+            dur = float(value)
+            log(f"Audio duration: {seconds_to_timecode(dur, millis=True)} ({dur:.3f}s)")
+            return dur
+    except Exception:
+        pass
+
+    # Method 2: ffmpeg -i Duration parsing (reliable for all mp3 sizes)
+    dur = _ffmpeg_parse_duration(path)
+    if dur is not None:
         return dur
-    except Exception as e:
-        warn(f"Could not read audio duration via ffprobe: {e}")
-        return None
+
+    # Method 3: estimate from size / bitrate (last resort)
+    dur = _estimate_duration_from_bitrate(path)
+    if dur is not None:
+        return dur
+
+    warn(f"Could not determine duration for {path.name}")
+    return None
 
 
 # ── Chapter JSON / CSV ───────────────────────────────────────────
@@ -514,6 +626,18 @@ def extract_quoted_or_token(rest: str) -> str:
     return rest.split()[0]
 
 
+def _rpp_read_text_safe(path: Path) -> str:
+    """Read RPP file trying multiple encodings since REAPER uses system locale."""
+    for enc in ["utf-8-sig", "utf-8", "cp1251", "cp866", "latin-1"]:
+        try:
+            return path.read_text(encoding=enc)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    # ultimate fallback
+    warn(f"Cannot decode {path} with known encodings; using latin-1 with replacement")
+    return path.read_text(encoding="latin-1", errors="replace")
+
+
 def parse_rpp(path: Path) -> RppReport:
     if not path.exists():
         fail(f"RPP file not found: {path}")
@@ -525,28 +649,73 @@ def parse_rpp(path: Path) -> RppReport:
     current_track: Optional[RppTrack] = None
     current_item: Optional[RppItem] = None
 
-    lines = path.read_text(encoding="utf-8-sig").splitlines()
+    # Stack-based nesting depth.
+    # REAPER RPP uses <tag> ... > for blocks.
+    # <TRACK increments from 0→1, <ITEM 1→2, other blocks go deeper.
+    # > decrements. When depth returns to 1, item closes; to 0, track closes.
+    depth = 0
+    item_depth = -1   # depth at which the current ITEM was opened
+    track_depth = -1  # depth at which the current TRACK was opened
+
+    raw = _rpp_read_text_safe(path)
+    lines = raw.splitlines()
 
     for line_no, line in enumerate(lines, start=1):
         stripped = line.strip()
         if not stripped:
             continue
 
-        if stripped.startswith("<TRACK"):
+        # Count opening '<' tags (non-closing ones)
+        open_count = 0
+        idx = 0
+        while idx < len(stripped):
+            if stripped[idx] == '<' and not stripped.startswith("-->", idx):
+                # check it's not the start of a closing tag (aka standalone ">")
+                open_count += 1
+                idx += 1
+            else:
+                idx += 1
+
+        # Closing '>' on its own line – depth decrement
+        if stripped == ">":
+            depth -= 1
+            # ITEM closes when depth drops *below* the level it was opened at
+            # (e.g. item at depth=2 → SOURCE at depth=3 → '>' back to depth=2 → another '>' to depth=1 closes ITEM)
+            if current_item is not None and depth < item_depth:
+                current_item = None
+                item_depth = -1
+            # TRACK closes when depth drops below track_depth
+            if current_track is not None and depth < track_depth:
+                current_track = None
+                track_depth = -1
+                item_depth = -1
+                current_item = None
+            depth = max(0, depth)
+            continue
+
+        # Opening tags: increment depth for each '<' found
+        if open_count > 0:
+            depth += open_count
+
+        # Track open
+        if re.match(r"^\s*<TRACK\b", stripped):
             current_track = RppTrack(name="", line=line_no, items=[])
             tracks.append(current_track)
+            current_item = None
+            item_depth = -1
+            track_depth = depth
+            # Check inline attributes
             m = re.search(r'NAME\s+"([^"]*)"', line)
             if m:
                 current_track.name = m.group(1)
             continue
 
-        if stripped.startswith(">") and current_track is not None:
-            current_track = None
-            continue
-
-        if stripped.startswith("<ITEM") and current_track is not None:
+        # ITEM open (only inside a track)
+        if re.match(r"^\s*<ITEM\b", stripped) and current_track is not None:
             current_item = RppItem(track=current_track.name, position=0.0, length=0.0, line=line_no)
             current_track.items.append(current_item)
+            item_depth = depth
+            # Check inline attributes
             m = re.search(r'POSITION\s+([\d.]+)', line)
             if m:
                 current_item.position = float(m.group(1))
@@ -556,38 +725,68 @@ def parse_rpp(path: Path) -> RppReport:
             m = re.search(r'NAME\s+"([^"]*)"', line)
             if m:
                 current_item.name = m.group(1)
-            # peek next lines for filename
             continue
 
-        if stripped.startswith(">") and current_item is not None:
-            current_item = None
-            continue
-
+        # Properties inside current contexts
         if current_item is not None:
-            if stripped.startswith("FILE"):
+            if re.match(r"^\s*NAME\s", stripped):
+                m = re.search(r'NAME\s+(.+)', stripped)
+                if m:
+                    current_item.name = strip_reaper_quotes(m.group(1))
+            elif re.match(r"^\s*POSITION\s", stripped):
+                m = re.search(r'POSITION\s+([\d.]+)', stripped)
+                if m:
+                    current_item.position = float(m.group(1))
+            elif re.match(r"^\s*LENGTH\s", stripped):
+                m = re.search(r'LENGTH\s+([\d.]+)', stripped)
+                if m:
+                    current_item.length = float(m.group(1))
+            elif re.match(r"^\s*FILE\s", stripped):
                 parts = stripped.split(None, 1)
                 if len(parts) >= 2:
                     current_item.file = extract_quoted_or_token(parts[1])
-            elif stripped.startswith("NAME"):
-                pass  # already captured; names can also be on sub-lines
 
-        if stripped.startswith("MARKER"):
+        if current_track is not None and current_item is None:
+            # Track-level properties (when not inside an ITEM)
+            if re.match(r"^\s*NAME\s", stripped):
+                m = re.search(r'NAME\s+(.+)', stripped)
+                if m:
+                    name_val = strip_reaper_quotes(m.group(1))
+                    if name_val:
+                        current_track.name = name_val
+
+        # MARKER line (only at top level depth <= 1)
+        if depth <= 1 and re.match(r"^\s*(MARKER|MARKER_LENGTH|REGION)\s", stripped):
             parts = stripped.split()
             if len(parts) >= 3 and parts[1].isdigit():
-                marker_kind = parts[2]
-                marker_position = 0.0
-                marker_name = ""
+                kind = parts[2]
+                pos = 0.0
+                name = ""
                 for part in parts[3:]:
-                    m = re.match(r"([\d.]+)", part)
-                    if m:
-                        marker_position = float(m.group(1))
+                    mm = re.match(r"([\d.]+)", part)
+                    if mm:
+                        pos = float(mm.group(1))
                     else:
-                        marker_name = extract_quoted_or_token(part)
-                markers.append(RppMarker(kind=marker_kind, position=marker_position, name=marker_name, raw=stripped, line=line_no))
+                        name = extract_quoted_or_token(part)
+                if parts[0].startswith("REGION") and len(parts) >= 4:
+                    end_pos = 0.0
+                    for part in parts[4:]:
+                        mm = re.match(r"([\d.]+)", part)
+                        if mm and end_pos == 0.0:
+                            end_pos = float(mm.group(1))
+                        else:
+                            name = extract_quoted_or_token(part)
+                    regions.append(RppMarker(kind=kind, position=pos, name=name, end=end_pos, raw=stripped, line=line_no))
+                else:
+                    markers.append(RppMarker(kind=kind, position=pos, name=name, raw=stripped, line=line_no))
 
-        if re.match(r'^\d+\s+"', stripped) or re.match(r'^\d+\s+\d+', stripped):
-            if "MARKER" not in stripped and "REGION" not in stripped and len(stripped.split()) >= 3:
-                pass  # skip non-marker lines that look like numbers
+    # Debug
+    log(f"RPP: {path.name}")
+    log(f"Tracks: {len(tracks)}")
+    for i, t in enumerate(tracks):
+        log(f"  track {i}: '{t.name}' | items: {len(t.items)} | line: {t.line}")
+    log(f"Markers: {len(markers)}")
+    log(f"Regions: {len(regions)}")
 
     return RppReport(
         path=str(path),
@@ -599,6 +798,56 @@ def parse_rpp(path: Path) -> RppReport:
 
 # ── Chapter detection from RPP ───────────────────────────────────
 
+# Mapping of known latin slugs to readable Russian titles
+_KNOWN_SLUG_TITLES: dict[str, str] = {
+    "glava_17_arhitekturnoe_nasilie": "Глава 17. Архитектурное насилие",
+    "glava_18_altar_musora": "Глава 18. Алтарь мусора",
+    "glava_24_krov_i_zhelezo": "Глава 24. Кровь и железо",
+    "glava_29_zheltyy_drug": "Глава 29. Жёлтый друг",
+    "glava_30_nauchnaya_sestra": "Глава 30. Научная сестра",
+    "epilog_idempotentnost_i_impotentnost": "Эпилог. Идемпотентность и импотентность",
+}
+
+def _normalize_item_title(name: str, file: str) -> str:
+    """Normalize item name or source file basename to readable chapter title."""
+    # Use item NAME if present and meaningful
+    if name and name.strip():
+        raw = name.strip()
+        # Remove leading number prefix: "002 - ", "003 - " or "037_" etc.
+        raw = re.sub(r'^\d+\s*[-–—]\s*', '', raw)
+        # Also strip leading number with underscore: "037_"
+        raw = re.sub(r'^\d+_', '', raw)
+        # Remove file extension if any
+        raw = re.sub(r'\.(mp3|wav|flac|ogg|aac|wma)$', '', raw, flags=re.IGNORECASE)
+        # Strip leading "Media" prefix if present
+        raw = re.sub(r'^Media[\\/]?', '', raw, flags=re.IGNORECASE)
+        raw = raw.strip()
+        # Check known slug mapping
+        if raw in _KNOWN_SLUG_TITLES:
+            return _KNOWN_SLUG_TITLES[raw]
+        if raw:
+            return raw
+
+    # Fallback to source file basename
+    if file:
+        basename = Path(file).stem  # "019_glava_17_arhitekturnoe_nasilie" or "002 - Глава 0. Ложное срабатывание"
+        # Remove leading number prefix: "019_" or "037_"
+        basename = re.sub(r'^\d+_', '', basename)
+        # Try known slug mapping first
+        if basename in _KNOWN_SLUG_TITLES:
+            return _KNOWN_SLUG_TITLES[basename]
+        # Generic latin slug → readable
+        # Replace underscores with spaces
+        readable = basename.replace('_', ' ')
+        # Remove leading digits with space or dash
+        readable = re.sub(r'^\d+\s*[-–—]\s*', '', readable)
+        readable = readable.strip()
+        if readable:
+            return readable
+
+    return "Unknown Chapter"
+
+
 def detect_chapters_from_rpp(
     report: RppReport,
     audio_duration: Optional[float] = None,
@@ -606,40 +855,66 @@ def detect_chapters_from_rpp(
     chapter_pattern: str = "Глава",
     offset: float = 0.0,
     origin: str = "project",
-    add_intro: bool = False,
+    add_intro: bool = True,
     end_mode: str = "next-start",
-    min_item_length: float = 30.0,
+    min_item_length: float = 1.0,
 ) -> list[Chapter]:
+    """
+    Extract chapters from a specific RPP track.
+
+    KEY BEHAVIOR (as of Book Wunderwaffe 1.0):
+    - Uses ALL items from the specified track (NOT filtered by chapter_pattern).
+    - Chapter_pattern is ignored; we take every item on the book track.
+    - Items are sorted by POSITION.
+    - If the first item starts after > 0.5 sec, a synthetic "Вступление от автора" segment is created.
+    - End mode uses "next-start" by default (interval mode) to avoid gaps.
+    - Title normalization handles both Cyrillic (Глава N. Name) and latin slugs.
+    """
     track: Optional[RppTrack] = None
     for t in report.tracks:
         if rpp_track.lower() in t.name.lower():
             track = t
             break
     if not track:
-        warn(f"Track '{rpp_track}' not found. Using first track with chapter-like items.")
+        warn(f"Track '{rpp_track}' not found. Trying fallback: first track with items.")
         for t in report.tracks:
-            for it in t.items:
-                if chapter_pattern.lower() in it.name.lower():
-                    track = t
-                    break
-            if track:
+            if len(t.items) >= 5:
+                track = t
                 break
     if not track:
-        fail(f"No track with items matching chapter pattern '{chapter_pattern}'")
+        fail(f"No suitable track found with items matching '{rpp_track}'")
 
     log(f"Using track: '{track.name}' ({len(track.items)} items)")
 
-    # Filter items by name containing chapter_pattern
-    items = [it for it in track.items if chapter_pattern.lower() in it.name.lower() and it.length >= min_item_length]
-    if not items:
-        # fallback: all items in track
-        items = [it for it in track.items if it.length >= min_item_length]
+    # Use ALL items from this track regardless of name
+    items = sorted(track.items, key=lambda it: it.position)
 
-    items.sort(key=lambda it: it.position)
+    # Check if the first item has meaningful content at position 0
+    # Items that are voice/audio before the first book item
+    first_book_item = items[0] if items else None
 
     chapters: list[Chapter] = []
+
+    # --- SYNTHETIC INTRO ---
+    # If the first book track item starts after 0.5 sec, create synthetic intro
+    if first_book_item and first_book_item.position > 0.5:
+        intro_start = 0.0
+        intro_end = first_book_item.position
+        intro = Chapter(
+            title="Вступление от автора",
+            start_seconds=0.0,
+            end_seconds=intro_end,
+            source="synthetic_intro",
+            raw_name="",
+            file="",
+            track="",
+        )
+        chapters.append(intro)
+        log(f"Synthetic intro: 00:00:00.000 → {_sec_to_ts(intro_end)}")
+    
+    # --- BOOK TRACK ITEMS ---
     for i, it in enumerate(items):
-        title = it.name.strip() if it.name.strip() else f"Chapter {i+1}"
+        title = _normalize_item_title(it.name, it.file)
         start = it.position + offset
         if end_mode == "next-start" and i + 1 < len(items):
             end = items[i + 1].position + offset
@@ -662,16 +937,6 @@ def detect_chapters_from_rpp(
             ch.start_seconds = max(0.0, ch.start_seconds - shift)
             ch.end_seconds = max(0.0, ch.end_seconds - shift)
 
-    # Add intro if requested
-    if add_intro and origin == "project" and chapters and chapters[0].start_seconds > 2.0:
-        intro = Chapter(
-            title="Intro",
-            start_seconds=0.0,
-            end_seconds=chapters[0].start_seconds,
-            source="auto_intro",
-        )
-        chapters.insert(0, intro)
-
     # Ensure last chapter extends to audio duration
     if audio_duration is not None and chapters:
         last = chapters[-1]
@@ -682,8 +947,22 @@ def detect_chapters_from_rpp(
                 warn("Audio is much longer than last chapter, not extending")
 
     chapters = normalize_chapters(chapters)
+
+    # Log summary
     log(f"Detected {len(chapters)} chapters from RPP")
+    if chapters:
+        log(f"  First segment: {chapters[0].title} @ {_sec_to_ts(chapters[0].start_seconds)}")
+        log(f"  Last segment:  {chapters[-1].title} @ {_sec_to_ts(chapters[-1].start_seconds)} → {_sec_to_ts(chapters[-1].end_seconds)}")
+    
     return chapters
+
+
+def _sec_to_ts(sec: float) -> str:
+    """Convert seconds to HH:MM:SS.xxx format."""
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = sec % 60
+    return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 
 # ── Style presets ───────────────────────────────────────────────

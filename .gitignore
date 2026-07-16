@@ -1,34 +1,58 @@
-﻿*.rpp
-*.RPP
-_suviren_q_build/
-*.mp3
-*.wav
-*.m4a
-*.flac
-*.mp4
-*.mov
-*.avi
-*.mkv
+﻿# Python
 __pycache__/
 *.pyc
-# suviren-q local/build files
-_suviren_q_local/
-
-# Python
 *.pyo
 *.pyd
 .venv/
 venv/
 env/
 
-# Media and heavy files
+# Media — heavy files, never commit
+*.mp3
+*.wav
+*.m4a
+*.flac
 *.aac
 *.ogg
+*.mp4
+*.mov
+*.avi
+*.mkv
 
-# REAPER projects usually contain local paths and private project data
+# User data — needs manual setup after clone
+data/
+
+# Vite cache
+.vite/
+
+# REAPER project files (local paths, private)
 *.rpp
+*.RPP
+
+# Build outputs — specific ignores, NOT full _suviren_q_build/
+_suviren_q_local/
+_suviren_q_build/*.mp4
+_suviren_q_build/*.wav
+_suviren_q_build/*.log
+_suviren_q_build/render.lock
+_suviren_q_build/test_60sec.mp4
+_suviren_q_build/zina_book_youtube_full.mp4
+render.lock
+*.log
+*.bak
+
+# Node / UI
 node_modules/
 ui/node_modules/
 ui/dist/
+
+# Windows shortcuts (local user paths)
+*.lnk
+
+# Launcher scripts with absolute local paths
+_suviren_q_build/Book_Wunderwaffe_GUI.bat
+_suviren_q_build/Book_Wunderwaffe_CLI.bat
+
+# Secrets
 .env
 .env.local
