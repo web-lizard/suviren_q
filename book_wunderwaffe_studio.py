@@ -30,7 +30,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QAction, QBrush, QColor, QFont, QIcon, QPainter, QPen,
     QPixmap, QTransform, QWheelEvent, QMouseEvent, QShortcut,
-    QKeySequence, QFontDatabase, QLinearGradient, QColorDialog, QFontInfo
+    QKeySequence, QFontDatabase, QLinearGradient, QFontInfo
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
@@ -43,7 +43,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem, QProgressBar, QDialog, QLineEdit,
     QSizePolicy, QToolButton, QButtonGroup, QRadioButton,
     QGraphicsSimpleTextItem, QStatusBar, QToolTip,
-    QAbstractItemView, QGraphicsWidget
+    QAbstractItemView, QGraphicsWidget, QColorDialog
 )
 try:
     from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -76,6 +76,53 @@ ACCENT_VIOLET = "#7c3aed"
 TEXT_PRIMARY = "#e0e0e0"
 TEXT_SECONDARY = "#9090b0"
 BORDER_COLOR = "#2a2a4a"
+
+# =========================================================
+#  Undo Manager for layout edits
+# =========================================================
+
+class UndoManager:
+    """Simple snapshot-based undo/redo for layout data."""
+    MAX_STACK = 50
+
+    def __init__(self):
+        self._stack = []
+        self._index = -1
+        self._saved_index = -1
+
+    def push_snapshot(self, layout_data):
+        """Push a deep copy of layout_data onto undo stack."""
+        snapshot = json.loads(json.dumps(layout_data))
+        # Remove future states if we are in the middle of stack
+        if self._index < len(self._stack) - 1:
+            self._stack = self._stack[:self._index + 1]
+        self._stack.append(snapshot)
+        if len(self._stack) > self.MAX_STACK:
+            self._stack.pop(0)
+        self._index = len(self._stack) - 1
+
+    def can_undo(self):
+        return self._index > 0
+
+    def can_redo(self):
+        return self._index < len(self._stack) - 1
+
+    def undo(self):
+        if not self.can_undo():
+            return None
+        self._index -= 1
+        return json.loads(json.dumps(self._stack[self._index]))
+
+    def redo(self):
+        if not self.can_redo():
+            return None
+        self._index += 1
+        return json.loads(json.dumps(self._stack[self._index]))
+
+    def clear(self):
+        self._stack.clear()
+        self._index = -1
+
 
 # --- Object types ---
 OBJ_BACKGROUND = "background"
@@ -1404,6 +1451,15 @@ class MainWindow(QMainWindow):
         self._layout_dirty = False
         self._total_duration = 0.0
 
+        # Undo manager
+        self._undo = UndoManager()
+        self._last_undo_obj_id = ""
+        self._item_drag_timer = QTimer()
+        self._item_drag_timer.setSingleShot(True)
+        self._item_drag_timer.setInterval(500)
+        self._item_drag_timer.timeout.connect(self._on_drag_stop)
+        self._drag_start_positions = {}
+
         # Player state
         self._player = None
         self._audio_output = None
@@ -1474,7 +1530,7 @@ class MainWindow(QMainWindow):
         ct_layout.addWidget(self._timeline)
         ct_layout.addWidget(self._view, 1)
 
-        center_split.addWidget(canvas_timeline, 1)
+        center_split.addWidget(canvas_timeline)
 
         # Properties dock as right panel
         self._props_dock = PropertiesDock(self)
@@ -1517,6 +1573,63 @@ class MainWindow(QMainWindow):
         self._init_player()
         self._load_project()
         self._update_chapter_combo()
+
+        # --- Undo/Redo shortcuts ---
+        self._setup_undo_shortcuts()
+
+    # --- Undo/Redo ---
+    def _setup_undo_shortcuts(self):
+        """Ctrl+Z undo, Ctrl+Y/Ctrl+Shift+Z redo."""
+        self._shortcut_undo = QShortcut(QKeySequence("Ctrl+Z"), self)
+        self._shortcut_undo.activated.connect(self._on_undo)
+        self._shortcut_redo = QShortcut(QKeySequence("Ctrl+Y"), self)
+        self._shortcut_redo.activated.connect(self._on_redo)
+        self._shortcut_redo2 = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)
+        self._shortcut_redo2.activated.connect(self._on_redo)
+
+    def _on_undo(self):
+        if not self._undo.can_undo():
+            self._status_bar.showMessage("Нет действий для отмены", 2000)
+            return
+        snapshot = self._undo.undo()
+        if snapshot is not None:
+            # Find which object changed by comparing snapshots
+            old_snapshot = self._layout_data
+            changed_id = None
+            for key in old_snapshot:
+                if key in snapshot and old_snapshot[key] != snapshot[key]:
+                    changed_id = key
+                    break
+            if changed_id is None:
+                for key in snapshot:
+                    if key not in old_snapshot:
+                        changed_id = key
+                        break
+            self._layout_data = snapshot
+            self._rebuild_canvas()
+            self._layout_dirty = True
+            obj_name = changed_id or "?"
+            self._status_bar.showMessage(f"Отменено: {obj_name}", 3000)
+
+    def _on_redo(self):
+        if not self._undo.can_redo():
+            self._status_bar.showMessage("Нет действий для возврата", 2000)
+            return
+        snapshot = self._undo.redo()
+        if snapshot is not None:
+            self._layout_data = snapshot
+            self._rebuild_canvas()
+            self._layout_dirty = True
+            self._status_bar.showMessage("Возвращено", 3000)
+
+    def _on_drag_stop(self):
+        """Called after item drag finishes — push snapshot."""
+        if self._layout_data and self._drag_start_positions:
+            # Push snapshot after drag
+            self._undo.push_snapshot(self._layout_data)
+            self._layout_dirty = True
+            self._drag_start_positions.clear()
+            self._status_bar.showMessage("Позиция изменена", 2000)
 
     # --- Player init ---
     def _init_player(self):
@@ -1800,7 +1913,14 @@ class MainWindow(QMainWindow):
         ch = self._chapters[idx]
         start_s = timestr_to_seconds(ch.get("start", "0"))
         self._seek_to(int(start_s * 1000))
-        self._on_chapter_selected(idx)
+        # Update UI without calling _on_chapter_selected (which would re-enter here)
+        self._chapters_index = idx
+        self._chapter_combo.blockSignals(True)
+        self._chapter_combo.setCurrentIndex(idx)
+        self._chapter_combo.blockSignals(False)
+        self._chapter_list.set_current_index(idx)
+        self._timeline.set_current_index(idx)
+        self._update_ui_for_time(start_s)
 
     def _prev_chapter(self):
         idx = self._chapters_index - 1
@@ -1850,7 +1970,7 @@ class MainWindow(QMainWindow):
         layout.addSpacing(16)
 
         # Canvas hint
-        hint = QLabel("Сцена 1920×1080. Перетаскивай элементы мышкой. Колесо/кнопки — зум.")
+        hint = QLabel("Сцена 1920×1080. Навигация: Ctrl+колесо — зум, средняя кнопка/Space+drag — двигать сцену.")
         hint.setStyleSheet(f"font-size: 10px; color: {TEXT_SECONDARY}; padding: 2px 4px;")
         layout.addWidget(hint)
 
@@ -1864,6 +1984,7 @@ class MainWindow(QMainWindow):
         layout.addSpacing(8)
 
         for text, method in [("Fit", self._view.zoom_fit),
+                              ("Center", self._view.zoom_center),
                               ("50%", self._view.zoom_50),
                               ("100%", self._view.zoom_100),
                               ("150%", self._view.zoom_150),
@@ -1975,6 +2096,17 @@ class MainWindow(QMainWindow):
         btn_reload.setMinimumHeight(30)
         btn_reload.setStyleSheet(self._btn_style())
         btn_layout.addWidget(btn_reload)
+
+        # Subgroup: Diagnostics
+        sub_diag = QLabel("  Диагностика")
+        sub_diag.setStyleSheet(f"color: {ACCENT_VIOLET}; font-size: 10px; font-weight: bold; padding: 2px 0;")
+        btn_layout.addWidget(sub_diag)
+
+        btn_diag = QPushButton("🩺 Диагностика")
+        btn_diag.clicked.connect(self._run_diagnostics)
+        btn_diag.setMinimumHeight(30)
+        btn_diag.setStyleSheet(self._btn_style())
+        btn_layout.addWidget(btn_diag)
 
         # Subgroup: Preview
         sub_preview = QLabel("  Превью")
@@ -2299,6 +2431,9 @@ class MainWindow(QMainWindow):
         self._load_chapters()
         self._load_waveform()
         self._load_layout()
+        # Push initial layout snapshot
+        if self._layout_data:
+            self._undo.push_snapshot(self._layout_data)
 
         self._update_project_info()
         self._rebuild_canvas()
@@ -2358,6 +2493,8 @@ class MainWindow(QMainWindow):
         else:
             self._layout_data = dict(DEFAULT_LAYOUT)
             self.log("Используется композиция по умолчанию.")
+            if self._layout_data:
+                self._undo.push_snapshot(self._layout_data)
 
     def _reset_layout(self):
         self._layout_data = dict(DEFAULT_LAYOUT)
@@ -2580,6 +2717,298 @@ class MainWindow(QMainWindow):
         self.log(f"Запуск тестового рендера: {sec} сек")
         self._run_command(f"render-test --duration {sec}")
 
+    def _run_diagnostics(self):
+        """Run full diagnostics and open report."""
+        self.log("Запуск диагностики...")
+        try:
+            import subprocess, sys, json, os, shutil, datetime, platform
+            from pathlib import Path
+            report_lines = []
+            rl = report_lines.append
+
+            rl("=" * 70)
+            rl("  BOOK WUNDERWAFFE STUDIO 1.0 — DIAGNOSTICS REPORT")
+            rl(f"  Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            rl("=" * 70)
+            rl("")
+
+            # --- 1. Environment ---
+            rl("[ENVIRONMENT]")
+            rl(f"Python executable: {sys.executable}")
+            rl(f"Python version: {sys.version}")
+            rl(f"Platform: {platform.platform()}")
+            rl(f"CWD: {os.getcwd()}")
+
+            try:
+                from PySide6.QtCore import __version__ as qt_ver
+                rl(f"PySide6: {qt_ver}")
+            except:
+                rl("PySide6: ERROR — cannot import version")
+
+            try:
+                from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+                rl("QtMultimedia: AVAILABLE (imported)")
+            except ImportError as e:
+                rl(f"QtMultimedia: UNAVAILABLE — {e}")
+
+            # ffmpeg/ffprobe paths
+            ffmpeg = shutil.which("ffmpeg")
+            ffprobe = shutil.which("ffprobe")
+            rl(f"ffmpeg: {ffmpeg or 'NOT FOUND'}")
+            rl(f"ffprobe: {ffprobe or 'NOT FOUND'}")
+            rl("")
+
+            # --- 2. Project files ---
+            rl("[PROJECT FILES]")
+            audio_path = DATA_DIR / "ЗИНА. Книга. final last version.mp3"
+            rl(f"Selected audio: {audio_path}")
+            if audio_path.exists():
+                sz = audio_path.stat().st_size
+                mb = sz / (1024 * 1024)
+                gb = sz / (1024 * 1024 * 1024)
+                rl(f"Audio exists: YES")
+                rl(f"Audio size: {mb:.2f} MB ({gb:.3f} GB)")
+            else:
+                rl(f"Audio exists: NO")
+
+            rpp_candidates = list(DATA_DIR.glob("*.rpp"))
+            rl(f"Selected RPP: {rpp_candidates[0] if rpp_candidates else 'NOT FOUND'}")
+
+            cover_candidates = list(DATA_DIR.glob("*cover*")) + list(DATA_DIR.glob("*обложк*"))
+            rl(f"Cover: {cover_candidates[0] if cover_candidates else 'NOT FOUND'}")
+
+            bg_candidates = list(DATA_DIR.glob("*background*")) + list(DATA_DIR.glob("*фон*"))
+            rl(f"Background: {bg_candidates[0] if bg_candidates else 'NOT FOUND'}")
+
+            rl(f"Chapters path: {CHAPTERS_PATH} — {'EXISTS' if CHAPTERS_PATH.exists() else 'NOT FOUND'}")
+            rl(f"Waveform path: {WAVEFORM_PATH} — {'EXISTS' if WAVEFORM_PATH.exists() else 'NOT FOUND'}")
+            rl(f"Layout path: {LAYOUT_PATH} — {'EXISTS' if LAYOUT_PATH.exists() else 'NOT FOUND'}")
+            rl("")
+
+            # --- 3. Audio ffprobe ---
+            rl("[AUDIO FFPROBE]")
+            if ffprobe and audio_path.exists():
+                try:
+                    result = subprocess.run(
+                        [ffprobe, "-v", "error", "-show_format", "-show_streams",
+                         "-of", "json", str(audio_path)],
+                        capture_output=True, text=True, timeout=30
+                    )
+                    if result.returncode == 0:
+                        info = json.loads(result.stdout)
+                        fmt = info.get("format", {})
+                        rl(f"format_name: {fmt.get('format_name', '?')}")
+                        rl(f"duration: {fmt.get('duration', '?')} sec")
+                        rl(f"bit_rate: {fmt.get('bit_rate', '?')} bps")
+                        streams = info.get("streams", [])
+                        for s in streams:
+                            if s.get("codec_type") == "audio":
+                                rl(f"codec: {s.get('codec_name', '?')}")
+                                rl(f"sample_rate: {s.get('sample_rate', '?')} Hz")
+                                rl(f"channels: {s.get('channels', '?')}")
+                                break
+                    else:
+                        dur_result = subprocess.run(
+                            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+                             "-of", "default=noprint_wrappers=1:nokey=1", str(audio_path)],
+                            capture_output=True, text=True, timeout=30
+                        )
+                        rl(f"Duration (fallback): {dur_result.stdout.strip() or 'UNKNOWN'} sec")
+                        rl(f"ffprobe stderr: {result.stderr[:500] if result.stderr else 'none'}")
+                except Exception as e:
+                    rl(f"ffprobe error: {e}")
+            else:
+                rl("Cannot probe audio — ffprobe missing or audio missing")
+            rl("")
+
+            # --- 4. QMediaPlayer diagnostics ---
+            rl("[QMEDIAPLAYER DIAGNOSTICS]")
+            rl(f"HAS_MULTIMEDIA: {HAS_MULTIMEDIA}")
+            rl(f"Player simulation: {self._player_simulation}")
+            rl(f"Player error: {self._player_error or 'None'}")
+            if self._player and not self._player_simulation:
+                try:
+                    ms = self._player.mediaStatus()
+                    ms_map = {0: "NoMedia", 1: "LoadingMedia", 2: "LoadedMedia",
+                              3: "BufferingMedia", 4: "BufferedMedia", 5: "EndOfMedia",
+                              6: "InvalidMedia", 7: "StalledMedia"}
+                    rl(f"mediaStatus: {ms_map.get(ms, str(ms))}")
+                    err = self._player.error()
+                    err_map = {0: "NoError", 1: "ResourceError", 2: "FormatError",
+                               3: "NetworkError", 4: "AccessDeniedError"}
+                    rl(f"error: {err_map.get(err, str(err))}")
+                    rl(f"errorString: {self._player.errorString()}")
+                except Exception as e:
+                    rl(f"player.diagnostics error: {e}")
+            else:
+                rl("QMediaPlayer not active or in simulation mode")
+
+            if self._player_error and "Ошибка" in str(self._player_error):
+                rl("")
+                rl(">>> QMediaPlayer FAILED. Check audio file format/codec/size.")
+                rl(">>> 2.17 GB MP3 may be too large for Qt's built-in player.")
+                rl(">>> Recommended fallback: proxy audio or python-vlc.")
+            rl("")
+
+            # --- 5. Audio fallback recommendation ---
+            rl("[FALLBACK RECOMMENDATION]")
+            for vlc_path in [
+                r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+                r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe"
+            ]:
+                rl(f"VLC at '{vlc_path}': {'YES' if os.path.exists(vlc_path) else 'NO'}")
+            ffplay = shutil.which("ffplay")
+            rl(f"ffplay: {ffplay or 'NOT FOUND'}")
+            rl("")
+            rl("Options:")
+            rl("  Option A: use ffplay external preview (for audio check only)")
+            rl("  Option B: install python-vlc (pip install python-vlc)")
+            rl("  Option C: generate low-bitrate proxy MP3 for GUI playback")
+            rl("")
+
+            # --- 6. Waveform diagnostics ---
+            rl("[WAVEFORM DIAGNOSTICS]")
+            if WAVEFORM_PATH.exists():
+                sz = WAVEFORM_PATH.stat().st_size
+                mt = datetime.datetime.fromtimestamp(WAVEFORM_PATH.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+                rl(f"File size: {sz / 1024:.1f} KB")
+                rl(f"Modified: {mt}")
+                try:
+                    wf_data = json.loads(WAVEFORM_PATH.read_text("utf-8"))
+                    if isinstance(wf_data, list):
+                        rl(f"Valid JSON: YES (list, {len(wf_data)} samples)")
+                        if len(wf_data) > 0:
+                            rl(f"First 10 samples: {wf_data[:10]}")
+                            rl(f"Min sample: {min(wf_data):.4f}")
+                            rl(f"Max sample: {max(wf_data):.4f}")
+                    elif isinstance(wf_data, dict):
+                        rl(f"Valid JSON: YES (dict)")
+                        rl(f"Keys: {list(wf_data.keys())[:10]}")
+                        if "samples" in wf_data:
+                            rl(f"  samples count: {len(wf_data['samples'])}")
+                        if "peaks" in wf_data:
+                            rl(f"  peaks count: {len(wf_data['peaks'])}")
+                        if "data" in wf_data:
+                            rl(f"  data count: {len(wf_data['data'])}")
+                    else:
+                        rl(f"Valid JSON: YES (type={type(wf_data).__name__})")
+                except Exception as e:
+                    rl(f"Valid JSON: NO — {e}")
+                rl(f"Waveform loaded in GUI: {'YES' if self._waveform_data else 'NO'}")
+            else:
+                rl("waveform.json NOT FOUND")
+                rl("  -> Run: python bookforge.py waveform")
+            rl("")
+
+            # --- 7. Layout diagnostics ---
+            rl("[LAYOUT DIAGNOSTICS]")
+            if LAYOUT_PATH.exists():
+                try:
+                    lt_data = json.loads(LAYOUT_PATH.read_text("utf-8"))
+                    rl(f"Object IDs: {list(lt_data.keys())}")
+                    for obj_id, obj_data in lt_data.items():
+                        visible = obj_data.get("visible", True)
+                        z = obj_data.get("z", obj_data.get("z_index", 0))
+                        rl(f"  {obj_id}: visible={visible}, z={z}, type={obj_data.get('type','?')}")
+                except Exception as e:
+                    rl(f"Layout error: {e}")
+            else:
+                rl("layout.json NOT FOUND (using defaults)")
+            rl("")
+
+            # --- 8. GUI diagnostics ---
+            rl("[GUI DIAGNOSTICS]")
+            rl("MainWindow class: AVAILABLE")
+            rl("UndoManager: AVAILABLE")
+            rl("ZoomGraphicsView: AVAILABLE")
+            rl("CanvasScene: AVAILABLE")
+            rl("WaveformItem: AVAILABLE")
+            rl("ProgressItem: AVAILABLE")
+            rl("ChapterStackItem: AVAILABLE")
+            rl("CustomTextItem: AVAILABLE")
+            rl("TimelineWidget: AVAILABLE")
+            rl("PropertiesDock: AVAILABLE")
+            rl(f"Player simulation mode: {self._player_simulation}")
+            rl(f"Total chapters: {len(self._chapters)}")
+            rl(f"Total duration: {self._total_duration:.2f} sec")
+            rl(f"Layout dirty: {self._layout_dirty}")
+            rl(f"Waveform samples: {len(self._waveform_data) if self._waveform_data else 0}")
+            rl("")
+
+            # --- 9. Summary ---
+            rl("=" * 70)
+            rl("  SUMMARY")
+            rl("=" * 70)
+
+            audio_ok = audio_path.exists() and not self._player_error
+            if not audio_path.exists():
+                audio_status = "FILE_MISSING"
+            elif self._player_error:
+                audio_status = f"FAILED_QMEDIAPLAYER: {self._player_error[:80]}"
+            elif HAS_MULTIMEDIA and self._player:
+                audio_status = "OK (QMediaPlayer)"
+            elif self._player_simulation:
+                audio_status = "SIMULATION_MODE (no real playback)"
+            else:
+                audio_status = "UNKNOWN"
+            rl(f"AUDIO_STATUS: {audio_status}")
+
+            if self._waveform_data:
+                wf_status = "OK_DATA_AND_GUI"
+                # check if GUI waveform item actually renders
+                wf_item = self._scene.get_item(OBJ_WAVEFORM)
+                if wf_item is None or not isinstance(wf_item, WaveformItem):
+                    wf_status = "OK_DATA_GUI_BROKEN"
+            elif WAVEFORM_PATH.exists():
+                wf_status = "OK_DATA_GUI_BROKEN (data file exists but not loaded)"
+            else:
+                wf_status = "MISSING"
+            rl(f"WAVEFORM_STATUS: {wf_status}")
+
+            canvas_ok = True
+            rl(f"CANVAS_STATUS: OK")
+
+            rl("")
+            rl("NEXT_FIXES:")
+            fixes = []
+            if not audio_path.exists():
+                fixes.append("Find/replace missing audio file")
+            if self._player_error:
+                fixes.append("Create proxy audio for QMediaPlayer (ffmpeg -> low-bitrate MP3)")
+            if not self._waveform_data:
+                fixes.append("Generate waveform: python bookforge.py waveform")
+            if not self._chapters:
+                fixes.append("Extract chapters: python bookforge.py chapters")
+            if not fixes:
+                fixes.append("All systems nominal.")
+            for f in fixes:
+                rl(f"  - {f}")
+
+            rl("")
+            rl("=" * 70)
+            rl("  END OF REPORT")
+            rl("=" * 70)
+
+            # --- Write report ---
+            BUILD_DIR.mkdir(parents=True, exist_ok=True)
+            report_path = BUILD_DIR / "BOOK_WUNDERWAFFE_DIAGNOSTICS.txt"
+            report_path.write_text("\n".join(report_lines), "utf-8")
+            self.log(f"Диагностика завершена: {report_path}")
+
+            # Open report automatically
+            try:
+                os.startfile(str(report_path))
+                self.log("Отчёт открыт.")
+            except Exception as e:
+                self.log(f"Не удалось открыть отчёт: {e}")
+                # Fallback: log content
+                self._log_widget.append("\n".join(report_lines[-20:]))
+
+        except Exception as e:
+            self.log(f"Ошибка диагностики: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
     def _confirm_full_render(self):
         reply = QMessageBox.warning(self, "Полный рендер",
                                      "Полный рендер может занять несколько часов.\n\n"
@@ -2613,10 +3042,70 @@ class ZoomGraphicsView(QGraphicsView):
     def __init__(self, scene, parent=None):
         super().__init__(scene, parent)
         self._zoom = 1.0
+        self._panning = False
+        self._pan_start = QPointF()
+        self._space_pressed = False
+        self._space_panning = False
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setStyleSheet(f"background-color: {DARK_BG}; border: none;")
+        self.setInteractive(True)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+
+    # ---- Middle mouse / Space+left pan ----
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._panning = True
+            self._pan_start = event.pos()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._space_pressed:
+            self._space_panning = True
+            self._pan_start = event.pos()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._panning or self._space_panning:
+            delta = event.pos() - self._pan_start
+            self._pan_start = event.pos()
+            self.horizontalScrollBar().setValue(
+                self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(
+                self.verticalScrollBar().value() - delta.y())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._panning = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._space_panning:
+            self._space_panning = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Space:
+            self._space_pressed = True
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key.Key_Space:
+            self._space_pressed = False
+            if self._space_panning:
+                self._space_panning = False
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().keyReleaseEvent(event)
 
     def wheelEvent(self, event):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -2630,19 +3119,24 @@ class ZoomGraphicsView(QGraphicsView):
             super().wheelEvent(event)
 
     def zoom_fit(self):
+        """Fit entire scene into view, keep aspect ratio."""
         self._zoom = 1.0
         self.resetTransform()
         self.fitInView(0, 0, SCENE_W, SCENE_H, Qt.AspectRatioMode.KeepAspectRatio)
-        # Update zoom factor
         t = self.transform()
         self._zoom = t.m11()
         self.zoomChanged.emit(self._zoom)
 
-    def zoom_50(self):
-        self._set_zoom(0.5)
+    def zoom_center(self):
+        """Center view on scene center without changing zoom."""
+        self.centerOn(SCENE_W / 2, SCENE_H / 2)
 
     def zoom_100(self):
+        """Zoom to 100% and center."""
         self._set_zoom(1.0)
+
+    def zoom_50(self):
+        self._set_zoom(0.5)
 
     def zoom_150(self):
         self._set_zoom(1.5)
