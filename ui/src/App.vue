@@ -154,7 +154,7 @@
             <span aria-hidden="true">◖</span>
             <input type="range" min="0" max="1" step="0.01" v-model.number="volume" @input="applyVolume" />
           </label>
-          <audio ref="audioEl" :src="audioSource" crossorigin="anonymous" preload="metadata"
+          <audio :key="audioSource || 'audio-empty'" ref="audioEl" :src="audioSource" crossorigin="anonymous" preload="metadata"
                  @loadedmetadata="onMediaMetadata('audio')" @timeupdate="onMediaTime('audio')"
                  @play="onMediaPlay('audio')" @pause="onMediaPause('audio')"
                  @ended="onMediaEnded('audio')" @error="onMediaError('audio')"></audio>
@@ -486,10 +486,6 @@ let renderPoll = null
 let noticeTimer = null
 let playbackFrame = null
 let visualFrame = null
-let audioContext = null
-let analyser = null
-let activeSourceNode = null
-const mediaSourceNodes = new WeakMap()
 const objectUrls = new Set()
 
 const assetById = (id) => project.materials.find((item) => item.id === id) || null
@@ -1186,34 +1182,6 @@ function secondaryTimeAt(absoluteTime) {
   return absoluteTime
 }
 
-async function ensureAudioGraph() {
-  const element = masterElement()
-  if (!element || !globalThis.AudioContext && !globalThis.webkitAudioContext) return
-  try {
-    if (!audioContext) {
-      const AudioContextClass = globalThis.AudioContext || globalThis.webkitAudioContext
-      audioContext = new AudioContextClass()
-      analyser = audioContext.createAnalyser()
-      analyser.fftSize = 256
-      analyser.smoothingTimeConstant = 0.84
-      analyser.connect(audioContext.destination)
-    }
-    if (activeSourceNode !== mediaSourceNodes.get(element)) {
-      activeSourceNode?.disconnect()
-      let source = mediaSourceNodes.get(element)
-      if (!source) {
-        source = audioContext.createMediaElementSource(element)
-        mediaSourceNodes.set(element, source)
-      }
-      source.connect(analyser)
-      activeSourceNode = source
-    }
-    await audioContext.resume()
-  } catch {
-    // Browsers can reject analysis for a codec/CORS combination; playback remains available.
-  }
-}
-
 async function togglePlay() {
   const master = masterElement()
   if (!master) return setNotice('Сначала добавьте аудио или видео', 'warning')
@@ -1221,7 +1189,16 @@ async function togglePlay() {
     pauseAll()
     return
   }
-  await ensureAudioGraph()
+
+  // Keep the audible master on the browser's native media path. Capturing the
+  // element in a suspended Web Audio graph can leave Firefox playing silence.
+  const level = Math.min(1, Math.max(0, Number(volume.value) || 0))
+  master.volume = level
+  if (master === audioEl.value) {
+    master.defaultMuted = false
+    master.muted = false
+  }
+
   const secondary = secondaryElement()
   if (secondary) {
     secondary.muted = true
@@ -1316,7 +1293,14 @@ function tickPlayback() {
 
 function applyVolume() {
   const master = masterElement()
-  if (master) master.volume = volume.value
+  const level = Math.min(1, Math.max(0, Number(volume.value) || 0))
+  if (master) {
+    master.volume = level
+    if (master === audioEl.value) {
+      master.defaultMuted = false
+      master.muted = false
+    }
+  }
   if (videoEl.value && masterKind.value === 'audio') videoEl.value.muted = true
 }
 
@@ -1356,19 +1340,17 @@ function drawVisualizer() {
     }
 
     const count = 96
-    let values
-    if (analyser && playing.value) {
-      const raw = new Uint8Array(analyser.frequencyBinCount)
-      analyser.getByteFrequencyData(raw)
-      values = Array.from({ length: count }, (_, index) => raw[Math.min(raw.length - 1, Math.floor(index / count * raw.length))] / 255)
-    } else {
-      const source = waveformSamples.value
-      const offset = duration.value ? Math.floor(currentTime.value / duration.value * Math.max(0, source.length - count)) : 0
-      values = Array.from({ length: count }, (_, index) => {
-        if (source.length) return Math.min(1, Math.abs(Number(source[(offset + index * 7) % source.length]) || 0) * 1.25)
-        return 0.18 + Math.abs(Math.sin(index * 0.31 + currentTime.value * 0.25) * Math.cos(index * 0.09)) * 0.48
-      })
-    }
+    const source = waveformSamples.value
+    const offset = duration.value ? Math.floor(currentTime.value / duration.value * Math.max(0, source.length - count)) : 0
+    const motion = playing.value ? currentTime.value * 3.2 : 0
+    const values = Array.from({ length: count }, (_, index) => {
+      if (source.length) {
+        const sample = Math.abs(Number(source[(offset + index * 7) % source.length]) || 0)
+        const pulse = playing.value ? 0.78 + Math.abs(Math.sin(motion + index * 0.37)) * 0.3 : 0.92
+        return Math.min(1, Math.max(0.035, sample * 1.22 * pulse))
+      }
+      return 0.18 + Math.abs(Math.sin(index * 0.31 + currentTime.value * 0.25) * Math.cos(index * 0.09)) * 0.48
+    })
 
     const points = values.map((value, index) => ({
       x: index / (values.length - 1) * width,
@@ -1527,6 +1509,5 @@ onBeforeUnmount(() => {
   clearInterval(renderPoll)
   clearTimeout(noticeTimer)
   releaseObjectUrls()
-  audioContext?.close?.()
 })
 </script>
