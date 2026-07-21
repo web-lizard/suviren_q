@@ -101,9 +101,10 @@
           <div class="scene-backdrop" :style="backgroundStyle"></div>
           <video v-if="videoSource" ref="videoEl" class="scene-video" :src="videoSource" playsinline
                  crossorigin="anonymous" preload="metadata" :muted="masterKind === 'audio'"
+                 :loop="masterKind === 'audio'"
                  @loadedmetadata="onMediaMetadata('video')" @timeupdate="onMediaTime('video')"
                  @play="onMediaPlay('video')" @pause="onMediaPause('video')"
-                 @ended="onMediaEnded" @error="onMediaError('video')"></video>
+                 @ended="onMediaEnded('video')" @error="onMediaError('video')"></video>
           <div class="scene-grade"></div>
           <div class="scene-grid" aria-hidden="true"></div>
           <div v-if="project.glitch" class="glitch-scan" aria-hidden="true"></div>
@@ -156,7 +157,7 @@
           <audio ref="audioEl" :src="audioSource" crossorigin="anonymous" preload="metadata"
                  @loadedmetadata="onMediaMetadata('audio')" @timeupdate="onMediaTime('audio')"
                  @play="onMediaPlay('audio')" @pause="onMediaPause('audio')"
-                 @ended="onMediaEnded" @error="onMediaError('audio')"></audio>
+                 @ended="onMediaEnded('audio')" @error="onMediaError('audio')"></audio>
         </div>
       </section>
 
@@ -380,6 +381,7 @@
             <input v-model="exportTest" type="checkbox" /><i></i>
           </label>
           <p v-if="exportIssue" class="export-issue">{{ exportIssue }}</p>
+          <p v-for="warning in exportReadiness?.warnings || []" :key="warning" class="export-warning">{{ warning }}</p>
           <button type="button" class="modal-primary" :disabled="!!exportIssue || startingExport" @click="startExport">
             {{ startingExport ? 'Подготавливаю…' : exportTest ? 'Собрать тест 60 секунд' : 'Начать полный экспорт' }}
           </button>
@@ -393,6 +395,7 @@
           <p class="render-state-copy">{{ renderStateCopy }}</p>
           <div class="render-progress"><i :style="{ width: `${Math.round((renderJob.progress || 0) * 100)}%` }"></i></div>
           <a v-if="renderJob.status === 'done' && renderJob.download_url" class="modal-primary download-link" :href="renderJob.download_url">Скачать MP4</a>
+          <button v-if="renderJob.status === 'done'" type="button" class="modal-secondary" @click="resetExport">Новый экспорт</button>
           <button v-if="renderJob.status === 'failed'" type="button" class="modal-primary" @click="renderJob = null">Вернуться к настройкам</button>
           <pre v-if="renderJob.status === 'failed' && renderJob.log?.length" class="render-error">{{ renderJob.log.slice(-4).join('\n') }}</pre>
         </template>
@@ -412,8 +415,8 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 
 const API = import.meta.env.VITE_API_URL || '/api'
 const AUDIO_EXT = new Set(['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'])
-const VIDEO_EXT = new Set(['mp4', 'mov', 'm4v', 'webm', 'mkv'])
-const IMAGE_EXT = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif'])
+const VIDEO_EXT = new Set(['mp4', 'mov', 'm4v', 'webm', 'mkv', 'avi'])
+const IMAGE_EXT = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'])
 
 const DEFAULT_LAYERS = {
   cover: { visible: true, x: 7, y: 17, w: 27, h: 66 },
@@ -504,7 +507,8 @@ const chapterMax = computed(() => project.chapters.reduce((max, item) => Math.ma
 const sceneMax = computed(() => project.scenes.reduce((max, item) => Math.max(max, Number(item.end) || 0), 0))
 const duration = computed(() => {
   const media = masterKind.value === 'audio' ? audioDuration.value : videoDuration.value
-  return Math.max(Number.isFinite(media) ? media : 0, chapterMax.value, sceneMax.value, 0)
+  if (Number.isFinite(media) && media > 0) return media
+  return Math.max(chapterMax.value, sceneMax.value, 0)
 })
 const progressPercent = computed(() => duration.value ? Math.min(100, Math.max(0, currentTime.value / duration.value * 100)) : 0)
 
@@ -534,8 +538,6 @@ const currentChapter = computed(() => {
 const currentScene = computed(() => {
   const sorted = [...project.scenes].sort((a, b) => a.start - b.start)
   return [...sorted].reverse().find((scene) => currentTime.value >= scene.start && currentTime.value < scene.end)
-    || [...sorted].reverse().find((scene) => currentTime.value >= scene.start)
-    || sorted[0]
     || null
 })
 
@@ -585,8 +587,10 @@ const exportIssue = computed(() => {
       cover: 'Backend не видит выбранную обложку.',
       chapters: 'Главы не сохранены.',
       'audio-decodable': 'Выбранный аудиофайл повреждён или не читается FFmpeg. Назначьте другую копию из материалов.',
-      'chapters-duration-mismatch': 'Главы не покрывают всю аудиокнигу. Обновите разметку из RPP.',
+      'chapters-duration-mismatch': 'Главы не покрывают всю аудиокнигу. Продлите последнюю главу или обновите разметку из RPP.',
       'chapters-outside-audio': 'Разметка глав выходит за пределы аудиофайла.',
+      'chapters-start-after-audio': 'Первая глава должна начинаться с 00:00:00.',
+      'chapters-have-gaps': 'Между главами есть непокрытый интервал.',
       ffmpeg: 'FFmpeg не найден.',
       ffprobe: 'FFprobe не найден.',
     }
@@ -718,6 +722,7 @@ function replaceProject(value) {
 function serializeProject() {
   return {
     ...clone(project),
+    duration_seconds: duration.value,
     updatedAt: new Date().toISOString(),
     materials: project.materials.map(({ file, src, progress, ...asset }) => ({ ...asset, status: asset.serverPath ? 'ready' : 'missing' })),
     chapters: timelineChapters.value.map(({ index, ...chapter }) => chapter),
@@ -741,7 +746,10 @@ async function apiRequest(path, options = {}) {
   const text = await response.text()
   let data = null
   try { data = text ? JSON.parse(text) : {} } catch { data = { detail: text } }
-  if (!response.ok) throw new Error(data.detail || data.message || `HTTP ${response.status}`)
+  if (!response.ok) {
+    const detail = typeof data.detail === 'string' ? data.detail : data.detail?.message
+    throw new Error(detail || data.message || `HTTP ${response.status}`)
+  }
   return data
 }
 
@@ -1100,7 +1108,7 @@ function updateChapterStart(chapter, value) {
 }
 
 function addChapterAtCursor() {
-  const start = Math.round(currentTime.value * 10) / 10
+  const start = project.chapters.length ? Math.round(currentTime.value * 10) / 10 : 0
   const chapter = normalizeChapter({ title: `Глава ${project.chapters.length + 1}`, start_seconds: start }, project.chapters.length)
   project.chapters.push(chapter)
   project.chapters.sort((a, b) => a.start_seconds - b.start_seconds)
@@ -1171,6 +1179,13 @@ function secondaryElement() {
   return masterKind.value === 'audio' && videoSource.value ? videoEl.value : null
 }
 
+function secondaryTimeAt(absoluteTime) {
+  const secondary = secondaryElement()
+  const secondaryDuration = Number(secondary?.duration)
+  if (Number.isFinite(secondaryDuration) && secondaryDuration > 0) return absoluteTime % secondaryDuration
+  return absoluteTime
+}
+
 async function ensureAudioGraph() {
   const element = masterElement()
   if (!element || !globalThis.AudioContext && !globalThis.webkitAudioContext) return
@@ -1210,7 +1225,8 @@ async function togglePlay() {
   const secondary = secondaryElement()
   if (secondary) {
     secondary.muted = true
-    if (Math.abs(secondary.currentTime - master.currentTime) > 0.08) secondary.currentTime = master.currentTime
+    const target = secondaryTimeAt(master.currentTime)
+    if (Math.abs(secondary.currentTime - target) > 0.08) secondary.currentTime = target
   }
   try {
     await master.play()
@@ -1241,7 +1257,8 @@ function seekTo(value) {
   currentTime.value = next
   for (const element of [audioEl.value, videoEl.value]) {
     if (element && Number.isFinite(element.duration) && Math.abs(element.currentTime - next) > 0.02) {
-      try { element.currentTime = Math.min(next, element.duration) } catch { /* metadata not ready */ }
+      const target = element === secondaryElement() ? secondaryTimeAt(next) : Math.min(next, element.duration)
+      try { element.currentTime = target } catch { /* metadata not ready */ }
     }
   }
 }
@@ -1263,7 +1280,8 @@ function onMediaTime(kind) {
   if (!master) return
   currentTime.value = master.currentTime || 0
   const secondary = secondaryElement()
-  if (secondary && Math.abs(secondary.currentTime - master.currentTime) > 0.22) secondary.currentTime = master.currentTime
+  const secondaryTarget = secondaryTimeAt(master.currentTime)
+  if (secondary && Math.abs(secondary.currentTime - secondaryTarget) > 0.22) secondary.currentTime = secondaryTarget
 }
 
 function onMediaPlay(kind) {
@@ -1279,7 +1297,8 @@ function onMediaPause(kind) {
   secondaryElement()?.pause()
 }
 
-function onMediaEnded() {
+function onMediaEnded(kind) {
+  if (kind !== masterKind.value) return
   pauseAll()
 }
 
@@ -1393,8 +1412,20 @@ async function openExport() {
   showExport.value = true
   if (backend.online) {
     try {
+      const running = await apiRequest('/render/status')
+      if (running.active && running.latest) {
+        renderJob.value = running.latest
+        clearInterval(renderPoll)
+        renderPoll = setInterval(() => pollRender(running.latest.id), 1200)
+        return
+      }
+      if (dirty.value) {
+        setNotice('Сохраняю актуальную разметку перед проверкой экспорта…', 'info', 0)
+        const saved = await saveProject({ silent: true })
+        if (!saved) return
+      }
       exportReadiness.value = await apiRequest('/export/readiness')
-      if (exportReadiness.value.missing?.includes('chapters-duration-mismatch')) {
+      if (exportReadiness.value.missing?.includes('chapters-duration-mismatch') && !exportReadiness.value.editorProject?.exists) {
         setNotice('Обновляю главы из исходного RPP…', 'info', 0)
         const refreshed = await apiRequest('/book-project/refresh-chapters', { method: 'POST' })
         if (refreshed.ok && refreshed.chapters?.length) {
@@ -1407,6 +1438,11 @@ async function openExport() {
       }
     } catch { /* client checks remain visible */ }
   }
+}
+
+async function resetExport() {
+  renderJob.value = null
+  await openExport()
 }
 
 function closeExport() {

@@ -47,9 +47,9 @@ CHAPTERS_PATH = BUILD_DIR / "chapters.detected.json"
 APP_NAME = "BOOK WUNDERWAFFE"
 APP_VERSION = "1.0.0"
 
-AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg"}
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg", ".opus"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi"}
 IMPORT_EXTENSIONS = AUDIO_EXTENSIONS | IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 EXPORT_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
 
@@ -57,13 +57,19 @@ app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=[
+        "http://127.0.0.1:5178",
+        "http://localhost:5178",
+        "http://127.0.0.1:4178",
+        "http://localhost:4178",
+    ],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
     allow_headers=["*"],
 )
 
 JOBS: dict[str, dict[str, Any]] = {}
+JOBS_LOCK = threading.Lock()
 AUDIO_PROBE_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
 AUDIO_DISCOVERY_CACHE: dict[tuple[str, int, int], float] = {}
 
@@ -294,28 +300,41 @@ def append_job_line(job_id: str, line: str) -> None:
 
 
 def start_job(kind: str, cmd: list[str], *, output: Path | None = None) -> str:
-    job_id = uuid.uuid4().hex[:12]
-    output_path = output.resolve() if output else None
-    JOBS[job_id] = {
-        "id": job_id,
-        "kind": kind,
-        "cmd": cmd,
-        "status": "running",
-        "returncode": None,
-        "progress": 0.0,
-        "created_at": time.time(),
-        "updated_at": time.time(),
-        "output": server_path(output_path) if output_path else None,
-        "download_url": (
-            f"/api/exports/{quote(output_path.name, safe='')}" if output_path else None
-        ),
-        "output_exists": False,
-        "output_size": 0,
-        "log": [
-            f"[BookForge] job started: {kind}",
-            "[cmd] " + " ".join(f'"{x}"' if " " in x else x for x in cmd),
-        ],
-    }
+    with JOBS_LOCK:
+        active_render = next(
+            (
+                job for job in JOBS.values()
+                if job["kind"] in ("render-test", "render-full") and job["status"] == "running"
+            ),
+            None,
+        )
+        if kind in ("render-test", "render-full") and active_render:
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "A render is already running", "job_id": active_render["id"]},
+            )
+        job_id = uuid.uuid4().hex[:12]
+        output_path = output.resolve() if output else None
+        JOBS[job_id] = {
+            "id": job_id,
+            "kind": kind,
+            "cmd": cmd,
+            "status": "running",
+            "returncode": None,
+            "progress": 0.0,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "output": server_path(output_path) if output_path else None,
+            "download_url": (
+                f"/api/exports/{quote(output_path.name, safe='')}" if output_path else None
+            ),
+            "output_exists": False,
+            "output_size": 0,
+            "log": [
+                f"[BookForge] job started: {kind}",
+                "[cmd] " + " ".join(f'"{x}"' if " " in x else x for x in cmd),
+            ],
+        }
     thread = threading.Thread(target=run_job, args=(job_id, cmd), daemon=True)
     thread.start()
     return job_id
@@ -686,6 +705,7 @@ def get_export_inputs() -> dict[str, Any]:
 
     role_specs = {
         "audio": ("audioAssetId", AUDIO_EXTENSIONS),
+        "video": ("videoAssetId", VIDEO_EXTENSIONS),
         "cover": ("coverAssetId", IMAGE_EXTENSIONS),
         "background": ("backgroundAssetId", IMAGE_EXTENSIONS),
     }
@@ -702,6 +722,17 @@ def get_export_inputs() -> dict[str, Any]:
         fallback = existing_discovered_path(discovered, name)
         selected[name] = fallback
         selected_from[name] = "discovery" if fallback else None
+
+    if selected.get("video"):
+        warnings.append(
+            "Видео работает в синхронном предпросмотре; текущий FFmpeg-экспорт "
+            "использует статический фон, обложку, главы и аудио."
+        )
+    if editor and (editor.get("scenes") or editor.get("layers")):
+        warnings.append(
+            "Позиции слоёв и покадровые сцены пока не переносятся в MP4: "
+            "экспорт использует стабильный статический шаблон рендера."
+        )
 
     chapters: list[dict[str, Any]] = []
     try:
@@ -895,6 +926,22 @@ def export_readiness_payload() -> dict[str, Any]:
 
     if audio_probe and audio_probe["ok"] and inputs["chapter_items"]:
         audio_duration = float(audio_probe["duration"])
+        ordered_chapters = sorted(inputs["chapter_items"], key=lambda item: float(item["start_seconds"]))
+        first_chapter_start = float(ordered_chapters[0]["start_seconds"])
+        if first_chapter_start > 0.25:
+            missing.append("chapters-start-after-audio")
+            errors.append(
+                f"First chapter starts at {format_timestamp(first_chapter_start)}; "
+                "the chapter map must cover the audio from 00:00:00"
+            )
+        for previous, current in zip(ordered_chapters, ordered_chapters[1:]):
+            gap = float(current["start_seconds"]) - float(previous["end_seconds"])
+            if gap > 0.25:
+                missing.append("chapters-have-gaps")
+                errors.append(
+                    f"Chapter gap of {gap:.1f}s before {current['title']}"
+                )
+                break
         last_chapter_end = max(
             float(chapter["end_seconds"]) for chapter in inputs["chapter_items"]
         )
@@ -910,11 +957,8 @@ def export_readiness_payload() -> dict[str, Any]:
                 f"Chapters end {duration_delta:.1f}s before the audio "
                 f"({format_timestamp(last_chapter_end)} vs {format_timestamp(audio_duration)})"
             )
-            if inputs["editor_chapters_explicit"]:
-                warnings.append(message + "; keeping explicitly saved editor chapters")
-            else:
-                missing.append("chapters-duration-mismatch")
-                errors.append(message + "; refresh or save chapters in the editor")
+            missing.append("chapters-duration-mismatch")
+            errors.append(message + "; extend or refresh the chapter map")
 
     try:
         import PIL
@@ -924,7 +968,7 @@ def export_readiness_payload() -> dict[str, Any]:
         missing.append("Pillow")
 
     assets: dict[str, Any] = {}
-    for key in ("audio", "cover", "background"):
+    for key in ("audio", "video", "cover", "background"):
         path = inputs.get(key)
         assets[key] = {
             **(file_info(path) if path else {"path": "", "exists": False, "size": 0}),
@@ -1095,11 +1139,11 @@ def get_chapters() -> dict[str, Any]:
 @app.post("/api/save-chapters")
 def save_chapters(data: SaveChaptersRequest) -> dict[str, Any]:
     p = resolve_path(data.path)
-    if not p:
-        raise HTTPException(status_code=400, detail="Invalid chapters path")
+    if not p or not is_within(p, BUILD_DIR) or p.suffix.lower() != ".json":
+        raise HTTPException(status_code=400, detail="Chapters path must be a JSON file inside the build directory")
     p.parent.mkdir(parents=True, exist_ok=True)
     try:
-        p.write_text(json.dumps(data.chapters, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
+        atomic_write_json(p, data.chapters)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Cannot save chapters: {exc}")
     return {"ok": True, "path": str(p), "count": len(data.chapters)}
@@ -1265,27 +1309,34 @@ def get_waveform(
     force: bool = Query(False),
 ) -> dict[str, Any]:
     """Generate downsampled waveform data from audio file."""
-    project = discover_data_files()
-    if not project["audio"]["exists"]:
+    audio_path = get_export_inputs().get("audio")
+    if not audio_path or not audio_path.is_file():
         raise HTTPException(status_code=404, detail="No audio file found")
-    audio_path = resolve_path(project["audio"]["path"])
     waveform_path = BUILD_DIR / "waveform.json"
+    stat = audio_path.stat()
+    cache_key = f"{server_path(audio_path)}:{stat.st_size}:{stat.st_mtime_ns}:{samples}"
     if waveform_path.exists() and not force:
         try:
             data = json.loads(waveform_path.read_text(encoding="utf-8"))
-            return data
+            if data.get("cacheKey") == cache_key:
+                return data
         except Exception:
             pass
-    # Try to use ffmpeg to get raw PCM samples
-    pcm_path = BUILD_DIR / "_waveform_tmp.pcm"
+    # Decode directly to a deliberately tiny sample rate. Even a 16-hour book
+    # stays below 1 MB instead of producing gigabytes of temporary 22 kHz PCM.
     try:
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", str(audio_path),
-             "-ac", "1", "-ar", "22050", "-f", "s16le",
-             str(pcm_path)],
+        duration_hint = quick_audio_duration(audio_path) or 0.0
+        sample_rate = max(8, min(4000, math.ceil(samples / max(duration_hint, 1.0))))
+        process = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(audio_path), "-vn",
+             "-ac", "1", "-ar", str(sample_rate), "-f", "s16le", "pipe:1"],
             capture_output=True, timeout=120, check=True,
         )
-        raw = pcm_path.read_bytes()
+        raw = process.stdout
+        if len(raw) % 2:
+            raw = raw[:-1]
+        if not raw:
+            raise ValueError("FFmpeg returned no waveform samples")
         raw_samples = list(struct.unpack(f"<{len(raw)//2}h", raw))
         # Downsample
         step = max(1, len(raw_samples) // samples)
@@ -1299,11 +1350,10 @@ def get_waveform(
             "samples": normalized,
             "count": len(normalized),
             "max": round(max_val, 2),
-            "duration_sec": round(len(raw_samples) / 22050, 1),
+            "duration_sec": round(duration_hint or len(raw_samples) / sample_rate, 1),
+            "cacheKey": cache_key,
         }
-        waveform_path.write_text(json.dumps(result), encoding="utf-8")
-        if pcm_path.exists():
-            pcm_path.unlink()
+        atomic_write_json(waveform_path, result)
         return result
     except FileNotFoundError:
         # ffmpeg not found — generate synthetic waveform
@@ -1511,11 +1561,10 @@ async def import_media(request: Request, filename: str | None = Query(default=No
 
 @app.get("/api/media/{filename}")
 def media(filename: str):
-    """Serve media files from data/ or root."""
-    for base in [DATA_DIR, ROOT]:
-        fp = (base / filename).resolve()
-        if is_within(fp, base) and fp.is_file():
-            return FileResponse(str(fp))
+    """Legacy single-component media route, restricted to data/."""
+    fp = (DATA_DIR / filename).resolve()
+    if is_within(fp, DATA_DIR) and fp.is_file():
+        return FileResponse(str(fp))
     raise HTTPException(status_code=404, detail=f"File not found: {filename}")
 
 

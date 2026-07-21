@@ -2019,6 +2019,16 @@ input[type="range"] {
   line-height: 1.45;
 }
 
+.export-warning {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--accent);
+  background: rgba(var(--accent-rgb), .055);
+  color: #b7ab92;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
 .modal-primary {
   display: grid;
   place-items: center;
@@ -2040,6 +2050,23 @@ input[type="range"] {
 
 .modal-primary:hover:not(:disabled) {
   background: rgba(var(--accent-rgb), .22);
+}
+
+.modal-secondary {
+  width: 100%;
+  min-height: 34px;
+  margin-top: 8px;
+  border: 1px solid #303038;
+  border-radius: 6px;
+  background: #18181d;
+  color: var(--muted-strong);
+  font-size: 9px;
+  cursor: pointer;
+}
+
+.modal-secondary:hover {
+  border-color: #494951;
+  color: var(--text);
 }
 
 .render-progress-orb {
