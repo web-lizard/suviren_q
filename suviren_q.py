@@ -470,15 +470,28 @@ def _estimate_duration_from_bitrate(path: Path) -> Optional[float]:
 
         bitrate: float = 320000  # default for high-quality VBR mp3
 
-        # Try ffprobe bitrate first (fast if available)
-        br_cmd = [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=bit_rate",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(path),
-        ]
-        br_res = subprocess.run(br_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        br_str = br_res.stdout.strip()
+        # Probing malformed >2 GB MP3 files may never return. For those files
+        # the size-based fallback is both safer and more predictable.
+        br_str = ""
+        if size_bytes <= 1_500_000_000:
+            br_cmd = [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=bit_rate",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ]
+            try:
+                br_res = subprocess.run(
+                    br_cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=5,
+                )
+                br_str = br_res.stdout.strip()
+            except subprocess.TimeoutExpired:
+                warn(f"ffprobe bitrate timed out for {path.name}; using size estimate")
         if br_str and br_str != "N/A" and br_str != "0":
             if br_str != "N/A":
                 bitrate = float(br_str)
