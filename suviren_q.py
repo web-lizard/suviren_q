@@ -1302,15 +1302,12 @@ def _render_segment_worker(args: dict[str, Any]) -> dict[str, Any]:
     cmd += ["-map", "1:a:0", "-shortest"]
 
     # Encoder args (replace -vf if we used filter_complex)
-    has_vf = False
-    for a in enc_args:
-        if a.startswith("-vf="):
-            has_vf = True
-            break
+    has_vf = "-vf" in enc_args or any(a.startswith("-vf=") for a in enc_args)
     if not filter_complex and not has_vf:
         cmd += ["-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"]
 
     cmd += enc_args
+    cmd += [str(out)]
 
     if dry_run:
         print(f"[DRY RUN] Would render: {out.name}", flush=True)
@@ -1326,6 +1323,7 @@ def _render_segment_worker(args: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "out": str(out), "elapsed": elapsed, "speed": speed}
     except subprocess.CalledProcessError as e:
         error_msg = e.stderr[-500:] if e.stderr else str(e)
+        warn(f"Segment failed: {out.name} | {error_msg}")
         return {"ok": False, "out": str(out), "error": error_msg}
 
 
@@ -1614,7 +1612,7 @@ def cmd_render(args: argparse.Namespace) -> None:
         fail("No segments to render")
 
     # Parallel render
-    parallel = getattr(args, "parallel", True)
+    parallel = not getattr(args, "no_parallel", False)
     if parallel and len(segment_args_list) > 1:
         results = render_segments_parallel(segment_args_list)
     else:
@@ -1625,12 +1623,13 @@ def cmd_render(args: argparse.Namespace) -> None:
 
     # Collect rendered segments
     rendered_segments: list[Path] = []
-    for i, r in enumerate(segment_args_list):
-        p = Path(r["out"])
-        if p.exists():
+    for result in results:
+        p = Path(result["out"])
+        if result.get("ok") and (args.dry_run or (p.exists() and p.stat().st_size > 0)):
             rendered_segments.append(p)
         else:
-            warn(f"Segment missing: {p}")
+            detail = result.get("error", "output file is missing or empty")
+            warn(f"Segment failed: {p} | {detail}")
 
     if not rendered_segments:
         fail("No segments rendered successfully")
