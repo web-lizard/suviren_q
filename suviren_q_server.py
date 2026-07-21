@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -26,8 +28,9 @@ import struct
 import math
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, unquote
 
-from fastapi import FastAPI, HTTPException, Body, Query
+from fastapi import FastAPI, HTTPException, Body, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -38,8 +41,19 @@ MAIN_SCRIPT = ROOT / "suviren_q.py"
 BUILD_DIR = ROOT / "_suviren_q_build"
 DATA_DIR = ROOT / "data"
 LAYOUT_PATH = BUILD_DIR / "layout.json"
+EDITOR_PROJECT_PATH = BUILD_DIR / "editor-project.json"
+CHAPTERS_PATH = BUILD_DIR / "chapters.detected.json"
 
-app = FastAPI(title="BookForge Studio API", version="0.3.0")
+APP_NAME = "BOOK WUNDERWAFFE"
+APP_VERSION = "1.0.0"
+
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+IMPORT_EXTENSIONS = AUDIO_EXTENSIONS | IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+EXPORT_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
+
+app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,6 +64,8 @@ app.add_middleware(
 )
 
 JOBS: dict[str, dict[str, Any]] = {}
+AUDIO_PROBE_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
+AUDIO_DISCOVERY_CACHE: dict[tuple[str, int, int], float] = {}
 
 
 # ── Request models ───────────────────────────────────────────────
@@ -80,6 +96,195 @@ def resolve_path(value: str | None) -> Path | None:
     return p
 
 
+def is_within(path: Path, parent: Path) -> bool:
+    """Return True when path resolves inside parent (or is parent itself)."""
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def server_path(path: Path) -> str:
+    """Return a stable project-relative path for API payloads."""
+    try:
+        return path.resolve().relative_to(ROOT.resolve()).as_posix()
+    except (OSError, ValueError):
+        return str(path)
+
+
+def media_url(path: Path) -> str | None:
+    if not is_within(path, DATA_DIR):
+        return None
+    relative = path.resolve().relative_to(DATA_DIR.resolve()).as_posix()
+    return f"/api/media/data/{quote(relative, safe='/')}"
+
+
+def atomic_write_json(path: Path, payload: Any) -> None:
+    """Write JSON through a sibling temp file and atomically replace target."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temp.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def read_json_object(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{path.name} must contain a JSON object")
+    return data
+
+
+def parse_seconds(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    text = str(value).strip().replace(",", ".")
+    if not text:
+        return None
+    try:
+        number = float(text)
+        return number if math.isfinite(number) else None
+    except ValueError:
+        pass
+    parts = text.split(":")
+    try:
+        if len(parts) == 3:
+            hours, minutes, seconds = (float(part) for part in parts)
+            return hours * 3600 + minutes * 60 + seconds
+        if len(parts) == 2:
+            minutes, seconds = (float(part) for part in parts)
+            return minutes * 60 + seconds
+    except ValueError:
+        return None
+    return None
+
+
+def format_timestamp(seconds: float) -> str:
+    milliseconds = max(0, int(round(seconds * 1000)))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, millis = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
+def normalize_editor_chapters(
+    chapters: Any,
+    *,
+    project_duration: float | None = None,
+) -> list[dict[str, Any]]:
+    """Normalize editor chapter shapes to the format consumed by suviren_q.py."""
+    if chapters is None:
+        return []
+    if not isinstance(chapters, list):
+        raise ValueError("chapters must be an array")
+
+    parsed: list[dict[str, Any]] = []
+    for index, raw in enumerate(chapters):
+        if not isinstance(raw, dict):
+            raise ValueError(f"chapter {index + 1} must be an object")
+
+        start = parse_seconds(
+            raw.get("start_seconds", raw.get("startSeconds", raw.get("start")))
+        )
+        if start is None and raw.get("startMs") is not None:
+            start_ms = parse_seconds(raw.get("startMs"))
+            start = start_ms / 1000 if start_ms is not None else None
+        if start is None or start < 0:
+            raise ValueError(f"chapter {index + 1} has an invalid start")
+
+        end = parse_seconds(
+            raw.get("end_seconds", raw.get("endSeconds", raw.get("end")))
+        )
+        if end is None and raw.get("endMs") is not None:
+            end_ms = parse_seconds(raw.get("endMs"))
+            end = end_ms / 1000 if end_ms is not None else None
+
+        duration = parse_seconds(
+            raw.get(
+                "duration_seconds",
+                raw.get("durationSeconds", raw.get("duration")),
+            )
+        )
+        if duration is None and raw.get("durationMs") is not None:
+            duration_ms = parse_seconds(raw.get("durationMs"))
+            duration = duration_ms / 1000 if duration_ms is not None else None
+        if (end is None or end <= start) and duration is not None and duration > 0:
+            end = start + duration
+
+        title = str(raw.get("title") or raw.get("name") or raw.get("label") or f"Глава {index + 1}").strip()
+        parsed.append({"raw": raw, "source_index": index, "title": title, "start": start, "end": end})
+
+    parsed.sort(key=lambda item: (item["start"], item["source_index"]))
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(parsed):
+        start = float(item["start"])
+        end = item["end"]
+        if (end is None or end <= start) and index + 1 < len(parsed):
+            next_start = float(parsed[index + 1]["start"])
+            if next_start > start:
+                end = next_start
+        if (end is None or end <= start) and project_duration is not None and project_duration > start:
+            end = project_duration
+        if end is None or end <= start:
+            raise ValueError(f"chapter {item['source_index'] + 1} has no valid end or duration")
+
+        end = float(end)
+        raw = dict(item["raw"])
+        raw.update({
+            "title": item["title"],
+            "start": format_timestamp(start),
+            "end": format_timestamp(end),
+            "start_seconds": round(start, 3),
+            "end_seconds": round(end, 3),
+            "duration_seconds": round(end - start, 3),
+            "source": str(raw.get("source") or "editor"),
+        })
+        normalized.append(raw)
+    return normalized
+
+
+def load_editor_project() -> dict[str, Any] | None:
+    try:
+        return read_json_object(EDITOR_PROJECT_PATH)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def resolve_editor_server_path(value: Any) -> Path | None:
+    """Resolve an editor material path while preventing paths outside the project."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = unquote(value.strip())
+    media_prefix = "/api/media/data/"
+    if text.startswith(media_prefix):
+        text = f"data/{text[len(media_prefix):]}"
+    candidate = Path(text)
+    if not candidate.is_absolute():
+        candidate = ROOT / candidate
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return None
+    if not is_within(resolved, ROOT) or not resolved.is_file():
+        return None
+    return resolved
+
+
 def append_job_line(job_id: str, line: str) -> None:
     job = JOBS.get(job_id)
     if not job:
@@ -88,8 +293,9 @@ def append_job_line(job_id: str, line: str) -> None:
     job["updated_at"] = time.time()
 
 
-def start_job(kind: str, cmd: list[str]) -> str:
+def start_job(kind: str, cmd: list[str], *, output: Path | None = None) -> str:
     job_id = uuid.uuid4().hex[:12]
+    output_path = output.resolve() if output else None
     JOBS[job_id] = {
         "id": job_id,
         "kind": kind,
@@ -99,6 +305,12 @@ def start_job(kind: str, cmd: list[str]) -> str:
         "progress": 0.0,
         "created_at": time.time(),
         "updated_at": time.time(),
+        "output": server_path(output_path) if output_path else None,
+        "download_url": (
+            f"/api/exports/{quote(output_path.name, safe='')}" if output_path else None
+        ),
+        "output_exists": False,
+        "output_size": 0,
         "log": [
             f"[BookForge] job started: {kind}",
             "[cmd] " + " ".join(f'"{x}"' if " " in x else x for x in cmd),
@@ -129,9 +341,18 @@ def run_job(job_id: str, cmd: list[str]) -> None:
             if "Rendering segment" in line:
                 JOBS[job_id]["progress"] = min(0.99, JOBS[job_id].get("progress", 0) + 0.01)
         returncode = proc.wait()
-        JOBS[job_id]["returncode"] = returncode
-        JOBS[job_id]["status"] = "done" if returncode == 0 else "failed"
-        JOBS[job_id]["progress"] = 1.0 if returncode == 0 else JOBS[job_id].get("progress", 0)
+        job = JOBS[job_id]
+        output_value = job.get("output")
+        output_path = resolve_path(output_value) if output_value else None
+        output_exists = bool(returncode == 0 and output_path and output_path.is_file())
+        job["returncode"] = returncode
+        job["output_exists"] = output_exists
+        job["output_size"] = output_path.stat().st_size if output_exists and output_path else 0
+        job["status"] = "done" if returncode == 0 and (not output_path or output_exists) else "failed"
+        job["progress"] = 1.0 if job["status"] == "done" else job.get("progress", 0)
+        job["updated_at"] = time.time()
+        if returncode == 0 and output_path and not output_exists:
+            append_job_line(job_id, f"[error] expected output was not created: {output_path}")
         append_job_line(job_id, f"[BookForge] job finished with code {returncode}")
     except Exception as exc:
         JOBS[job_id]["status"] = "failed"
@@ -143,17 +364,74 @@ def run_job(job_id: str, cmd: list[str]) -> None:
 def file_info(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"path": str(path), "exists": False, "size": 0}
-    return {
-        "path": str(path.relative_to(ROOT)),
+    info = {
+        "path": server_path(path),
         "exists": True,
         "size": path.stat().st_size,
         "size_mb": round(path.stat().st_size / (1024 * 1024), 1),
     }
+    url = media_url(path)
+    if url:
+        info["url"] = url
+    return info
+
+
+def media_record(path: Path, kind: str) -> dict[str, Any]:
+    info = file_info(path)
+    return {
+        "id": server_path(path),
+        "name": path.name,
+        "kind": kind,
+        "serverPath": server_path(path),
+        **info,
+    }
+
+
+def quick_audio_duration(path: Path) -> float | None:
+    """Return a cached finite duration for safe auto-selection, without decoding."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    cache_key = (str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+    cached = AUDIO_DISCOVERY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached or None
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+        )
+        duration = parse_seconds(probe.stdout.strip()) if probe.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        duration = None
+    value = duration if duration is not None and duration > 0 else 0.0
+    if len(AUDIO_DISCOVERY_CACHE) >= 64:
+        AUDIO_DISCOVERY_CACHE.clear()
+    AUDIO_DISCOVERY_CACHE[cache_key] = value
+    return value or None
 
 
 def discover_data_files() -> dict[str, Any]:
-    """Scan data/ directory and auto-detect audio, cover, background, rpp."""
+    """Scan data/ and expose legacy selections plus editor media collections."""
     data_dir = DATA_DIR
+    files = sorted(
+        (path for path in data_dir.iterdir() if path.is_file()),
+        key=lambda path: path.name.casefold(),
+    ) if data_dir.exists() else []
+    audio_files = [path for path in files if path.suffix.lower() in AUDIO_EXTENSIONS]
+    image_files = [path for path in files if path.suffix.lower() in IMAGE_EXTENSIONS]
+    video_files = [path for path in files if path.suffix.lower() in VIDEO_EXTENSIONS]
+
     result = {
         "projectName": "",
         "dataDir": str(data_dir),
@@ -165,46 +443,80 @@ def discover_data_files() -> dict[str, Any]:
         "ready": False,
         "missing": [],
         "warnings": [],
+        "audios": [media_record(path, "audio") for path in audio_files],
+        "images": [media_record(path, "image") for path in image_files],
+        "videos": [media_record(path, "video") for path in video_files],
+    }
+    result["materials"] = result["audios"] + result["images"] + result["videos"]
+    result["video"] = file_info(video_files[0]) if video_files else {
+        "path": "", "exists": False, "size": 0
     }
 
-    # Find best audio
-    audio_exts = [".mp3", ".wav", ".m4a"]
-    found_audio = list(data_dir.glob("*"))
-    found_audio = [f for f in found_audio if f.suffix.lower() in audio_exts]
-    if found_audio:
-        best = max(found_audio, key=lambda f: f.stat().st_size)
+    # Find the longest probeable master. Files above 2 GiB remain available in
+    # the material library, but are not auto-selected: several MP3 parsers fail
+    # at that boundary and a broken giant file used to make startup unusable.
+    if audio_files:
+        auto_candidates = [
+            path for path in audio_files
+            if path.stat().st_size < 2 * 1024 ** 3 and ".tmp_probe" not in path.name
+        ]
+        probed = [
+            (duration, path)
+            for path in auto_candidates
+            if (duration := quick_audio_duration(path)) is not None
+        ]
+        best = max(probed, key=lambda item: item[0])[1] if probed else max(
+            auto_candidates or audio_files,
+            key=lambda path: path.stat().st_size,
+        )
         result["audio"] = file_info(best)
+        oversized = [path.name for path in audio_files if path.stat().st_size >= 2 * 1024 ** 3]
+        if oversized:
+            result["warnings"].append(
+                "audio files above 2 GiB were kept in the library but skipped for automatic selection"
+            )
     else:
-        result["missing"].append("audio (mp3/wav/m4a)")
+        result["missing"].append("audio")
 
     # Find cover
-    found_cover = [f for f in data_dir.glob("*") if "cover" in f.stem.lower()]
+    cover_keywords = ("cover", "облож")
+    found_cover = [
+        path for path in image_files
+        if any(keyword in path.stem.casefold() for keyword in cover_keywords)
+    ]
+    if not found_cover and image_files:
+        found_cover = [image_files[0]]
+        result["warnings"].append("cover keyword not found — using the first image")
     if found_cover:
         result["cover"] = file_info(found_cover[0])
     else:
-        result["missing"].append("cover (image with 'cover' in name)")
+        result["missing"].append("cover")
 
     # Find background
     bg_keywords = ["background", "backdrop", "bg"]
-    found_bg = [f for f in data_dir.glob("*")
-                if any(kw in f.stem.lower() for kw in bg_keywords)]
+    found_bg = [path for path in image_files
+                if any(keyword in path.stem.casefold() for keyword in bg_keywords)]
     if found_bg:
         result["background"] = file_info(found_bg[0])
     else:
         result["warnings"].append("background not found — using dark fallback")
 
     # Find RPP
-    found_rpp = list(data_dir.glob("*.rpp")) + list(data_dir.glob("*.RPP"))
+    found_rpp = [path for path in files if path.suffix.lower() == ".rpp"]
     if found_rpp:
         result["rpp"] = file_info(found_rpp[0])
     else:
-        result["missing"].append("RPP project file")
+        result["warnings"].append("RPP project not found — saved editor chapters will be used")
 
     # Chapters
-    chapters_path = BUILD_DIR / "chapters.detected.json"
+    chapters_path = CHAPTERS_PATH
     if chapters_path.exists():
         try:
             ch_data = json.loads(chapters_path.read_text(encoding="utf-8"))
+            if isinstance(ch_data, dict):
+                ch_data = ch_data.get("chapters", [])
+            if not isinstance(ch_data, list):
+                raise ValueError("chapters must be an array")
             result["chapters"] = {
                 "path": str(chapters_path.relative_to(ROOT)),
                 "exists": True,
@@ -212,12 +524,18 @@ def discover_data_files() -> dict[str, Any]:
                 "first": ch_data[0].get("title", "") if ch_data else "",
                 "last": ch_data[-1].get("title", "") if ch_data else "",
             }
+            if not ch_data:
+                result["missing"].append("chapters")
         except Exception:
             result["warnings"].append("chapters.detected.json corrupted")
+            result["missing"].append("chapters")
+    else:
+        result["missing"].append("chapters")
 
-    # Derive project name from audio file
-    if result["audio"]["exists"]:
-        name = Path(result["audio"]["path"]).stem
+    # Prefer the book project name over technical render suffixes in audio names.
+    if result["rpp"]["exists"] or result["audio"]["exists"]:
+        source_path = result["rpp"]["path"] if result["rpp"]["exists"] else result["audio"]["path"]
+        name = Path(source_path).stem
         # Clean up common suffixes
         result["projectName"] = name.replace("_", " ").replace("-", " ").title()
 
@@ -225,8 +543,8 @@ def discover_data_files() -> dict[str, Any]:
     result["ready"] = (
         result["audio"]["exists"]
         and result["cover"]["exists"]
-        and result["rpp"]["exists"]
         and result["chapters"]["exists"]
+        and result["chapters"]["count"] > 0
     )
 
     return result
@@ -303,14 +621,350 @@ def get_default_layout() -> dict:
     }
 
 
+def editor_role_id(project: dict[str, Any] | None, key: str) -> Any:
+    if not project:
+        return None
+    if project.get(key) not in (None, ""):
+        return project.get(key)
+    roles = project.get("roles")
+    if isinstance(roles, dict):
+        return roles.get(key)
+    return None
+
+
+def editor_role_path(
+    project: dict[str, Any] | None,
+    role_key: str,
+    allowed_extensions: set[str],
+) -> Path | None:
+    role_id = editor_role_id(project, role_key)
+    if role_id in (None, "") or not project:
+        return None
+    materials = project.get("materials", [])
+    if not isinstance(materials, list):
+        return None
+    for material in materials:
+        if not isinstance(material, dict):
+            continue
+        material_id = material.get("id", material.get("assetId", material.get("materialId")))
+        if str(material_id) != str(role_id):
+            continue
+        path = resolve_editor_server_path(material.get("serverPath", material.get("server_path")))
+        if path and path.suffix.lower() in allowed_extensions:
+            return path
+        return None
+    return None
+
+
+def existing_discovered_path(project: dict[str, Any], key: str) -> Path | None:
+    value = project.get(key)
+    if not isinstance(value, dict) or not value.get("exists"):
+        return None
+    path = resolve_path(str(value.get("path", "")))
+    return path.resolve() if path and path.is_file() and is_within(path, ROOT) else None
+
+
+def load_chapter_payload(path: Path | None = None) -> list[dict[str, Any]]:
+    path = path or CHAPTERS_PATH
+    if not path.is_file():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        data = data.get("chapters", [])
+    if not isinstance(data, list):
+        raise ValueError("chapters file must contain an array")
+    return normalize_editor_chapters(data)
+
+
+def get_export_inputs() -> dict[str, Any]:
+    """Resolve export roles from editor project, then fall back per role."""
+    discovered = discover_data_files()
+    editor = load_editor_project()
+    warnings: list[str] = []
+    if EDITOR_PROJECT_PATH.is_file() and editor is None:
+        warnings.append("editor-project.json is invalid; using discovery fallback")
+
+    role_specs = {
+        "audio": ("audioAssetId", AUDIO_EXTENSIONS),
+        "cover": ("coverAssetId", IMAGE_EXTENSIONS),
+        "background": ("backgroundAssetId", IMAGE_EXTENSIONS),
+    }
+    selected: dict[str, Path | None] = {}
+    selected_from: dict[str, str | None] = {}
+    for name, (role_key, extensions) in role_specs.items():
+        path = editor_role_path(editor, role_key, extensions)
+        if path:
+            selected[name] = path
+            selected_from[name] = "editor-project"
+            continue
+        if editor_role_id(editor, role_key) not in (None, ""):
+            warnings.append(f"{role_key} does not reference a usable material; using discovery fallback")
+        fallback = existing_discovered_path(discovered, name)
+        selected[name] = fallback
+        selected_from[name] = "discovery" if fallback else None
+
+    chapters: list[dict[str, Any]] = []
+    try:
+        chapters = load_chapter_payload()
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        warnings.append(f"chapters are invalid: {exc}")
+
+    return {
+        **selected,
+        "chapters": CHAPTERS_PATH if chapters else None,
+        "chapter_items": chapters,
+        "selected_from": selected_from,
+        "editor_project_exists": EDITOR_PROJECT_PATH.is_file(),
+        "editor_chapters_explicit": bool(
+            editor
+            and isinstance(editor.get("chapters"), list)
+            and editor.get("chapters")
+        ),
+        "warnings": warnings,
+        "discovered": discovered,
+    }
+
+
+def clipped_test_chapters(chapters: list[dict[str, Any]], seconds: float = 60.0) -> Path:
+    """Persist a render-safe chapter window whose total span is at most seconds."""
+    if not chapters:
+        raise ValueError("No chapters available for test export")
+    window_start = 0.0
+    window_end = seconds
+    clipped: list[dict[str, Any]] = []
+    cursor = window_start
+    for chapter in chapters:
+        start = max(float(chapter["start_seconds"]), window_start, cursor)
+        end = min(float(chapter["end_seconds"]), window_end)
+        if end <= start:
+            if float(chapter["start_seconds"]) >= window_end:
+                break
+            continue
+        item = dict(chapter)
+        item.update({
+            "start": format_timestamp(start),
+            "end": format_timestamp(end),
+            "start_seconds": round(start, 3),
+            "end_seconds": round(end, 3),
+            "duration_seconds": round(end - start, 3),
+        })
+        clipped.append(item)
+        cursor = end
+        if end >= window_end:
+            break
+    if not clipped:
+        raise ValueError("No chapters overlap the 60-second test window")
+    path = BUILD_DIR / "chapters.test-60s.json"
+    atomic_write_json(path, clipped)
+    return path
+
+
+def export_output_path(test_mode: bool) -> Path:
+    filename = "zina_book_youtube_test_60sec.mp4" if test_mode else "zina_book_youtube_full.mp4"
+    return BUILD_DIR / filename
+
+
+def probe_audio_for_export(
+    audio_path: Path,
+    ffprobe: str | None,
+    ffmpeg: str | None,
+) -> dict[str, Any]:
+    """Bounded ffprobe + short decode check, cached by file identity."""
+    try:
+        stat = audio_path.stat()
+    except OSError as exc:
+        return {
+            "ok": False,
+            "duration": None,
+            "durationOk": False,
+            "decodeOk": False,
+            "error": f"Cannot stat audio file: {exc}",
+        }
+    cache_key = (str(audio_path.resolve()), stat.st_size, stat.st_mtime_ns)
+    cached = AUDIO_PROBE_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+
+    result: dict[str, Any] = {
+        "ok": False,
+        "duration": None,
+        "durationOk": False,
+        "decodeOk": False,
+        "error": "",
+    }
+    if not ffprobe or not ffmpeg:
+        result["error"] = "ffprobe and ffmpeg are required to validate audio"
+        return result
+
+    try:
+        duration_proc = subprocess.run(
+            [
+                ffprobe,
+                "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(audio_path),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+        )
+    except subprocess.TimeoutExpired:
+        result["error"] = "ffprobe timed out after 8 seconds; audio may be damaged or too large"
+    except OSError as exc:
+        result["error"] = f"ffprobe could not start: {exc}"
+    else:
+        duration = parse_seconds(duration_proc.stdout.strip()) if duration_proc.returncode == 0 else None
+        if duration is None or not math.isfinite(duration) or duration <= 0:
+            stderr = (duration_proc.stderr or "").strip().replace("\r", " ").replace("\n", " ")
+            result["error"] = (
+                f"ffprobe could not read a finite audio duration"
+                + (f": {stderr[:400]}" if stderr else "")
+            )
+        else:
+            result["duration"] = round(duration, 3)
+            result["durationOk"] = True
+
+    if result["durationOk"]:
+        try:
+            decode_proc = subprocess.run(
+                [
+                    ffmpeg,
+                    "-v", "error",
+                    "-i", str(audio_path),
+                    "-map", "0:a:0",
+                    "-t", "0.25",
+                    "-f", "null",
+                    "-",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=8,
+            )
+        except subprocess.TimeoutExpired:
+            result["error"] = "ffmpeg decode probe timed out after 8 seconds"
+        except OSError as exc:
+            result["error"] = f"ffmpeg decode probe could not start: {exc}"
+        else:
+            if decode_proc.returncode == 0:
+                result["decodeOk"] = True
+            else:
+                stderr = (decode_proc.stderr or "").strip().replace("\r", " ").replace("\n", " ")
+                result["error"] = "ffmpeg could not decode the start of the audio"
+                if stderr:
+                    result["error"] += f": {stderr[:400]}"
+
+    result["ok"] = bool(result["durationOk"] and result["decodeOk"])
+    if len(AUDIO_PROBE_CACHE) >= 32:
+        AUDIO_PROBE_CACHE.clear()
+    AUDIO_PROBE_CACHE[cache_key] = dict(result)
+    return result
+
+
+def export_readiness_payload() -> dict[str, Any]:
+    inputs = get_export_inputs()
+    missing: list[str] = []
+    warnings = list(inputs["warnings"])
+    errors: list[str] = []
+    for key in ("audio", "cover", "chapters"):
+        if not inputs.get(key):
+            missing.append(key)
+
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg:
+        missing.append("ffmpeg")
+    if not ffprobe:
+        missing.append("ffprobe")
+
+    audio_probe: dict[str, Any] | None = None
+    audio_path = inputs.get("audio")
+    if audio_path and ffmpeg and ffprobe:
+        audio_probe = probe_audio_for_export(audio_path, ffprobe, ffmpeg)
+        if not audio_probe["ok"]:
+            missing.append("audio-decodable")
+            errors.append(
+                "Selected audio cannot be exported: "
+                + (audio_probe.get("error") or "duration/decode probe failed")
+            )
+
+    if audio_probe and audio_probe["ok"] and inputs["chapter_items"]:
+        audio_duration = float(audio_probe["duration"])
+        last_chapter_end = max(
+            float(chapter["end_seconds"]) for chapter in inputs["chapter_items"]
+        )
+        duration_delta = audio_duration - last_chapter_end
+        if last_chapter_end > audio_duration + 5.0:
+            missing.append("chapters-outside-audio")
+            errors.append(
+                f"Chapters end at {format_timestamp(last_chapter_end)}, "
+                f"but audio ends at {format_timestamp(audio_duration)}"
+            )
+        elif duration_delta > 5.0:
+            message = (
+                f"Chapters end {duration_delta:.1f}s before the audio "
+                f"({format_timestamp(last_chapter_end)} vs {format_timestamp(audio_duration)})"
+            )
+            if inputs["editor_chapters_explicit"]:
+                warnings.append(message + "; keeping explicitly saved editor chapters")
+            else:
+                missing.append("chapters-duration-mismatch")
+                errors.append(message + "; refresh or save chapters in the editor")
+
+    try:
+        import PIL
+        pillow_version = PIL.__version__
+    except ImportError:
+        pillow_version = None
+        missing.append("Pillow")
+
+    assets: dict[str, Any] = {}
+    for key in ("audio", "cover", "background"):
+        path = inputs.get(key)
+        assets[key] = {
+            **(file_info(path) if path else {"path": "", "exists": False, "size": 0}),
+            "selectedFrom": inputs["selected_from"].get(key),
+        }
+    assets["chapters"] = {
+        "path": server_path(CHAPTERS_PATH),
+        "exists": bool(inputs.get("chapters")),
+        "count": len(inputs["chapter_items"]),
+    }
+    if audio_probe and assets["audio"]["exists"]:
+        assets["audio"]["duration"] = audio_probe.get("duration")
+    missing = list(dict.fromkeys(missing))
+    return {
+        "ready": not missing,
+        "missing": missing,
+        "warnings": warnings,
+        "errors": errors,
+        "assets": assets,
+        "editorProject": {
+            "exists": inputs["editor_project_exists"],
+            "path": server_path(EDITOR_PROJECT_PATH),
+        },
+        "tools": {
+            "ffmpeg": ffmpeg,
+            "ffprobe": ffprobe,
+            "pillow": pillow_version,
+        },
+        "audioProbe": audio_probe,
+    }
+
+
 # ── Endpoints ────────────────────────────────────────────────────
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return {
         "ok": True,
-        "version": "0.3.0",
-        "app": "BookForge Studio",
+        "version": APP_VERSION,
+        "app": APP_NAME,
         "root": str(ROOT),
         "python": sys.executable,
         "main_script_exists": MAIN_SCRIPT.exists(),
@@ -324,6 +978,62 @@ def book_project() -> dict[str, Any]:
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     data = discover_data_files()
     return data
+
+
+@app.get("/api/editor-project")
+def get_editor_project() -> dict[str, Any]:
+    """Return the persisted editor document, or an empty compatible document."""
+    if not EDITOR_PROJECT_PATH.exists():
+        return {
+            "exists": False,
+            "path": server_path(EDITOR_PROJECT_PATH),
+            "project": {"version": 1, "materials": [], "chapters": []},
+        }
+    try:
+        project = read_json_object(EDITOR_PROJECT_PATH)
+        return {
+            "exists": True,
+            "path": server_path(EDITOR_PROJECT_PATH),
+            "project": project or {"version": 1, "materials": [], "chapters": []},
+        }
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=500, detail=f"Cannot read editor project: {exc}")
+
+
+@app.post("/api/editor-project")
+def save_editor_project(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Atomically save editor state and its normalized renderer chapter file."""
+    project = dict(payload)
+    project_duration = parse_seconds(
+        project.get(
+            "duration_seconds",
+            project.get("durationSeconds", project.get("audioDuration")),
+        )
+    )
+    if project_duration is None and project.get("durationMs") is not None:
+        duration_ms = parse_seconds(project.get("durationMs"))
+        project_duration = duration_ms / 1000 if duration_ms is not None else None
+    try:
+        chapters = normalize_editor_chapters(
+            project.get("chapters", []),
+            project_duration=project_duration,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    project["chapters"] = chapters
+    try:
+        atomic_write_json(CHAPTERS_PATH, chapters)
+        atomic_write_json(EDITOR_PROJECT_PATH, project)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Cannot save editor project: {exc}")
+    return {
+        "ok": True,
+        "path": server_path(EDITOR_PROJECT_PATH),
+        "chaptersPath": server_path(CHAPTERS_PATH),
+        "chapterCount": len(chapters),
+        "project": project,
+    }
 
 
 @app.post("/api/book-project/refresh-chapters")
@@ -400,17 +1110,24 @@ def save_chapters(data: SaveChaptersRequest) -> dict[str, Any]:
 def build_render_cmd(
     test_mode: bool = False,
 ) -> list[str]:
-    """Build the CLI command for render."""
-    project = discover_data_files()
-    if not project["ready"]:
-        raise HTTPException(status_code=400, detail="Project not ready", detail_info=project["missing"])
-    audio = resolve_path(project["audio"]["path"])
-    cover = resolve_path(project["cover"]["path"])
-    bg = resolve_path(project["background"]["path"]) if project["background"]["exists"] else None
-    rpp = resolve_path(project["rpp"]["path"])
-    chapters = BUILD_DIR / "chapters.detected.json"
-    out_name = "zina_book_youtube_test_60sec.mp4" if test_mode else "zina_book_youtube_full.mp4"
-    out = BUILD_DIR / out_name
+    """Build a command using only arguments supported by suviren_q.py render."""
+    inputs = get_export_inputs()
+    missing = [key for key in ("audio", "cover", "chapters") if not inputs.get(key)]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "Project is not ready for export", "missing": missing},
+        )
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    audio: Path = inputs["audio"]
+    cover: Path = inputs["cover"]
+    background: Path | None = inputs["background"]
+    chapters = (
+        clipped_test_chapters(inputs["chapter_items"], seconds=60.0)
+        if test_mode
+        else CHAPTERS_PATH
+    )
+    out = export_output_path(test_mode)
     cmd = [
         sys.executable,
         str(MAIN_SCRIPT),
@@ -418,57 +1135,82 @@ def build_render_cmd(
         "--audio", str(audio),
         "--cover", str(cover),
         "--chapters", str(chapters),
-        "--rpp", str(rpp),
-        "--rpp-track", "КНИГА ОЗВУЧКА",
-        "--chapter-pattern", "Глава",
-        "--add-intro",
         "--out", str(out),
         "--fps", "30",
-        "--waveform", "ffmpeg",
+        "--waveform", "static",
         "--width", "1920",
         "--height", "1080",
     ]
-    if bg:
-        cmd += ["--background", str(bg)]
-    if test_mode:
-        cmd += ["--duration", "60"]
-    # Use layout if available
-    if LAYOUT_PATH.exists():
-        try:
-            layout = json.loads(LAYOUT_PATH.read_text(encoding="utf-8"))
-            if layout.get("render", {}).get("crf"):
-                cmd += ["--crf", str(layout["render"]["crf"])]
-        except Exception:
-            pass
+    if background:
+        cmd += ["--background", str(background)]
     return cmd
+
+
+@app.get("/api/export/readiness")
+def export_readiness() -> dict[str, Any]:
+    """Fast, non-rendering validation of export inputs and local tools."""
+    return export_readiness_payload()
+
+
+def require_export_ready() -> dict[str, Any]:
+    readiness = export_readiness_payload()
+    if not readiness["ready"]:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Project is not ready for export",
+                "missing": readiness["missing"],
+                "errors": readiness["errors"],
+                "warnings": readiness["warnings"],
+            },
+        )
+    return readiness
 
 
 @app.post("/api/render/test")
 def render_test() -> dict[str, Any]:
     """Start a test render job (60 seconds)."""
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    require_export_ready()
     try:
         cmd = build_render_cmd(test_mode=True)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Cannot build render command: {exc}")
-    job_id = start_job("render-test", cmd)
-    return {"job_id": job_id, "kind": "test", "message": "Test render started (60s)"}
+    output = export_output_path(True)
+    job_id = start_job("render-test", cmd, output=output)
+    job = JOBS[job_id]
+    return {
+        "job_id": job_id,
+        "kind": "test",
+        "message": "Test render started (60s)",
+        "output": job["output"],
+        "download_url": job["download_url"],
+    }
 
 
 @app.post("/api/render/full")
 def render_full() -> dict[str, Any]:
     """Start a full render job."""
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    require_export_ready()
     try:
         cmd = build_render_cmd(test_mode=False)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Cannot build render command: {exc}")
-    job_id = start_job("render-full", cmd)
-    return {"job_id": job_id, "kind": "full", "message": "Full render started"}
+    output = export_output_path(False)
+    job_id = start_job("render-full", cmd, output=output)
+    job = JOBS[job_id]
+    return {
+        "job_id": job_id,
+        "kind": "full",
+        "message": "Full render started",
+        "output": job["output"],
+        "download_url": job["download_url"],
+    }
 
 
 @app.get("/api/render/status")
@@ -654,12 +1396,125 @@ def api_reset_layout(target: str = "default"):
 
 # ── Media ────────────────────────────────────────────────────────
 
+def upload_filename_from_request(request: Request, query_filename: str | None) -> str | None:
+    if query_filename:
+        return query_filename
+    header_name = request.headers.get("x-filename") or request.headers.get("x-file-name")
+    if header_name:
+        return unquote(header_name)
+    disposition = request.headers.get("content-disposition", "")
+    encoded = re.search(r"filename\*=UTF-8''([^;]+)", disposition, flags=re.IGNORECASE)
+    if encoded:
+        return unquote(encoded.group(1).strip())
+    plain = re.search(r'filename="?([^";]+)"?', disposition, flags=re.IGNORECASE)
+    return plain.group(1).strip() if plain else None
+
+
+def sanitize_upload_filename(value: str) -> str:
+    raw_name = unquote(value).replace("\\", "/").rsplit("/", 1)[-1].strip()
+    suffix = Path(raw_name).suffix.lower()
+    if suffix not in IMPORT_EXTENSIONS:
+        allowed = ", ".join(sorted(IMPORT_EXTENSIONS))
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported media extension '{suffix or '(none)'}'. Allowed: {allowed}",
+        )
+    stem = raw_name[:-len(suffix)] if suffix else raw_name
+    stem = re.sub(r'[\x00-\x1f<>:"/\\|?*]+', "_", stem)
+    stem = re.sub(r"\s+", " ", stem).strip(" .")
+    if not stem:
+        stem = "media"
+    stem = stem[:140].rstrip(" .") or "media"
+    if stem.casefold() in {
+        "con", "prn", "aux", "nul",
+        *(f"com{number}" for number in range(1, 10)),
+        *(f"lpt{number}" for number in range(1, 10)),
+    }:
+        stem = f"_{stem}"
+    return f"{stem}{suffix}"
+
+
+def publish_upload(temp_path: Path, preferred_name: str) -> Path:
+    """Publish a completed temp upload without ever replacing an existing file."""
+    stem = Path(preferred_name).stem
+    suffix = Path(preferred_name).suffix
+    attempt = 1
+    while True:
+        filename = preferred_name if attempt == 1 else f"{stem}-{attempt}{suffix}"
+        candidate = DATA_DIR / filename
+        try:
+            os.link(temp_path, candidate)
+            return candidate
+        except FileExistsError:
+            attempt += 1
+            continue
+        except OSError:
+            # Filesystems without hard-link support still get exclusive creation.
+            try:
+                with candidate.open("xb") as target, temp_path.open("rb") as source:
+                    shutil.copyfileobj(source, target, length=1024 * 1024)
+                    target.flush()
+                    os.fsync(target.fileno())
+                return candidate
+            except FileExistsError:
+                attempt += 1
+                continue
+            except Exception:
+                try:
+                    candidate.unlink()
+                except FileNotFoundError:
+                    pass
+                raise
+
+
+@app.put("/api/media/import")
+async def import_media(request: Request, filename: str | None = Query(default=None)) -> dict[str, Any]:
+    """Stream a raw request body into data/ and publish it under a unique name."""
+    requested_name = upload_filename_from_request(request, filename)
+    if not requested_name:
+        raise HTTPException(
+            status_code=400,
+            detail="A filename query parameter, X-Filename header, or Content-Disposition filename is required",
+        )
+    safe_name = sanitize_upload_filename(requested_name)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    temp_path = DATA_DIR / f".upload-{uuid.uuid4().hex}.part"
+    size = 0
+    try:
+        with temp_path.open("xb") as handle:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                handle.write(chunk)
+                size += len(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if size == 0:
+            raise HTTPException(status_code=400, detail="Uploaded media body is empty")
+        destination = publish_upload(temp_path, safe_name)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    suffix = destination.suffix.lower()
+    kind = "audio" if suffix in AUDIO_EXTENSIONS else "image" if suffix in IMAGE_EXTENSIONS else "video"
+    return {
+        "ok": True,
+        "filename": destination.name,
+        "kind": kind,
+        "size": size,
+        "serverPath": server_path(destination),
+        "url": media_url(destination),
+    }
+
 @app.get("/api/media/{filename}")
 def media(filename: str):
     """Serve media files from data/ or root."""
     for base in [DATA_DIR, ROOT]:
-        fp = base / filename
-        if fp.exists():
+        fp = (base / filename).resolve()
+        if is_within(fp, base) and fp.is_file():
             return FileResponse(str(fp))
     raise HTTPException(status_code=404, detail=f"File not found: {filename}")
 
@@ -667,10 +1522,33 @@ def media(filename: str):
 @app.get("/api/media/data/{filename:path}")
 def media_data(filename: str):
     """Serve files specifically from data/ directory."""
-    fp = DATA_DIR / filename
-    if not fp.exists():
+    fp = (DATA_DIR / filename).resolve()
+    if not is_within(fp, DATA_DIR) or not fp.is_file():
         raise HTTPException(status_code=404, detail=f"File not found in data/: {filename}")
     return FileResponse(str(fp))
+
+
+@app.get("/api/exports/{filename}")
+def download_export(filename: str):
+    """Download a finished render from the build root without path traversal."""
+    if Path(filename).name != filename or filename in {"", ".", ".."}:
+        raise HTTPException(status_code=400, detail="Invalid export filename")
+    if Path(filename).suffix.lower() not in EXPORT_EXTENSIONS:
+        raise HTTPException(status_code=404, detail="Export not found")
+    path = (BUILD_DIR / filename).resolve()
+    if not is_within(path, BUILD_DIR) or path.parent != BUILD_DIR.resolve() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Export not found")
+    media_types = {
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".mkv": "video/x-matroska",
+        ".webm": "video/webm",
+    }
+    return FileResponse(
+        str(path),
+        media_type=media_types.get(path.suffix.lower(), "application/octet-stream"),
+        filename=path.name,
+    )
 
 
 # ── Build files ──────────────────────────────────────────────────
@@ -699,7 +1577,7 @@ if __name__ == "__main__":
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     import uvicorn
     print("=" * 60)
-    print("  BookForge Studio API Server v0.3.0")
+    print(f"  {APP_NAME} API Server v{APP_VERSION}")
     print("  YouTube Audiobook Composer")
     print("=" * 60)
     print(f"  Root:    {ROOT}")

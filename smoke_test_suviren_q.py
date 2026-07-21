@@ -156,12 +156,30 @@ def test_cli_help() -> None:
 
 
 def find_rpp() -> Path | None:
-    rpps = sorted(ROOT.glob("*.rpp")) + sorted(ROOT.glob("*.RPP"))
+    # The data/ project is the renderer source of truth. A legacy root-level
+    # RPP is intentionally kept for reference but has fewer chapters.
+    rpps = (
+        sorted((ROOT / "data").glob("*.rpp"))
+        + sorted((ROOT / "data").glob("*.RPP"))
+        + sorted(ROOT.glob("*.rpp"))
+        + sorted(ROOT.glob("*.RPP"))
+    )
     if not rpps:
         return None
 
     preferred = [p for p in rpps if "зина" in p.name.lower()]
     return preferred[0] if preferred else rpps[0]
+
+
+def find_audio() -> Path | None:
+    candidates = [
+        path for path in (ROOT / "data").glob("*")
+        if path.suffix.lower() in {".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg"}
+        and path.stat().st_size < 2 * 1024 ** 3
+        and ".tmp_probe" not in path.name
+    ]
+    preferred = [path for path in candidates if "render" in path.name.lower()]
+    return max(preferred or candidates, key=lambda path: path.stat().st_size, default=None)
 
 
 def test_rpp_inspection_optional() -> None:
@@ -174,7 +192,7 @@ def test_rpp_inspection_optional() -> None:
 
     ok(f"Using RPP: {rpp.name}")
 
-    run([
+    command = [
         PY,
         ROOT / "suviren_q.py",
         "inspect-rpp",
@@ -185,7 +203,11 @@ def test_rpp_inspection_optional() -> None:
         "--chapter-pattern",
         "Глава",
         "--add-intro",
-    ], timeout=120)
+    ]
+    audio = find_audio()
+    if audio:
+        command.extend(["--audio", audio])
+    run(command, timeout=120)
 
     assert_exists(CHAPTERS_JSON, "_suviren_q_build/chapters.detected.json")
 

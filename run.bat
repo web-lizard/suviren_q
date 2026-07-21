@@ -1,64 +1,57 @@
 @echo off
+setlocal
 chcp 65001 >nul
-title suviren-q Launcher
-
-echo =======================================
-echo    suviren-q — редактор видеокниг
-echo =======================================
+title BOOK WUNDERWAFFE
 cd /d "%~dp0"
 
-:: Мочим всё что заняло 8787
-echo [x] Чищу порты...
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr :8787 ^| findstr LISTENING') do (
-    if not "%%a"=="" taskkill /f /pid %%a 2>nul
-)
-timeout /t 1 /nobreak >nul
+set "APP_PYTHON=%~dp0.venv\Scripts\python.exe"
+if not exist "%APP_PYTHON%" set "APP_PYTHON=python"
 
-:: Ставим зависимости npm если ещё нет
-echo [1/3] Проверка npm...
+echo.
+echo   BOOK WUNDERWAFFE
+echo   Локальная студия аудиокниг
+echo.
+
 if not exist "ui\node_modules" (
-    echo    npm install...
-    cd ui
-    call npm install
-    cd ..
+    echo [1/3] Устанавливаю зависимости интерфейса...
+    pushd ui
+    call npm.cmd install
+    if errorlevel 1 goto :fail
+    popd
+) else (
+    echo [1/3] Интерфейс готов
 )
 
-:: Запускаем API сервер
-echo [2/3] Запуск API сервера (порт 8787)...
-start "suviren-q API" /MIN cmd /c "python suviren_q_server.py"
+echo [2/3] Запускаю медиадвижок на порту 8787...
+start "BOOK WUNDERWAFFE API" /MIN "%APP_PYTHON%" "%~dp0suviren_q_server.py"
 
-:: Ждём пока API встанет
-echo    Ожидание API...
+set /a API_TRIES=0
 :wait_api
-timeout /t 2 /nobreak >nul
-python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/health')" 2>nul
-if errorlevel 1 goto wait_api
-echo    API готов!
+set /a API_TRIES+=1
+"%APP_PYTHON%" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/health', timeout=1)" >nul 2>nul
+if not errorlevel 1 goto :api_ready
+if %API_TRIES% GEQ 30 goto :api_failed
+timeout /t 1 /nobreak >nul
+goto :wait_api
 
-:: Запускаем UI
-echo [3/3] Запуск редактора...
-start "suviren-q UI" /MIN cmd /c "cd /d %~dp0ui && npx vite --host 127.0.0.1"
-
-timeout /t 4 /nobreak >nul
-
-:: Находим какой порт занял Vite
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr :51[0-9][0-9] ^| findstr LISTENING') do (
-    for /f "tokens=4" %%b in ('netstat -ano ^| findstr %%a ^| findstr LISTENING') do (
-        set "port=%%b"
-    )
-)
-
-:: Если не нашли, пробуем стандартный
-if "%port%"=="" set "port=127.0.0.1:5173"
-
+:api_ready
+echo [3/3] Запускаю студию на порту 5178...
+start "BOOK WUNDERWAFFE UI" /MIN /D "%~dp0ui" cmd /c npm.cmd run dev
+timeout /t 3 /nobreak >nul
+start "" "http://127.0.0.1:5178"
 echo.
-echo =======================================
-echo    Всё запущено! Открываю браузер...
-echo    http://%port%/
-echo =======================================
-start http://%port%/
-
+echo   Студия открыта: http://127.0.0.1:5178
+echo   Это окно можно закрыть — серверы продолжат работать.
 echo.
-echo [Для выхода закрой это окно]
+exit /b 0
+
+:api_failed
+echo.
+echo [ОШИБКА] Backend не ответил за 30 секунд.
+echo Проверьте сообщения в окне BOOK WUNDERWAFFE API.
+goto :fail
+
+:fail
 echo.
 pause
+exit /b 1
