@@ -1,5 +1,9 @@
 # BOOK WUNDERWAFFE Studio
 
+<p align="center">
+  <img src="assets/book-wunderwaffe-icon.png" width="180" alt="BOOK WUNDERWAFFE Studio icon" />
+</p>
+
 > **Local-first Audiobook Production Suite** — превращает мастер-аудио и разметку глав в аккуратный, готовый к публикации видеорелиз.
 
 ![Version](https://img.shields.io/badge/version-1.1.0-ffb731?style=flat-square)
@@ -49,6 +53,12 @@ cd ..
 ```
 
 `run.bat` открывает самостоятельное GUI-окно. Внешний браузер и постоянно работающий Vite dev-server для обычной работы не нужны. Если production-сборка интерфейса устарела, desktop-оболочка пересоберёт её автоматически.
+
+Создать фирменный ярлык на рабочем столе:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\create_desktop_shortcut.ps1
+```
 
 FFmpeg можно поставить через Winget:
 

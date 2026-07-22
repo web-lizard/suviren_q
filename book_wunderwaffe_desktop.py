@@ -11,6 +11,7 @@ development server is needed at runtime.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import shutil
 import socket
@@ -29,6 +30,7 @@ UI_ROOT = ROOT / "ui"
 UI_DIST = UI_ROOT / "dist"
 UI_INDEX = UI_DIST / "index.html"
 HOST = "127.0.0.1"
+APP_ICON = ROOT / "assets" / "book-wunderwaffe.ico"
 
 
 def hidden_process_options() -> dict[str, int]:
@@ -219,6 +221,13 @@ def run_desktop(*, window_smoke_test: bool = False) -> int:
 
     app_name = backend_module.APP_NAME
     app_version = backend_module.APP_VERSION
+    if os.name == "nt":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "TempleOfLizard.BookWunderwaffeStudio"
+            )
+        except (AttributeError, OSError):
+            pass
 
     QApplication.setOrganizationName("Temple of Lizard")
     QApplication.setApplicationName(app_name)
@@ -226,6 +235,8 @@ def run_desktop(*, window_smoke_test: bool = False) -> int:
     QApplication.setApplicationVersion(app_version)
     qt_app = QApplication.instance() or QApplication(sys.argv)
     qt_app.setQuitOnLastWindowClosed(True)
+    if APP_ICON.is_file():
+        qt_app.setWindowIcon(QIcon(str(APP_ICON)))
 
     data_dir = Path(QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation))
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -268,8 +279,8 @@ def run_desktop(*, window_smoke_test: bool = False) -> int:
             self.setWindowTitle(f"{app_name} · {app_version}")
             self.resize(1600, 960)
             self.setMinimumSize(1120, 720)
-            if (ROOT / "cover.png").is_file():
-                self.setWindowIcon(QIcon(str(ROOT / "cover.png")))
+            if APP_ICON.is_file():
+                self.setWindowIcon(QIcon(str(APP_ICON)))
 
             self.view = QWebEngineView(self)
             profile = QWebEngineProfile.defaultProfile()
