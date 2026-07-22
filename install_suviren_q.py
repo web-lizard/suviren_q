@@ -3,13 +3,13 @@
 """
 install_suviren_q.py
 
-Bootstrap installer for suviren-q: La Queue Souveraine.
+Bootstrap installer for BOOK WUNDERWAFFE Studio 1.1.0.
 
 This script prepares a local Windows-friendly Python environment:
 - checks Python version
 - creates .venv
 - writes requirements.txt
-- installs Pillow
+- installs the Python desktop/API/render runtime
 - checks ffmpeg and ffprobe
 - creates local helper scripts
 - runs a smoke test for suviren_q.py
@@ -29,8 +29,8 @@ from pathlib import Path
 from typing import Iterable
 
 
-APP_NAME = "suviren-q"
-APP_FULL_NAME = "suviren-q: La Queue Souveraine"
+APP_NAME = "book-wunderwaffe-studio"
+APP_FULL_NAME = "BOOK WUNDERWAFFE Studio 1.1.0"
 
 ROOT = Path(__file__).resolve().parent
 MAIN_SCRIPT = ROOT / "suviren_q.py"
@@ -43,12 +43,16 @@ LOCAL_DIR = ROOT / "_suviren_q_local"
 
 REQUIREMENTS = [
     "Pillow>=10.0.0",
+    "qrcode[pil]>=8.2",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "PySide6>=6.8,<7",
 ]
 
 
 GITIGNORE_RULES = [
     "",
-    "# suviren-q local/build files",
+    "# BOOK WUNDERWAFFE Studio local/build files",
     "_suviren_q_build/",
     "_suviren_q_local/",
     "",
@@ -456,7 +460,7 @@ def print_next_steps(py: Path) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="install_suviren_q.py",
-        description="Bootstrap installer for suviren-q.",
+        description="Bootstrap installer for BOOK WUNDERWAFFE Studio.",
     )
 
     parser.add_argument(

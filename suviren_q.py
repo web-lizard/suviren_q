@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-suviren-q: La Queue Souveraine
-Audiobook → YouTube video builder with GPU-accelerated rendering.
+BOOK WUNDERWAFFE Studio — Local-first Audiobook Production Suite.
+
+Chapter-aware audiobook composition and reliable GPU/CPU video rendering.
 
 Commands:
   install          - check/install Python deps and ffmpeg availability
@@ -17,10 +18,10 @@ Python 3.10+
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import csv
 import json
 import math
-import multiprocessing
 import os
 import re
 import shutil
@@ -31,8 +32,9 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Optional
 
-APP_NAME = "suviren-q"
-APP_TITLE = "suviren-q: La Queue Souveraine"
+APP_NAME = "book-wunderwaffe-studio"
+APP_VERSION = "1.1.0"
+APP_TITLE = f"BOOK WUNDERWAFFE Studio {APP_VERSION}"
 BUILD_DIR_NAME = "_suviren_q_build"
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
@@ -46,7 +48,7 @@ GPU_ENCODERS: dict[str, dict[str, Any]] = {
         "preset": "p7",
         "tune": "hq",
         "rc": "vbr",
-        "cq": 19,
+        "cq": 23,
         "b_pyramid": 1,
         "gpu": 0,
         "label": "NVIDIA NVENC",
@@ -56,8 +58,8 @@ GPU_ENCODERS: dict[str, dict[str, Any]] = {
         "check_bin": "clinfo",
         "check_sub": "amd",
         "preset": "quality",
-        "rc": "cbr",
-        "cq": 20,
+        "rc": "vbr_peak",
+        "cq": 23,
         "gpu": 0,
         "label": "AMD AMF",
     },
@@ -99,15 +101,15 @@ def _safe_print(text: str, file=None, flush: bool = False) -> None:
 
 
 def log(msg: str) -> None:
-    _safe_print(f"[suviren-q] {msg}", flush=True)
+    _safe_print(f"[Wunderwaffe] {msg}", flush=True)
 
 
 def warn(msg: str) -> None:
-    _safe_print(f"[suviren-q][WARN] {msg}", flush=True)
+    _safe_print(f"[Wunderwaffe][WARN] {msg}", flush=True)
 
 
 def fail(msg: str, code: int = 1) -> None:
-    _safe_print(f"[suviren-q][ERROR] {msg}", file=sys.stderr, flush=True)
+    _safe_print(f"[Wunderwaffe][ERROR] {msg}", file=sys.stderr, flush=True)
     raise SystemExit(code)
 
 
@@ -289,9 +291,17 @@ def run_cmd(cmd: list[str], *, dry_run: bool = False, capture: bool = False) -> 
         return None
     try:
         if capture:
-            res = subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            res = subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                **hidden_process_options(),
+            )
             return res.stdout
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, **hidden_process_options())
         return None
     except FileNotFoundError:
         fail(f"Command not found: {cmd[0]}")
@@ -309,6 +319,13 @@ def quote_for_log(s: str) -> str:
 
 def which_or_none(name: str) -> Optional[str]:
     return shutil.which(name)
+
+
+def hidden_process_options() -> dict[str, int]:
+    """Keep FFmpeg/helper processes invisible behind the Windows desktop GUI."""
+    if os.name == "nt":
+        return {"creationflags": int(getattr(subprocess, "CREATE_NO_WINDOW", 0))}
+    return {}
 
 
 def check_binary(name: str, required: bool = True) -> Optional[str]:
@@ -356,7 +373,13 @@ def detect_gpu_encoder() -> tuple[str, dict[str, Any]]:
         if enc_name == "amd_amf":
             # clinfo exists → check for AMD
             try:
-                out = subprocess.run([check], capture_output=True, text=True, timeout=5)
+                out = subprocess.run(
+                    [check],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    **hidden_process_options(),
+                )
                 if "amd" in out.stdout.lower() or "amd" in out.stderr.lower():
                     log(f"GPU encoder detected: {enc['label']}")
                     return enc_name, enc
@@ -380,6 +403,9 @@ def encoder_ffmpeg_args(
     width: int,
     height: int,
     fps: int,
+    *,
+    include_video_filter: bool = True,
+    include_audio: bool = True,
 ) -> list[str]:
     """Build encoder-specific ffmpeg arguments."""
     codec = enc["codec"]
@@ -393,7 +419,7 @@ def encoder_ffmpeg_args(
         args += ["-preset", enc.get("preset", "p7")]
         args += ["-rc", enc.get("rc", "vbr")]
         args += ["-cq", str(enc.get("cq", 19))]
-        args += ["-b:v", "0"]
+        args += ["-b:v", "1800k", "-maxrate", "3500k", "-bufsize", "7000k"]
         if enc.get("b_pyramid"):
             args += ["-b-pyramid", "1"]
         if enc.get("gpu") is not None:
@@ -402,8 +428,7 @@ def encoder_ffmpeg_args(
         args += ["-c:v", "h264_amf"]
         args += ["-quality", enc.get("preset", "quality")]
         args += ["-rc", enc.get("rc", "cbr")]
-        args += ["-qp_i", str(enc.get("cq", 20))]
-        args += ["-qp_p", str(enc.get("cq", 20))]
+        args += ["-b:v", "1800k", "-maxrate", "3500k", "-bufsize", "7000k"]
     elif codec == "h264_qsv":
         args += ["-c:v", "h264_qsv"]
         args += ["-preset", enc.get("preset", "veryslow")]
@@ -412,8 +437,11 @@ def encoder_ffmpeg_args(
 
     # Common args
     args += ["-r", str(fps)]
-    args += ["-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"]
-    args += ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
+    if include_video_filter:
+        args += ["-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"]
+    if include_audio:
+        args += ["-c:a", "aac", "-b:a", "192k"]
+    args += ["-movflags", "+faststart"]
     return args
 
 
@@ -434,6 +462,7 @@ def _ffmpeg_parse_duration(path: Path) -> Optional[float]:
             encoding="utf-8",
             errors="replace",
             timeout=120,
+            **hidden_process_options(),
         )
         # Duration line format: "Duration: HH:MM:SS.xx, start: ..."
         out = res.stderr or ""
@@ -488,6 +517,7 @@ def _estimate_duration_from_bitrate(path: Path) -> Optional[float]:
                     encoding="utf-8",
                     errors="replace",
                     timeout=5,
+                    **hidden_process_options(),
                 )
                 br_str = br_res.stdout.strip()
             except subprocess.TimeoutExpired:
@@ -523,7 +553,15 @@ def ffprobe_duration(path: Path) -> Optional[float]:
             "-of", "default=noprint_wrappers=1:nokey=1",
             str(path),
         ]
-        res = subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        res = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **hidden_process_options(),
+        )
         value = res.stdout.strip()
         if value and value != "N/A":
             dur = float(value)
@@ -875,7 +913,7 @@ def detect_chapters_from_rpp(
     """
     Extract chapters from a specific RPP track.
 
-    KEY BEHAVIOR (as of Book Wunderwaffe 1.0):
+    KEY BEHAVIOR (as of BOOK WUNDERWAFFE Studio 1.1):
     - Uses ALL items from the specified track (NOT filtered by chapter_pattern).
     - Chapter_pattern is ignored; we take every item on the book track.
     - Items are sorted by POSITION.
@@ -1268,6 +1306,8 @@ def _prepare_panel_background(
     background: Optional[Path],
     size: tuple[int, int],
     bg_color: tuple[int, int, int],
+    *,
+    glitch: bool = True,
 ) -> Any:
     """Aspect-fill and softly grade the photographic panel background."""
     from PIL import Image, ImageEnhance, ImageFilter, ImageOps
@@ -1289,10 +1329,12 @@ def _prepare_panel_background(
         fitted = fitted.filter(ImageFilter.GaussianBlur(radius=1.8 * scale))
         fitted = ImageEnhance.Color(fitted).enhance(0.76)
         fitted = ImageEnhance.Brightness(fitted).enhance(0.57)
-        return _glitch_panel_background(
-            fitted,
-            seed=0x54454D50 ^ (width << 8) ^ height,
-        )
+        if glitch:
+            return _glitch_panel_background(
+                fitted,
+                seed=0x54454D50 ^ (width << 8) ^ height,
+            )
+        return fitted.convert("RGBA")
     except Exception as exc:
         warn(f"Could not load background: {background} ({exc})")
         return base
@@ -1384,6 +1426,9 @@ def draw_panel(
     width: int = DEFAULT_WIDTH,
     height: int = DEFAULT_HEIGHT,
     style: str = "deep-purple",
+    animated_visuals: bool = False,
+    timeline_duration: Optional[float] = None,
+    editor_project: Optional[dict[str, Any]] = None,
 ) -> None:
     from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
@@ -1394,22 +1439,46 @@ def draw_panel(
     bg_color = palette["bg"]
     accent = palette["accent"]
     accent2 = palette["accent2"]
-    text_color = palette["text"]
+    project_data = editor_project if isinstance(editor_project, dict) else {}
+    project_layers = project_data.get("layers") if isinstance(project_data.get("layers"), dict) else {}
+
+    def layer_config(layer_id: str) -> dict[str, Any]:
+        value = project_layers.get(layer_id)
+        return value if isinstance(value, dict) else {}
+
+    def layer_pixel(config: dict[str, Any], key: str, default: float, extent: int) -> int:
+        try:
+            value = float(config.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return round(extent * max(0.0, value) / 100.0)
+
+    cover_config = layer_config("cover")
+    title_config = layer_config("title")
+    visualizer_config = layer_config("visualizer")
+    cover_visible = cover_config.get("visible", True) is not False
+    title_visible = title_config.get("visible", True) is not False
+    visualizer_visible = visualizer_config.get("visible", True) is not False
+
+    text_color = rgb_or_default(title_config.get("color"), palette["text"])
     text_dim = palette["text_dim"]
-    progress_bg = palette["progress_bg"]
-    wave_color = palette["waveform"]
     title_glow = palette["title_glow"]
-    img = _prepare_panel_background(background, (W, H), bg_color)
+    img = _prepare_panel_background(
+        background,
+        (W, H),
+        bg_color,
+        glitch=project_data.get("glitch", True) is not False,
+    )
     scale = max(0.5, min(W / 1920, H / 1080))
 
     # Cover image
     ch = chapters[current_index]
-    cover_x = round(W * 0.07)
-    cover_y = round(H * 0.17)
-    cover_w = round(W * 0.27)
-    cover_h = round(H * 0.66)
+    cover_x = layer_pixel(cover_config, "x", 7.0, W)
+    cover_y = layer_pixel(cover_config, "y", 17.0, H)
+    cover_w = max(32, layer_pixel(cover_config, "w", 27.0, W))
+    cover_h = max(32, layer_pixel(cover_config, "h", 66.0, H))
 
-    if cover.exists():
+    if cover_visible and cover.exists():
         try:
             with Image.open(cover) as opened:
                 cv = ImageOps.fit(
@@ -1456,10 +1525,10 @@ def draw_panel(
     # Previous/current/next chapter stack. Neighbours live on a transparent
     # layer so alpha=128 remains a real 50% after the final RGB conversion.
     title_text = ch.title.strip() or f"Chapter {current_index + 1}"
-    title_x = round(W * 0.39)
-    title_y = round(H * 0.23)
-    title_w = round(W * 0.54)
-    title_h = round(H * 0.31)
+    title_x = layer_pixel(title_config, "x", 39.0, W)
+    title_y = layer_pixel(title_config, "y", 23.0, H)
+    title_w = max(64, layer_pixel(title_config, "w", 54.0, W))
+    title_h = max(48, layer_pixel(title_config, "h", 31.0, H))
     title_pad_x = max(12, round(title_w * 0.025))
     available_w = title_w - 2 * title_pad_x
 
@@ -1488,13 +1557,17 @@ def draw_panel(
         1,
         title_h - side_count * side_h - side_count * stack_gap,
     )
+    try:
+        configured_title_size = float(title_config.get("fontSize", 48))
+    except (TypeError, ValueError):
+        configured_title_size = 48.0
     current_font, current_text, current_spacing, current_dims = _fit_panel_title(
         text_draw,
         title_text,
         font,
         available_w,
         current_max_h,
-        max_size=max(28, round(68 * scale)),
+        max_size=max(18, round(configured_title_size * scale)),
         min_size=max(18, round(28 * scale)),
         max_lines=3,
     )
@@ -1551,41 +1624,106 @@ def draw_panel(
     if following:
         draw_side(current_index + 2, following.title.strip(), cursor_y)
 
-    img = Image.alpha_composite(img, text_layer)
+    if title_visible:
+        img = Image.alpha_composite(img, text_layer)
 
-    draw = ImageDraw.Draw(img, "RGBA")
+    chrome_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(chrome_layer)
 
-    # Progress bar bottom
-    bar_y = H - int(H * 0.08)
-    bar_h = int(H * 0.025)
-    bar_x = int(W * 0.04)
-    bar_w = int(W * 0.92)
-    draw.rounded_rectangle([(bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h)], radius=4, fill=progress_bg)
-    if len(chapters) > 1:
-        progress = current_index / (len(chapters) - 1)
-        prog_w = int(bar_w * progress)
-        if prog_w > 0:
-            draw.rounded_rectangle([(bar_x, bar_y), (bar_x + prog_w, bar_y + bar_h)], radius=4, fill=accent)
-
-    # Waveform bar, kept inside the right-side visualizer region.
-    wave_x = round(W * 0.38)
-    wave_y = round(H * 0.69)
-    wave_w = round(W * 0.56)
-    wave_h = round(H * 0.12)
+    # Visualizer geometry mirrors the Vue composition layer. During video
+    # export FFmpeg paints the audio-reactive curve over this quiet grid;
+    # PNG previews retain a deterministic fallback line.
+    wave_x = layer_pixel(visualizer_config, "x", 38.0, W)
+    wave_y = layer_pixel(visualizer_config, "y", 59.0, H)
+    wave_w = max(64, layer_pixel(visualizer_config, "w", 56.0, W))
+    wave_h = max(48, layer_pixel(visualizer_config, "h", 23.0, H))
     wave_mid = wave_y + wave_h // 2
-    bar_count = 120
-    import random
-    rng = random.Random(ch.start_seconds)  # deterministic
-    draw.line((wave_x, wave_mid, wave_x + wave_w, wave_mid), fill=(*accent, 88), width=max(1, round(scale)))
-    for n in range(bar_count):
-        bx = wave_x + round(n * wave_w / max(1, bar_count - 1))
-        bh = max(2, round(wave_h * (0.06 + 0.52 * rng.random() ** 2)))
-        draw.line((bx, wave_mid - bh // 2, bx, wave_mid + bh // 2), fill=(*wave_color, 154), width=max(1, round(2 * scale)))
+    if visualizer_visible:
+        for row in range(1, 5):
+            grid_y = wave_y + round(wave_h * row / 5)
+            draw.line(
+                (wave_x, grid_y, wave_x + wave_w, grid_y),
+                fill=(255, 255, 255, 19),
+                width=max(1, round(scale)),
+            )
+        draw.line(
+            (wave_x, wave_mid, wave_x + wave_w, wave_mid),
+            fill=(*accent, 54),
+            width=max(1, round(scale)),
+        )
 
-    # Chapter count
-    footer = f"Chapter {current_index + 1} / {len(chapters)}"
-    footer_font = _panel_font(font, max(12, round(22 * scale)))
-    draw.text((int(W * 0.04), H - int(H * 0.14)), footer, fill=(*text_dim, 205), font=footer_font)
+    if visualizer_visible and not animated_visuals:
+        import random
+
+        rng = random.Random(ch.start_seconds)
+        points = []
+        point_count = 96
+        for n in range(point_count):
+            bx = wave_x + round(n * wave_w / max(1, point_count - 1))
+            amplitude = 0.08 + 0.66 * rng.random() ** 2
+            by = wave_y + round(wave_h * (0.82 - amplitude * 0.64))
+            points.append((bx, by))
+        if len(points) > 1:
+            draw.line(points, fill=(*accent, 236), width=max(2, round(2 * scale)), joint="curve")
+
+    # The scene progress rail is intentionally thin, like the Vue preview.
+    # Only the neutral rail and total time are baked into panels. The moving
+    # fill/current time are generated per frame by FFmpeg.
+    total_duration = max(
+        0.001,
+        float(timeline_duration or max((item.end_seconds for item in chapters), default=0.0)),
+    )
+    progress_label_x = round(W * 0.398)
+    progress_bar_x = round(W * 0.455)
+    progress_bar_y = round(H * 0.944)
+    progress_bar_w = round(W * 0.435)
+    progress_bar_h = max(2, round(2 * scale))
+    draw.rounded_rectangle(
+        (
+            progress_bar_x,
+            progress_bar_y,
+            progress_bar_x + progress_bar_w,
+            progress_bar_y + progress_bar_h,
+        ),
+        radius=progress_bar_h,
+        fill=(255, 255, 255, 34),
+    )
+    if not animated_visuals:
+        progress = max(0.0, min(1.0, ch.start_seconds / total_duration))
+        progress_width = round(progress_bar_w * progress)
+        if progress_width > 0:
+            draw.rounded_rectangle(
+                (
+                    progress_bar_x,
+                    progress_bar_y,
+                    progress_bar_x + progress_width,
+                    progress_bar_y + progress_bar_h,
+                ),
+                radius=progress_bar_h,
+                fill=(*accent, 238),
+            )
+
+    time_font = _panel_font(font, max(10, round(15 * scale)))
+    time_y = progress_bar_y - max(5, round(8 * scale))
+    if not animated_visuals:
+        _draw_panel_text_top(
+            draw,
+            (progress_label_x, time_y),
+            seconds_to_timecode(ch.start_seconds, millis=False),
+            font=time_font,
+            fill=(*text_dim, 180),
+        )
+    total_label = seconds_to_timecode(total_duration, millis=False)
+    total_width = _panel_text_width(draw, total_label, time_font)
+    _draw_panel_text_top(
+        draw,
+        (round(W * 0.947) - total_width, time_y),
+        total_label,
+        font=time_font,
+        fill=(*text_dim, 180),
+    )
+
+    img = Image.alpha_composite(img, chrome_layer)
 
     # QR is deliberately last: its modules and quiet zone must never be blurred
     # or displaced by the background glitch treatment.
@@ -1607,6 +1745,9 @@ def render_panels(
     width: int = DEFAULT_WIDTH,
     height: int = DEFAULT_HEIGHT,
     style: str = "deep-purple",
+    animated_visuals: bool = False,
+    timeline_duration: Optional[float] = None,
+    editor_project: Optional[dict[str, Any]] = None,
 ) -> list[Path]:
     ensure_pillow(auto_install=False)
     ensure_dir(out_dir)
@@ -1630,6 +1771,9 @@ def render_panels(
             width=width,
             height=height,
             style=style,
+            animated_visuals=animated_visuals,
+            timeline_duration=timeline_duration,
+            editor_project=editor_project,
         )
         paths.append(out)
     return paths
@@ -1643,91 +1787,200 @@ def concat_file_line(path: Path) -> str:
 # ── GPU-accelerated segment rendering ────────────────────────────
 
 def _render_segment_worker(args: dict[str, Any]) -> dict[str, Any]:
-    """Worker for parallel segment rendering (runs in subprocess)."""
+    """Render one chapter with live visuals and a safe CPU fallback."""
     panel = Path(args["panel"])
     audio = Path(args["audio"])
     out = Path(args["out"])
-    start = args["start"]
-    duration = args["duration"]
-    fps = args["fps"]
-    width = args["width"]
-    height = args["height"]
-    dry_run = args.get("dry_run", False)
-    gpu_codec = args.get("gpu_codec", "libx264")
-    gpu_preset = args.get("gpu_preset", "fast")
-    gpu_opts = args.get("gpu_opts", {})
+    start = float(args["start"])
+    duration = float(args["duration"])
+    fps = int(args["fps"])
+    width = int(args["width"])
+    height = int(args["height"])
+    dry_run = bool(args.get("dry_run", False))
+    gpu_codec = str(args.get("gpu_codec", "libx264"))
+    gpu_preset = str(args.get("gpu_preset", "fast"))
+    gpu_opts = dict(args.get("gpu_opts", {}))
+    style = str(args.get("style", "deep-purple"))
+    include_audio = bool(args.get("include_audio", True))
+    timeline_duration = max(duration, float(args.get("timeline_duration") or duration))
+    visualizer = dict(args.get("visualizer") or {})
 
     ensure_dir(out.parent)
 
-    # Build encoder args
-    enc: dict[str, Any] = {"codec": gpu_codec, "preset": gpu_preset}
-    if gpu_codec == "h264_nvenc":
-        enc.update(gpu_opts)
-    elif gpu_codec == "h264_amf":
-        enc.update(gpu_opts)
-    elif gpu_codec == "h264_qsv":
-        enc.update(gpu_opts)
-    elif gpu_codec == "libx264":
-        enc["crf"] = gpu_opts.get("crf", 20)
+    def percent_pixel(key: str, default: float, extent: int) -> int:
+        try:
+            value = float(visualizer.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return round(extent * max(0.0, value) / 100.0)
 
-    enc_args = encoder_ffmpeg_args(enc, width, height, fps)
+    animated_visuals = args.get("waveform", "ffmpeg") == "ffmpeg"
+    waveform_visible = animated_visuals and visualizer.get("visible", True) is not False
+    palette = STYLE_PRESETS.get(style, STYLE_PRESETS["deep-purple"])
+    accent = tuple(palette["accent"])
+    accent2 = tuple(palette["accent2"])
+    accent_hex = "".join(f"{channel:02x}" for channel in accent)
+    accent2_hex = "".join(f"{channel:02x}" for channel in accent2)
 
-    # Build filter for waveform if needed
-    use_waveform = args.get("waveform", "ffmpeg") == "ffmpeg"
-    filter_complex = None
-    if use_waveform:
-        wave_height = max(110, int(height * 0.14))
-        wave_y = height - wave_height - int(height * 0.045)
-        filter_complex = (
-            f"[0:v]scale={width}:{height},format=rgba[base];"
-            f"[1:a]showwaves=s={width}x{wave_height}:mode=cline:rate={fps}:"
-            f"colors=0x7fffe0|0xb69aff,format=rgba,colorchannelmixer=aa=0.72[wave];"
-            f"[base][wave]overlay=x=0:y={wave_y}:format=auto,format=yuv420p[v]"
+    filter_parts: list[str] = [f"[0:v]scale={width}:{height},setsar=1,format=rgba[base]"]
+    current_label = "base"
+
+    if waveform_visible:
+        wave_x = percent_pixel("x", 38.0, width)
+        wave_y = percent_pixel("y", 59.0, height)
+        wave_w = max(64, percent_pixel("w", 56.0, width))
+        wave_h = max(48, percent_pixel("h", 23.0, height))
+        filter_parts.extend(
+            [
+                "[1:a]asetpts=PTS-STARTPTS,asplit=2[wave_fill_audio][wave_line_audio]",
+                (
+                    f"[wave_fill_audio]showwaves=s={wave_w}x{wave_h}:mode=cline:rate={fps}:"
+                    f"colors=0x{accent2_hex}:scale=sqrt:draw=full,format=rgba,"
+                    "colorkey=0x000000:0.05:0.0,colorchannelmixer=aa=0.18[wave_fill]"
+                ),
+                (
+                    f"[wave_line_audio]showwaves=s={wave_w}x{wave_h}:mode=p2p:rate={fps}:"
+                    f"colors=0x{accent_hex}:scale=sqrt:draw=full,format=rgba,"
+                    "colorkey=0x000000:0.05:0.0,colorchannelmixer=aa=0.96[wave_line]"
+                ),
+                (
+                    f"[base][wave_fill]overlay=x={wave_x}:y={wave_y}:"
+                    "shortest=0:eof_action=pass:repeatlast=0:format=auto[with_wave_fill]"
+                ),
+                (
+                    f"[with_wave_fill][wave_line]overlay=x={wave_x}:y={wave_y}:"
+                    "shortest=0:eof_action=pass:repeatlast=0:format=auto[with_wave]"
+                ),
+            ]
         )
+        current_label = "with_wave"
 
-    # Build base command
-    cmd = [
-        "ffmpeg", "-y",
-        "-loop", "1",
-        "-framerate", str(fps),
-        "-i", str(panel),
-        "-ss", f"{start:.3f}",
-        "-t", f"{duration:.3f}",
-        "-i", str(audio),
-    ]
+    if animated_visuals:
+        scale = max(0.5, min(width / 1920, height / 1080))
+        progress_x = round(width * 0.455)
+        progress_y = round(height * 0.944)
+        progress_w = max(64, round(width * 0.435))
+        progress_h = max(2, round(2 * scale))
+        progress_expression = (
+            f"-{progress_w}+{progress_w}*({start:.6f}+t)/{timeline_duration:.6f}"
+        )
+        filter_parts.extend(
+            [
+                (
+                    f"color=c=black@0.0:s={progress_w}x{progress_h}:"
+                    f"r={fps}:d={duration:.6f},format=rgba[progress_canvas]"
+                ),
+                (
+                    f"color=c=0x{accent_hex}@0.96:s={progress_w}x{progress_h}:"
+                    f"r={fps}:d={duration:.6f},format=rgba[progress_fill]"
+                ),
+                (
+                    f"[progress_canvas][progress_fill]overlay=x='{progress_expression}':"
+                    "y=0:eval=frame:shortest=1:eof_action=pass[progress_local]"
+                ),
+                (
+                    f"[{current_label}][progress_local]overlay=x={progress_x}:"
+                    f"y={progress_y}:shortest=1:eof_action=pass[with_progress]"
+                ),
+            ]
+        )
+        current_label = "with_progress"
 
-    if filter_complex:
-        cmd += ["-filter_complex", filter_complex]
-        cmd += ["-map", "[v]"]
-    else:
-        cmd += ["-map", "0:v:0"]
+        font_value = args.get("font")
+        font_path = Path(font_value) if font_value else Path(os.environ.get("SystemRoot", "C:\\Windows")) / "Fonts" / "segoeui.ttf"
+        if font_path.is_file():
+            escaped_font = str(font_path.resolve()).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+            time_x = round(width * 0.398)
+            time_y = progress_y - max(7, round(10 * scale))
+            time_size = max(10, round(15 * scale))
+            filter_parts.append(
+                f"[{current_label}]drawtext=fontfile='{escaped_font}':"
+                f"text='%{{pts\\:hms\\:{start:.6f}}}':"
+                f"fontcolor=white@0.44:fontsize={time_size}:x={time_x}:y={time_y}:"
+                "fix_bounds=1[with_time]"
+            )
+            current_label = "with_time"
 
-    cmd += ["-map", "1:a:0", "-shortest"]
+    filter_complex: Optional[str] = None
+    if animated_visuals:
+        filter_parts.append(f"[{current_label}]format=yuv420p[v]")
+        filter_complex = ";".join(filter_parts)
 
-    # Encoder args (replace -vf if we used filter_complex)
-    has_vf = "-vf" in enc_args or any(a.startswith("-vf=") for a in enc_args)
-    if not filter_complex and not has_vf:
-        cmd += ["-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"]
+    def make_encoder(codec: str, preset: str, options: dict[str, Any]) -> dict[str, Any]:
+        encoder: dict[str, Any] = {"codec": codec, "preset": preset}
+        encoder.update(options)
+        if codec == "libx264":
+            encoder["crf"] = options.get("crf", 22)
+        return encoder
 
-    cmd += enc_args
-    cmd += [str(out)]
+    attempts = [(gpu_codec, gpu_preset, gpu_opts)]
+    if gpu_codec != "libx264":
+        attempts.append(("libx264", "fast", {"crf": 22}))
 
-    if dry_run:
-        print(f"[DRY RUN] Would render: {out.name}", flush=True)
-        return {"ok": True, "dry_run": True, "out": str(out)}
+    last_error = "unknown encoder error"
+    for attempt_index, (codec, preset, options) in enumerate(attempts):
+        encoder_args = encoder_ffmpeg_args(
+            make_encoder(codec, preset, options),
+            width,
+            height,
+            fps,
+            include_video_filter=filter_complex is None,
+            include_audio=include_audio,
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1",
+            "-framerate", str(fps),
+            "-i", str(panel),
+            "-ss", f"{start:.3f}",
+            "-t", f"{duration:.3f}",
+            "-i", str(audio),
+        ]
+        if filter_complex:
+            cmd += ["-filter_complex", filter_complex, "-map", "[v]"]
+        else:
+            cmd += ["-map", "0:v:0"]
+        if include_audio:
+            cmd += ["-map", "1:a:0", "-shortest"]
+        else:
+            cmd += ["-an", "-t", f"{duration:.6f}"]
+        cmd += [*encoder_args, str(out)]
 
-    try:
-        log(f"Rendering segment: {out.name} | {duration:.1f}s | {gpu_codec}")
-        t0 = time.time()
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        elapsed = time.time() - t0
-        speed = duration / elapsed if elapsed > 0 else 0
-        log(f"Segment done: {out.name} | {elapsed:.1f}s | {speed:.1f}x")
-        return {"ok": True, "out": str(out), "elapsed": elapsed, "speed": speed}
-    except subprocess.CalledProcessError as e:
-        error_msg = e.stderr[-500:] if e.stderr else str(e)
-        warn(f"Segment failed: {out.name} | {error_msg}")
-        return {"ok": False, "out": str(out), "error": error_msg}
+        if dry_run:
+            print(f"[DRY RUN] Would render: {out.name} ({codec})", flush=True)
+            return {"ok": True, "dry_run": True, "out": str(out), "encoder": codec}
+
+        try:
+            fallback_note = " (CPU fallback)" if attempt_index else ""
+            log(f"Rendering segment: {out.name} | {duration:.1f}s | {codec}{fallback_note}")
+            started = time.time()
+            subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                **hidden_process_options(),
+            )
+            elapsed = time.time() - started
+            speed = duration / elapsed if elapsed > 0 else 0
+            log(f"Segment done: {out.name} | {elapsed:.1f}s | {speed:.1f}x | {codec}")
+            return {
+                "ok": True,
+                "out": str(out),
+                "elapsed": elapsed,
+                "speed": speed,
+                "encoder": codec,
+            }
+        except subprocess.CalledProcessError as exc:
+            last_error = (exc.stderr or str(exc))[-1200:]
+            if attempt_index + 1 < len(attempts):
+                warn(f"{codec} failed for {out.name}; retrying safely with libx264")
+            else:
+                warn(f"Segment failed: {out.name} | {last_error}")
+
+    return {"ok": False, "out": str(out), "error": last_error}
 
 
 def render_segment(
@@ -1746,7 +1999,7 @@ def render_segment(
     gpu_preset: str = "fast",
     gpu_opts: Optional[dict[str, Any]] = None,
 ) -> None:
-    """Render a single segment (legacy direct call, no multiprocessing)."""
+    """Render a single segment (legacy direct call, no worker pool)."""
     args = {
         "panel": str(panel),
         "audio": str(audio),
@@ -1774,13 +2027,14 @@ def render_segments_parallel(
     segments_args: list[dict[str, Any]],
     max_workers: Optional[int] = None,
 ) -> list[dict[str, Any]]:
-    """Render segments in parallel using multiprocessing pool."""
+    """Render segments concurrently without spawning visible Python consoles."""
     if max_workers is None:
-        max_workers = min(multiprocessing.cpu_count(), 4)
+        # Two workers keep GPU/decoder pressure predictable for multi-hour,
+        # multi-gigabyte audiobook masters.
+        max_workers = min(os.cpu_count() or 1, 2)
     log(f"Parallel rendering with {max_workers} workers")
-    with multiprocessing.Pool(processes=max_workers) as pool:
-        results = pool.map(_render_segment_worker, segments_args)
-    return results
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="render") as pool:
+        return list(pool.map(_render_segment_worker, segments_args))
 
 
 def concat_segments(segments: list[Path], out: Path, concat_txt: Path, *, dry_run: bool = False) -> None:
@@ -1797,6 +2051,119 @@ def concat_segments(segments: list[Path], out: Path, concat_txt: Path, *, dry_ru
         str(out),
     ]
     run_cmd(cmd, dry_run=dry_run)
+
+
+def mux_master_audio(
+    video: Path,
+    audio: Path,
+    out: Path,
+    *,
+    start: float = 0.0,
+    duration: float,
+    dry_run: bool = False,
+) -> None:
+    """Attach the master once, avoiding AAC priming gaps at chapter joins."""
+    ensure_dir(out.parent if out.parent != Path("") else Path.cwd())
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(video),
+        "-ss", f"{max(0.0, start):.6f}",
+        "-i", str(audio),
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-t", f"{duration:.6f}",
+        "-shortest",
+        "-movflags", "+faststart",
+        str(out),
+    ]
+    run_cmd(cmd, dry_run=dry_run)
+
+
+def validate_render_output(
+    out: Path,
+    *,
+    expected_duration: float,
+    width: int,
+    height: int,
+    fps: int,
+    dry_run: bool = False,
+) -> None:
+    """Reject empty, truncated or structurally invalid final exports."""
+    if dry_run:
+        return
+    if not out.is_file() or out.stat().st_size <= 0:
+        fail(f"Final render is missing or empty: {out}")
+    ffprobe = check_binary("ffprobe", required=True)
+    assert ffprobe is not None
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v", "error",
+                "-show_streams",
+                "-show_format",
+                "-of", "json",
+                str(out),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            **hidden_process_options(),
+        )
+        payload = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        fail(f"Final render failed ffprobe validation: {exc}")
+
+    streams = payload.get("streams") if isinstance(payload, dict) else None
+    if not isinstance(streams, list):
+        fail("Final render has no readable streams")
+    video = next((item for item in streams if item.get("codec_type") == "video"), None)
+    audio_stream = next((item for item in streams if item.get("codec_type") == "audio"), None)
+    if not video or not audio_stream:
+        fail("Final render must contain both video and audio streams")
+    if (int(video.get("width") or 0), int(video.get("height") or 0)) != (width, height):
+        fail(
+            f"Final render resolution mismatch: {video.get('width')}x{video.get('height')} "
+            f"instead of {width}x{height}"
+        )
+    if video.get("codec_name") != "h264" or audio_stream.get("codec_name") != "aac":
+        fail(
+            "Final render codec mismatch: expected H.264/AAC, got "
+            f"{video.get('codec_name')}/{audio_stream.get('codec_name')}"
+        )
+    if video.get("pix_fmt") != "yuv420p":
+        fail(f"Final render pixel format is not yuv420p: {video.get('pix_fmt')}")
+
+    rate = str(video.get("avg_frame_rate") or "0/1")
+    try:
+        numerator, denominator = rate.split("/", 1)
+        actual_fps = float(numerator) / max(float(denominator), 1.0)
+    except (TypeError, ValueError, ZeroDivisionError):
+        actual_fps = 0.0
+    if abs(actual_fps - fps) > 0.02:
+        fail(f"Final render frame rate mismatch: {actual_fps:.3f} instead of {fps}")
+
+    format_data = payload.get("format") if isinstance(payload.get("format"), dict) else {}
+    try:
+        actual_duration = float(format_data.get("duration"))
+    except (TypeError, ValueError):
+        actual_duration = 0.0
+    tolerance = max(0.35, 3.0 / max(1, fps))
+    if actual_duration <= 0 or abs(actual_duration - expected_duration) > tolerance:
+        fail(
+            f"Final render duration mismatch: {actual_duration:.3f}s instead of "
+            f"{expected_duration:.3f}s"
+        )
+    log(
+        f"Validated MP4: H.264/AAC | {width}x{height} | "
+        f"{actual_fps:.3f} fps | {actual_duration:.3f}s"
+    )
 
 
 # ── Progress callback type ──────────────────────────────────────
@@ -1890,6 +2257,7 @@ def cmd_preview(args: argparse.Namespace) -> None:
     out_base = Path(args.build_dir) if args.build_dir else Path.cwd()
     bdir = build_dir(out_base)
     panels_dir = ensure_dir(bdir / "panels")
+    editor_project = load_editor_project_config(getattr(args, "editor_project", None))
     paths = render_panels(
         chapters,
         cover=Path(args.cover),
@@ -1901,6 +2269,7 @@ def cmd_preview(args: argparse.Namespace) -> None:
         width=args.width,
         height=args.height,
         style=args.style,
+        editor_project=editor_project,
     )
     log("Preview panels created:")
     for p in paths:
@@ -1922,6 +2291,21 @@ def analyze_chapter_gaps(chapters: list[Chapter]) -> list[dict[str, Any]]:
                 "before_index": i + 1,
             })
     return gaps
+
+
+def load_editor_project_config(path_value: Optional[str]) -> dict[str, Any]:
+    """Load optional Vue editor state without making CLI rendering depend on it."""
+    if not path_value:
+        return {}
+    path = Path(path_value)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            return value
+        warn(f"Editor project is not a JSON object: {path}")
+    except Exception as exc:
+        warn(f"Could not load editor project {path}: {exc}")
+    return {}
 
 
 def cmd_render(args: argparse.Namespace) -> None:
@@ -1957,6 +2341,42 @@ def cmd_render(args: argparse.Namespace) -> None:
 
     if not chapters:
         fail("No chapters for render")
+    for previous, current in zip(chapters, chapters[1:]):
+        if current.start_seconds <= previous.start_seconds + 0.001:
+            fail(
+                "Chapter starts must be strictly increasing: "
+                f"'{previous.title}' and '{current.title}'"
+            )
+
+    editor_project = load_editor_project_config(getattr(args, "editor_project", None))
+    timeline_duration = max((chapter.end_seconds for chapter in chapters), default=0.0)
+    project_duration_value = editor_project.get(
+        "duration_seconds",
+        editor_project.get("durationSeconds", editor_project.get("audioDuration")),
+    )
+    if project_duration_value is None and editor_project.get("durationMs") is not None:
+        project_duration_value = safe_float(str(editor_project.get("durationMs"))) / 1000.0
+    project_duration = safe_float(str(project_duration_value)) if project_duration_value is not None else 0.0
+    if math.isfinite(project_duration) and project_duration > 0.05:
+        if abs(project_duration - timeline_duration) > 1.0 / max(1, args.fps):
+            warn(
+                f"Using editor audio duration {project_duration:.3f}s instead of "
+                f"chapter tail {timeline_duration:.3f}s"
+            )
+        timeline_duration = project_duration
+    max_duration = getattr(args, "max_duration", None)
+    render_end = timeline_duration
+    if max_duration is not None:
+        render_end = min(render_end, max(0.0, float(max_duration)))
+    if render_end <= 0.05:
+        fail("Render duration is too short")
+    render_count = sum(1 for chapter in chapters if chapter.start_seconds < render_end - 0.001)
+    timing_anomalies = analyze_chapter_gaps(chapters)
+    if timing_anomalies:
+        warn(
+            f"Normalizing {len(timing_anomalies)} chapter gap/overlap boundaries "
+            "to marker starts so video stays aligned with the master audio"
+        )
 
     out_base = Path(args.build_dir) if args.build_dir else Path.cwd()
     bdir = build_dir(out_base)
@@ -1973,7 +2393,7 @@ def cmd_render(args: argparse.Namespace) -> None:
     gpu_opts = {k: gpu_enc[k] for k in ("cq", "rc", "b_pyramid", "gpu", "global_quality") if k in gpu_enc}
 
     log(f"Using encoder: {gpu_enc['label']} ({gpu_codec})")
-    log(f"Rendering {len(chapters)} panels")
+    log(f"Rendering {render_count} of {len(chapters)} panels")
 
     render_panels(
         chapters,
@@ -1981,18 +2401,37 @@ def cmd_render(args: argparse.Namespace) -> None:
         background=Path(args.background) if args.background else None,
         font=Path(args.font) if args.font else None,
         out_dir=panels_dir,
-        count=None,
+        count=render_count,
         only_index=None,
         width=args.width,
         height=args.height,
         style=args.style,
+        animated_visuals=args.waveform == "ffmpeg",
+        timeline_duration=timeline_duration,
+        editor_project=editor_project,
     )
 
     # Build segment args
     segment_args_list: list[dict[str, Any]] = []
+    project_layers = editor_project.get("layers") if isinstance(editor_project.get("layers"), dict) else {}
+    visualizer_config = project_layers.get("visualizer") if isinstance(project_layers.get("visualizer"), dict) else {}
     for i, ch in enumerate(chapters):
-        if ch.duration_seconds <= 0.05:
-            warn(f"Skipping too short chapter: {ch.title}")
+        if ch.start_seconds >= render_end - 0.001:
+            break
+        # Chapter start markers are the source of truth. Using each stored
+        # end independently could omit or duplicate time when a hand-edited
+        # map contains a gap/overlap, then desynchronise every later title.
+        segment_start = 0.0 if i == 0 else ch.start_seconds
+        next_start = chapters[i + 1].start_seconds if i + 1 < len(chapters) else render_end
+        segment_end = min(render_end, next_start)
+        segment_duration = segment_end - segment_start
+        if segment_duration <= 0:
+            fail(f"Chapter has no renderable duration: {ch.title}")
+        if segment_duration < 1.0 / max(1, args.fps):
+            if not segment_args_list:
+                fail(f"First chapter is shorter than one video frame: {ch.title}")
+            warn(f"Merging sub-frame chapter into previous panel: {ch.title}")
+            segment_args_list[-1]["duration"] += segment_duration
             continue
         panel = panels_dir / f"{i:03d}.png"
         segment = segments_dir / f"{i:03d}.mp4"
@@ -2000,13 +2439,18 @@ def cmd_render(args: argparse.Namespace) -> None:
             "panel": str(panel),
             "audio": str(audio),
             "out": str(segment),
-            "start": ch.start_seconds,
-            "duration": ch.duration_seconds,
+            "start": segment_start,
+            "duration": segment_duration,
             "fps": args.fps,
             "width": args.width,
             "height": args.height,
             "dry_run": args.dry_run,
             "waveform": args.waveform,
+            "style": args.style,
+            "timeline_duration": timeline_duration,
+            "visualizer": visualizer_config,
+            "font": args.font,
+            "include_audio": False,
             "gpu_codec": gpu_codec,
             "gpu_preset": gpu_preset,
             "gpu_opts": gpu_opts,
@@ -2025,6 +2469,45 @@ def cmd_render(args: argparse.Namespace) -> None:
             r = _render_segment_worker(sargs)
             results.append(r)
 
+    # A missing chapter must never be silently removed: doing so would shift
+    # every later title against the continuous master audio.
+    failures = [result for result in results if not result.get("ok")]
+    if failures:
+        first = failures[0]
+        fail(
+            f"Render aborted: {len(failures)} of {len(results)} segments failed. "
+            f"First error: {first.get('error', 'unknown encoder error')}"
+        )
+
+    # Direct H.264 concat is only safe when every segment comes from one
+    # encoder family. If a single GPU segment required CPU fallback, rebuild
+    # the complete set with libx264 so SPS/profile/extradata stay consistent.
+    used_encoders = {str(result.get("encoder")) for result in results}
+    if len(used_encoders) > 1:
+        warn(
+            "Mixed GPU/CPU segment output detected; rebuilding every segment "
+            "with libx264 for a safe final concat"
+        )
+        cpu_args = [
+            {
+                **segment_args,
+                "gpu_codec": "libx264",
+                "gpu_preset": "fast",
+                "gpu_opts": {"crf": 22},
+            }
+            for segment_args in segment_args_list
+        ]
+        if parallel and len(cpu_args) > 1:
+            results = render_segments_parallel(cpu_args)
+        else:
+            results = [_render_segment_worker(segment_args) for segment_args in cpu_args]
+        failures = [result for result in results if not result.get("ok")]
+        if failures:
+            fail(
+                f"CPU safety rebuild failed for {len(failures)} of "
+                f"{len(results)} segments: {failures[0].get('error', 'unknown error')}"
+            )
+
     # Collect rendered segments
     rendered_segments: list[Path] = []
     for result in results:
@@ -2037,8 +2520,31 @@ def cmd_render(args: argparse.Namespace) -> None:
 
     if not rendered_segments:
         fail("No segments rendered successfully")
+    if len(rendered_segments) != len(segment_args_list):
+        fail(
+            f"Render aborted: expected {len(segment_args_list)} segment files, "
+            f"got {len(rendered_segments)}"
+        )
 
-    concat_segments(rendered_segments, Path(args.out), bdir / "concat.txt", dry_run=args.dry_run)
+    video_only = bdir / "video_only.mp4"
+    concat_segments(rendered_segments, video_only, bdir / "concat.txt", dry_run=args.dry_run)
+    output_duration = sum(float(item["duration"]) for item in segment_args_list)
+    mux_master_audio(
+        video_only,
+        audio,
+        Path(args.out),
+        start=float(segment_args_list[0]["start"]),
+        duration=output_duration,
+        dry_run=args.dry_run,
+    )
+    validate_render_output(
+        Path(args.out),
+        expected_duration=output_duration,
+        width=args.width,
+        height=args.height,
+        fps=args.fps,
+        dry_run=args.dry_run,
+    )
     log(f"Done: {args.out}")
 
 
@@ -2065,14 +2571,16 @@ def add_visual_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
     p.add_argument("--style", choices=list(STYLE_PRESETS.keys()), default="deep-purple",
                     help="Visual theme for panel rendering")
+    p.add_argument("--editor-project", help="Optional Vue editor-project.json for layer parity")
     p.add_argument("--build-dir", help="Base dir for _suviren_q_build")
 
 
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(
-        prog="suviren_q.py",
-        description="suviren-q: audiobook YouTube video builder from REAPER RPP chapters",
+        prog="book-wunderwaffe",
+        description="BOOK WUNDERWAFFE Studio — local-first audiobook production suite",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_install = sub.add_parser("install", help="Install/check Python deps and ffmpeg")
@@ -2102,7 +2610,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     p_render.add_argument("--min-item-length", type=float, default=30.0)
     p_render.add_argument("--out", required=True, help="Output MP4")
     p_render.add_argument("--fps", type=int, default=DEFAULT_FPS)
-    p_render.add_argument("--waveform", choices=["static", "ffmpeg"], default="static", help="Audio visualization mode")
+    p_render.add_argument("--waveform", choices=["static", "ffmpeg"], default="ffmpeg", help="Audio visualization mode")
+    p_render.add_argument("--max-duration", type=float, help="Render only the first N seconds while keeping full chapter context")
     p_render.add_argument("--dry-run", action="store_true")
     p_render.add_argument("--no-parallel", action="store_true", dest="no_parallel", help="Disable parallel segment rendering")
     add_visual_args(p_render)

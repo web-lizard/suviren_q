@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-install_suviren_q_ui.py
+install_suviren_q_ui.py — archived compatibility scaffolder.
 
-Installs a local Vue interface for suviren-q.
+The maintained BOOK WUNDERWAFFE Studio UI already lives in ui/. Follow
+README.md and run.bat for the current native desktop workflow. This historical
+generator is retained only for recovery of the early browser-based prototype.
 
 Creates:
 - suviren_q_server.py

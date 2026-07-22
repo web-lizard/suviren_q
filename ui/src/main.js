@@ -10,7 +10,7 @@ app.config.errorHandler = (error, _instance, info) => {
     stack: error?.stack || '',
     info,
   }
-  console.error('[BOOK WUNDERWAFFE]', info, error)
+  console.error('[BOOK WUNDERWAFFE Studio]', info, error)
 }
 
 app.mount('#app')

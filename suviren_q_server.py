@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-suviren_q_server.py → BookForge Studio API Server
+BOOK WUNDERWAFFE Studio API
 
 Provides endpoints for:
   - /api/book-project — data auto-discovery from data/
@@ -44,8 +44,8 @@ LAYOUT_PATH = BUILD_DIR / "layout.json"
 EDITOR_PROJECT_PATH = BUILD_DIR / "editor-project.json"
 CHAPTERS_PATH = BUILD_DIR / "chapters.detected.json"
 
-APP_NAME = "BOOK WUNDERWAFFE"
-APP_VERSION = "1.0.0"
+APP_NAME = "BOOK WUNDERWAFFE Studio"
+APP_VERSION = "1.1.0"
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg", ".opus"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
@@ -53,7 +53,14 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi"}
 IMPORT_EXTENSIONS = AUDIO_EXTENSIONS | IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 EXPORT_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
 
-app = FastAPI(title=APP_NAME, version=APP_VERSION)
+app = FastAPI(
+    title=APP_NAME,
+    version=APP_VERSION,
+    description=(
+        "Local-first audiobook production API for chapter-aware composition, "
+        "waveform visualization and reliable FFmpeg export."
+    ),
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -72,6 +79,23 @@ JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 AUDIO_PROBE_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
 AUDIO_DISCOVERY_CACHE: dict[tuple[str, int, int], float] = {}
+
+
+def console_python_executable() -> str:
+    """Use python.exe for child jobs even when the desktop runs via pythonw.exe."""
+    executable = Path(sys.executable)
+    if os.name == "nt" and executable.name.lower() == "pythonw.exe":
+        console_sibling = executable.with_name("python.exe")
+        if console_sibling.is_file():
+            return str(console_sibling)
+    return str(executable)
+
+
+def hidden_process_options() -> dict[str, int]:
+    """Prevent helper consoles from flashing behind the native Windows GUI."""
+    if os.name == "nt":
+        return {"creationflags": int(getattr(subprocess, "CREATE_NO_WINDOW", 0))}
+    return {}
 
 
 # ── Request models ───────────────────────────────────────────────
@@ -331,7 +355,7 @@ def start_job(kind: str, cmd: list[str], *, output: Path | None = None) -> str:
             "output_exists": False,
             "output_size": 0,
             "log": [
-                f"[BookForge] job started: {kind}",
+                f"[Wunderwaffe] job started: {kind}",
                 "[cmd] " + " ".join(f'"{x}"' if " " in x else x for x in cmd),
             ],
         }
@@ -344,6 +368,7 @@ def run_job(job_id: str, cmd: list[str]) -> None:
     try:
         env = os.environ.copy()
         env["PYTHONUTF8"] = "1"
+        env["PYTHONUNBUFFERED"] = "1"
         proc = subprocess.Popen(
             cmd,
             cwd=str(ROOT),
@@ -353,17 +378,49 @@ def run_job(job_id: str, cmd: list[str]) -> None:
             encoding="utf-8",
             errors="replace",
             env=env,
+            **hidden_process_options(),
         )
         assert proc.stdout is not None
+        total_segments = 0
+        completed_segments = 0
         for line in proc.stdout:
             append_job_line(job_id, line)
-            if "Rendering segment" in line:
-                JOBS[job_id]["progress"] = min(0.99, JOBS[job_id].get("progress", 0) + 0.01)
+            plan_match = re.search(r"Rendering\s+(\d+)\s+of\s+\d+\s+panels", line)
+            if plan_match:
+                total_segments = max(1, int(plan_match.group(1)))
+                JOBS[job_id]["progress"] = max(JOBS[job_id].get("progress", 0.0), 0.04)
+                continue
+            panel_match = re.search(r"Drawing panel\s+(\d+)/", line)
+            if panel_match and total_segments:
+                panel_index = min(total_segments, int(panel_match.group(1)))
+                JOBS[job_id]["progress"] = max(
+                    JOBS[job_id].get("progress", 0.0),
+                    0.04 + 0.08 * panel_index / total_segments,
+                )
+                continue
+            if "Rendering segment" in line and total_segments:
+                JOBS[job_id]["progress"] = max(JOBS[job_id].get("progress", 0.0), 0.12)
+                continue
+            if "Segment done:" in line:
+                completed_segments += 1
+                denominator = max(total_segments, completed_segments)
+                JOBS[job_id]["progress"] = max(
+                    JOBS[job_id].get("progress", 0.0),
+                    min(0.95, 0.12 + 0.83 * completed_segments / denominator),
+                )
+                continue
+            if "Concat list:" in line:
+                JOBS[job_id]["progress"] = max(JOBS[job_id].get("progress", 0.0), 0.97)
         returncode = proc.wait()
         job = JOBS[job_id]
         output_value = job.get("output")
         output_path = resolve_path(output_value) if output_value else None
-        output_exists = bool(returncode == 0 and output_path and output_path.is_file())
+        output_exists = bool(
+            returncode == 0
+            and output_path
+            and output_path.is_file()
+            and output_path.stat().st_size > 0
+        )
         job["returncode"] = returncode
         job["output_exists"] = output_exists
         job["output_size"] = output_path.stat().st_size if output_exists and output_path else 0
@@ -372,7 +429,7 @@ def run_job(job_id: str, cmd: list[str]) -> None:
         job["updated_at"] = time.time()
         if returncode == 0 and output_path and not output_exists:
             append_job_line(job_id, f"[error] expected output was not created: {output_path}")
-        append_job_line(job_id, f"[BookForge] job finished with code {returncode}")
+        append_job_line(job_id, f"[Wunderwaffe] job finished with code {returncode}")
     except Exception as exc:
         JOBS[job_id]["status"] = "failed"
         JOBS[job_id]["returncode"] = -1
@@ -429,6 +486,7 @@ def quick_audio_duration(path: Path) -> float | None:
             encoding="utf-8",
             errors="replace",
             timeout=2,
+            **hidden_process_options(),
         )
         duration = parse_seconds(probe.stdout.strip()) if probe.returncode == 0 else None
     except (OSError, subprocess.TimeoutExpired):
@@ -570,7 +628,7 @@ def discover_data_files() -> dict[str, Any]:
 
 
 def get_default_layout() -> dict:
-    """Return the default BookForge Studio composition layout."""
+    """Return the default BOOK WUNDERWAFFE Studio composition layout."""
     return {
         "scene": {"width": 1920, "height": 1080, "fps": 30},
         "objects": {
@@ -728,10 +786,10 @@ def get_export_inputs() -> dict[str, Any]:
             "Видео работает в синхронном предпросмотре; текущий FFmpeg-экспорт "
             "использует статический фон, обложку, главы и аудио."
         )
-    if editor and (editor.get("scenes") or editor.get("layers")):
+    if editor and editor.get("scenes"):
         warnings.append(
-            "Позиции слоёв и покадровые сцены пока не переносятся в MP4: "
-            "экспорт использует стабильный статический шаблон рендера."
+            "Покадровые сцены пока не переносятся в MP4; экспорт использует "
+            "сохранённую геометрию текущей композиции."
         )
 
     chapters: list[dict[str, Any]] = []
@@ -842,6 +900,7 @@ def probe_audio_for_export(
             encoding="utf-8",
             errors="replace",
             timeout=8,
+            **hidden_process_options(),
         )
     except subprocess.TimeoutExpired:
         result["error"] = "ffprobe timed out after 8 seconds; audio may be damaged or too large"
@@ -876,6 +935,7 @@ def probe_audio_for_export(
                 encoding="utf-8",
                 errors="replace",
                 timeout=8,
+                **hidden_process_options(),
             )
         except subprocess.TimeoutExpired:
             result["error"] = "ffmpeg decode probe timed out after 8 seconds"
@@ -940,6 +1000,12 @@ def export_readiness_payload() -> dict[str, Any]:
                 missing.append("chapters-have-gaps")
                 errors.append(
                     f"Chapter gap of {gap:.1f}s before {current['title']}"
+                )
+                break
+            if gap < -0.25:
+                missing.append("chapters-have-overlaps")
+                errors.append(
+                    f"Chapter overlap of {abs(gap):.1f}s before {current['title']}"
                 )
                 break
         last_chapter_end = max(
@@ -1089,7 +1155,7 @@ def refresh_chapters() -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="No RPP file found")
     audio_path = resolve_path(data["audio"]["path"]) if data["audio"]["exists"] else None
     cmd = [
-        sys.executable,
+        console_python_executable(),
         str(MAIN_SCRIPT),
         "inspect-rpp",
         "--rpp", str(rpp_path),
@@ -1106,6 +1172,7 @@ def refresh_chapters() -> dict[str, Any]:
         result = subprocess.run(
             cmd, cwd=str(ROOT), capture_output=True, text=True,
             encoding="utf-8", errors="replace", env=env, timeout=60,
+            **hidden_process_options(),
         )
         chapters_path = BUILD_DIR / "chapters.detected.json"
         chapters = []
@@ -1166,11 +1233,10 @@ def build_render_cmd(
     audio: Path = inputs["audio"]
     cover: Path = inputs["cover"]
     background: Path | None = inputs["background"]
-    chapters = (
-        clipped_test_chapters(inputs["chapter_items"], seconds=60.0)
-        if test_mode
-        else CHAPTERS_PATH
-    )
+    # Keep the complete chapter list even for a 60-second test. This preserves
+    # previous/next chapter context and lets the in-frame progress bar use the
+    # same full-project duration as the editor.
+    chapters = CHAPTERS_PATH
     out = export_output_path(test_mode)
     editor_theme = str((load_editor_project() or {}).get("theme") or "amber")
     render_style = {
@@ -1179,7 +1245,7 @@ def build_render_cmd(
         "mono": "mono",
     }.get(editor_theme, "obsidian")
     cmd = [
-        sys.executable,
+        console_python_executable(),
         str(MAIN_SCRIPT),
         "render",
         "--audio", str(audio),
@@ -1187,11 +1253,15 @@ def build_render_cmd(
         "--chapters", str(chapters),
         "--out", str(out),
         "--fps", "30",
-        "--waveform", "static",
+        "--waveform", "ffmpeg",
         "--width", "1920",
         "--height", "1080",
         "--style", render_style,
     ]
+    if EDITOR_PROJECT_PATH.is_file():
+        cmd += ["--editor-project", str(EDITOR_PROJECT_PATH)]
+    if test_mode:
+        cmd += ["--max-duration", "60"]
     if background:
         cmd += ["--background", str(background)]
     return cmd
@@ -1290,7 +1360,7 @@ def render_log(max_lines: int = Query(100, ge=10, le=5000)) -> list[str]:
     ]
     render_jobs.sort(key=lambda j: j["created_at"], reverse=True)
     if not render_jobs:
-        return ["[BookForge] No render jobs yet"]
+        return ["[Wunderwaffe] No render jobs yet"]
     latest = render_jobs[0]
     return latest["log"][-max_lines:]
 
@@ -1338,6 +1408,7 @@ def get_waveform(
             ["ffmpeg", "-v", "error", "-i", str(audio_path), "-vn",
              "-ac", "1", "-ar", str(sample_rate), "-f", "s16le", "pipe:1"],
             capture_output=True, timeout=120, check=True,
+            **hidden_process_options(),
         )
         raw = process.stdout
         if len(raw) % 2:
@@ -1385,6 +1456,7 @@ def generate_synthetic_waveform(audio_path: Path, samples: int) -> dict[str, Any
              "format=duration", "-of", "csv=p=0",
              str(audio_path)],
             capture_output=True, text=True, timeout=30,
+            **hidden_process_options(),
         )
         if result.returncode == 0 and result.stdout.strip():
             duration_sec = float(result.stdout.strip())
@@ -1634,7 +1706,7 @@ if __name__ == "__main__":
     import uvicorn
     print("=" * 60)
     print(f"  {APP_NAME} API Server v{APP_VERSION}")
-    print("  YouTube Audiobook Composer")
+    print("  Local-first Audiobook Production Suite")
     print("=" * 60)
     print(f"  Root:    {ROOT}")
     print(f"  Data:    {DATA_DIR}")

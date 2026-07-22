@@ -1,5 +1,8 @@
 # BookForge Studio — Todo List
 
+> [!WARNING]
+> Архивный чек-лист прототипа. Текущее состояние BOOK WUNDERWAFFE Studio 1.1.0, GUI-запуск и проверки описаны в [README.md](README.md) и [CHANGELOG.md](CHANGELOG.md).
+
 ## Phase 0 — Stabilize ✓
 - [x] Починить IndentationError в suviren_q.py (была на ~line 914)
 - [x] Smoke test green

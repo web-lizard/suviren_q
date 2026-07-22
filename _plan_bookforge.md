@@ -1,5 +1,8 @@
 # BookForge Engine v1 — Implementation Plan
 
+> [!WARNING]
+> Архив исходного плана. Актуальная реализация и release workflow находятся в [README.md](README.md) и [CHANGELOG.md](CHANGELOG.md).
+
 ## Phase 0 (Done)
 [x] Smoke test passes (suviren_q.py + suviren_q_server.py compile)
 [x] Project stable

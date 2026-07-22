@@ -116,6 +116,7 @@ def test_required_files() -> None:
     required = [
         ROOT / "suviren_q.py",
         ROOT / "suviren_q_server.py",
+        ROOT / "book_wunderwaffe_desktop.py",
         ROOT / "install_suviren_q.py",
         ROOT / "install_suviren_q_ui.py",
         ROOT / "requirements.txt",
@@ -137,6 +138,7 @@ def test_python_compile() -> None:
     files = [
         ROOT / "suviren_q.py",
         ROOT / "suviren_q_server.py",
+        ROOT / "book_wunderwaffe_desktop.py",
         ROOT / "install_suviren_q.py",
         ROOT / "install_suviren_q_ui.py",
     ]
@@ -283,7 +285,7 @@ def test_ui_build_optional() -> None:
 
 
 def main() -> int:
-    print("suviren-q smoke test")
+    print("BOOK WUNDERWAFFE Studio smoke test")
     print(f"Root: {ROOT}")
     print(f"Python: {PY}")
 

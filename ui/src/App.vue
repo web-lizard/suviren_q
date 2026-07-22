@@ -1,11 +1,11 @@
 <template>
   <div class="studio" :class="[`theme-${project.theme}`, { 'is-loading': loading }]">
     <header class="topbar">
-      <div class="brand" aria-label="BOOK WUNDERWAFFE">
+      <div class="brand" aria-label="BOOK WUNDERWAFFE Studio">
         <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
         <span class="brand-copy">
-          <strong>BOOK WUNDERWAFFE</strong>
-          <small>аудиокнижная студия</small>
+          <strong>BOOK WUNDERWAFFE STUDIO</strong>
+          <small>AUDIOBOOK SUITE · v{{ backend.version || '1.1.0' }}</small>
         </span>
       </div>
 
@@ -418,7 +418,7 @@
 
     <div v-if="loading" class="loading-screen">
       <span class="loading-mark"><i></i><i></i><i></i></span>
-      <strong>BOOK WUNDERWAFFE</strong>
+      <strong>BOOK WUNDERWAFFE STUDIO</strong>
       <small>{{ loadingMessage }}</small>
     </div>
   </div>
