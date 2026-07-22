@@ -52,6 +52,12 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi"}
 IMPORT_EXTENSIONS = AUDIO_EXTENSIONS | IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 EXPORT_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
+DEFAULT_RENDER_PRESET = "balanced"
+RENDER_RATE_PRESETS_KBPS: dict[str, tuple[int, int]] = {
+    "compact": (1200, 192),
+    "balanced": (1800, 192),
+    "youtube_1080p": (7500, 384),
+}
 
 app = FastAPI(
     title=APP_NAME,
@@ -1047,6 +1053,40 @@ def export_readiness_payload() -> dict[str, Any]:
     }
     if audio_probe and assets["audio"]["exists"]:
         assets["audio"]["duration"] = audio_probe.get("duration")
+
+    project = load_editor_project() or {}
+    render_preset = str(project.get("renderPreset") or DEFAULT_RENDER_PRESET)
+    if render_preset not in RENDER_RATE_PRESETS_KBPS:
+        render_preset = DEFAULT_RENDER_PRESET
+    video_kbps, audio_kbps = RENDER_RATE_PRESETS_KBPS[render_preset]
+    render_duration = float((audio_probe or {}).get("duration") or 0.0)
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    free_bytes = int(shutil.disk_usage(BUILD_DIR).free)
+
+    def storage_estimate(seconds: float) -> dict[str, Any]:
+        seconds = max(0.0, float(seconds))
+        video_bytes = seconds * video_kbps * 1000 / 8
+        audio_bytes = seconds * audio_kbps * 1000 / 8
+        final_bytes = video_bytes + audio_bytes
+        # Peak export keeps chapter segments, their concatenated video and the
+        # final muxed MP4 at the same time. Include room for panels/container
+        # overhead so a long render does not die at the finish line.
+        peak_bytes = int((video_bytes * 3 + audio_bytes + 128 * 1024**2) * 1.08)
+        return {
+            "seconds": seconds,
+            "finalBytes": int(final_bytes),
+            "peakBytes": peak_bytes,
+            "freeBytes": free_bytes,
+            "enough": free_bytes >= peak_bytes,
+        }
+
+    render_estimate = {
+        "preset": render_preset,
+        "videoKbps": video_kbps,
+        "audioKbps": audio_kbps,
+        "full": storage_estimate(render_duration),
+        "test": storage_estimate(min(60.0, render_duration)),
+    }
     missing = list(dict.fromkeys(missing))
     return {
         "ready": not missing,
@@ -1064,6 +1104,7 @@ def export_readiness_payload() -> dict[str, Any]:
             "pillow": pillow_version,
         },
         "audioProbe": audio_probe,
+        "renderEstimate": render_estimate,
     }
 
 
@@ -1238,7 +1279,11 @@ def build_render_cmd(
     # same full-project duration as the editor.
     chapters = CHAPTERS_PATH
     out = export_output_path(test_mode)
-    editor_theme = str((load_editor_project() or {}).get("theme") or "amber")
+    editor_project = load_editor_project() or {}
+    editor_theme = str(editor_project.get("theme") or "amber")
+    render_preset = str(editor_project.get("renderPreset") or DEFAULT_RENDER_PRESET)
+    if render_preset not in RENDER_RATE_PRESETS_KBPS:
+        render_preset = DEFAULT_RENDER_PRESET
     render_style = {
         "amber": "obsidian",
         "violet": "deep-purple",
@@ -1257,6 +1302,7 @@ def build_render_cmd(
         "--width", "1920",
         "--height", "1080",
         "--style", render_style,
+        "--bitrate-preset", render_preset,
     ]
     if EDITOR_PROJECT_PATH.is_file():
         cmd += ["--editor-project", str(EDITOR_PROJECT_PATH)]
@@ -1273,7 +1319,7 @@ def export_readiness() -> dict[str, Any]:
     return export_readiness_payload()
 
 
-def require_export_ready() -> dict[str, Any]:
+def require_export_ready(*, test_mode: bool) -> dict[str, Any]:
     readiness = export_readiness_payload()
     if not readiness["ready"]:
         raise HTTPException(
@@ -1285,6 +1331,20 @@ def require_export_ready() -> dict[str, Any]:
                 "warnings": readiness["warnings"],
             },
         )
+    storage = readiness["renderEstimate"]["test" if test_mode else "full"]
+    if not storage["enough"]:
+        required_gib = storage["peakBytes"] / 1024**3
+        free_gib = storage["freeBytes"] / 1024**3
+        raise HTTPException(
+            status_code=507,
+            detail={
+                "message": (
+                    f"Недостаточно места для выбранного профиля: "
+                    f"нужно около {required_gib:.1f} ГБ, свободно {free_gib:.1f} ГБ"
+                ),
+                "missing": ["disk-space"],
+            },
+        )
     return readiness
 
 
@@ -1292,7 +1352,7 @@ def require_export_ready() -> dict[str, Any]:
 def render_test() -> dict[str, Any]:
     """Start a test render job (60 seconds)."""
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    require_export_ready()
+    require_export_ready(test_mode=True)
     try:
         cmd = build_render_cmd(test_mode=True)
     except HTTPException:
@@ -1315,7 +1375,7 @@ def render_test() -> dict[str, Any]:
 def render_full() -> dict[str, Any]:
     """Start a full render job."""
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    require_export_ready()
+    require_export_ready(test_mode=False)
     try:
         cmd = build_render_cmd(test_mode=False)
     except HTTPException:

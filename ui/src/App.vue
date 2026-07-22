@@ -387,13 +387,28 @@
         <template v-if="!renderJob">
           <div class="export-summary">
             <div><span>Формат</span><b>MP4 · 1920×1080 · H.264</b></div>
+            <label class="export-preset-row">
+              <span>Качество YouTube</span>
+              <span class="export-preset-control">
+                <select v-model="project.renderPreset" aria-label="Профиль битрейта для YouTube">
+                  <option v-for="preset in renderPresetOptions" :key="preset.id" :value="preset.id">
+                    {{ preset.label }} · {{ preset.videoLabel }}
+                  </option>
+                </select>
+                <small>Видео {{ activeRenderPreset.videoLabel }} · AAC {{ activeRenderPreset.audioLabel }}</small>
+              </span>
+            </label>
             <div><span>Длительность</span><b>{{ formatTime(duration, true) }}</b></div>
+            <div><span>Оценка полного файла</span><b>≈ {{ estimatedFullRenderSize }}</b></div>
             <div><span>Главы</span><b>{{ project.chapters.length }}</b></div>
           </div>
           <label class="switch-row export-test-switch">
             <span><b>Тестовый фрагмент</b><small>Первые 60 секунд — быстрее проверить оформление</small></span>
             <input v-model="exportTest" type="checkbox" /><i></i>
           </label>
+          <p v-if="duration > YOUTUBE_MAX_DURATION_SECONDS" class="export-warning youtube-limit-warning">
+            YouTube не примет один файл длиннее 12 часов. Полный локальный MP4 будет создан, но перед загрузкой его потребуется разделить.
+          </p>
           <p v-if="exportIssue" class="export-issue">{{ exportIssue }}</p>
           <p v-for="warning in exportReadiness?.warnings || []" :key="warning" class="export-warning">{{ warning }}</p>
           <button type="button" class="modal-primary" :disabled="!!exportIssue || startingExport" @click="startExport">
@@ -433,6 +448,22 @@ const TELEGRAM_URL = 'https://t.me/temple_of_lizard'
 const AUDIO_EXT = new Set(['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'])
 const VIDEO_EXT = new Set(['mp4', 'mov', 'm4v', 'webm', 'mkv', 'avi'])
 const IMAGE_EXT = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'])
+const YOUTUBE_MAX_DURATION_SECONDS = 12 * 60 * 60
+const RENDER_PRESETS = Object.freeze({
+  compact: {
+    id: 'compact', label: 'Компактный', videoKbps: 1200, audioKbps: 192,
+    videoLabel: '1,2 Мбит/с', audioLabel: '192 кбит/с',
+  },
+  balanced: {
+    id: 'balanced', label: 'Оптимальный', videoKbps: 1800, audioKbps: 192,
+    videoLabel: '1,8 Мбит/с', audioLabel: '192 кбит/с',
+  },
+  youtube_1080p: {
+    id: 'youtube_1080p', label: 'YouTube 1080p', videoKbps: 7500, audioKbps: 384,
+    videoLabel: 'до 8 Мбит/с', audioLabel: '384 кбит/с',
+  },
+})
+const renderPresetOptions = Object.values(RENDER_PRESETS)
 
 const DEFAULT_LAYERS = {
   cover: { visible: true, x: 7, y: 17, w: 27, h: 66 },
@@ -456,6 +487,7 @@ function freshProject() {
     author: '',
     theme: 'amber',
     glitch: true,
+    renderPreset: 'balanced',
     audioAssetId: null,
     videoAssetId: null,
     coverAssetId: null,
@@ -526,6 +558,18 @@ const duration = computed(() => {
   const media = masterKind.value === 'audio' ? audioDuration.value : videoDuration.value
   if (Number.isFinite(media) && media > 0) return media
   return Math.max(chapterMax.value, sceneMax.value, 0)
+})
+const activeRenderPreset = computed(() => RENDER_PRESETS[project.renderPreset] || RENDER_PRESETS.balanced)
+const estimatedFullRenderSize = computed(() => {
+  const seconds = Number(exportReadiness.value?.audioProbe?.duration) || duration.value
+  const bitrate = activeRenderPreset.value.videoKbps + activeRenderPreset.value.audioKbps
+  return formatBytes(Math.max(0, seconds) * bitrate * 1000 / 8)
+})
+const estimatedPeakRenderBytes = computed(() => {
+  const seconds = Number(exportReadiness.value?.audioProbe?.duration) || duration.value
+  const videoBytes = Math.max(0, seconds) * activeRenderPreset.value.videoKbps * 1000 / 8
+  const audioBytes = Math.max(0, seconds) * activeRenderPreset.value.audioKbps * 1000 / 8
+  return Math.ceil((videoBytes * 3 + audioBytes + 128 * 1024 ** 2) * 1.08)
 })
 const progressPercent = computed(() => duration.value ? Math.min(100, Math.max(0, currentTime.value / duration.value * 100)) : 0)
 
@@ -625,6 +669,10 @@ const exportIssue = computed(() => {
     }
     return exportReadiness.value.missing?.map((item) => labels[item] || item).join(' · ') || 'Проект пока не готов к экспорту.'
   }
+  const freeBytes = Number(exportReadiness.value?.renderEstimate?.full?.freeBytes)
+  if (!exportTest.value && freeBytes > 0 && estimatedPeakRenderBytes.value > freeBytes) {
+    return `Недостаточно места для надёжной сборки: нужно около ${formatBytes(estimatedPeakRenderBytes.value)}, доступно ${formatBytes(freeBytes)}. Выберите более компактный профиль или освободите диск.`
+  }
   return ''
 })
 
@@ -708,6 +756,7 @@ function normalizeProject(value) {
   const normalized = {
     ...base,
     ...source,
+    renderPreset: RENDER_PRESETS[source.renderPreset] ? source.renderPreset : base.renderPreset,
     materials: Array.isArray(source.materials) ? source.materials.map((asset) => ({
       ...asset,
       id: asset.id || uid('asset'),
@@ -1567,7 +1616,7 @@ async function startExport() {
     const saved = await saveProject({ silent: true })
     if (!saved) return
     exportReadiness.value = await apiRequest('/export/readiness')
-    if (!exportReadiness.value.ready) return
+    if (!exportReadiness.value.ready || exportIssue.value) return
     const response = await apiRequest(exportTest.value ? '/render/test' : '/render/full', { method: 'POST' })
     renderJob.value = { id: response.job_id, status: 'running', progress: 0, log: [], download_url: response.download_url || '' }
     pollRender(response.job_id)

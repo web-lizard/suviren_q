@@ -49,7 +49,7 @@ GPU_ENCODERS: dict[str, dict[str, Any]] = {
         "tune": "hq",
         "rc": "vbr",
         "cq": 23,
-        "b_pyramid": 1,
+        "b_ref_mode": "middle",
         "gpu": 0,
         "label": "NVIDIA NVENC",
     },
@@ -74,6 +74,34 @@ GPU_ENCODERS: dict[str, dict[str, Any]] = {
 }
 
 DEFAULT_PRESET = "fast"      # fallback software preset
+DEFAULT_BITRATE_PRESET = "balanced"
+RENDER_BITRATE_PRESETS: dict[str, dict[str, str]] = {
+    # The lower profiles suit a mostly static audiobook composition. The
+    # highest profile follows YouTube's 1080p/24-30 SDR upload recommendation.
+    "compact": {
+        "label": "Compact YouTube",
+        "video_bitrate": "1200k",
+        "video_maxrate": "2400k",
+        "video_bufsize": "4800k",
+        "audio_bitrate": "192k",
+    },
+    "balanced": {
+        "label": "Balanced YouTube",
+        "video_bitrate": "1800k",
+        "video_maxrate": "3500k",
+        "video_bufsize": "7000k",
+        "audio_bitrate": "192k",
+    },
+    "youtube_1080p": {
+        "label": "YouTube 1080p30",
+        # Leave rate-control headroom so encoder overshoot does not cross the
+        # 8 Mbps YouTube recommendation on ordinary programme-length output.
+        "video_bitrate": "7500k",
+        "video_maxrate": "8000k",
+        "video_bufsize": "8000k",
+        "audio_bitrate": "384k",
+    },
+}
 
 
 # ── Logging ──────────────────────────────────────────────────────
@@ -406,41 +434,51 @@ def encoder_ffmpeg_args(
     *,
     include_video_filter: bool = True,
     include_audio: bool = True,
+    bitrate_preset: str = DEFAULT_BITRATE_PRESET,
 ) -> list[str]:
     """Build encoder-specific ffmpeg arguments."""
     codec = enc["codec"]
+    rate = RENDER_BITRATE_PRESETS.get(
+        bitrate_preset,
+        RENDER_BITRATE_PRESETS[DEFAULT_BITRATE_PRESET],
+    )
     args: list[str] = []
 
     if codec == "libx264":
         args += ["-c:v", "libx264", "-preset", enc.get("preset", DEFAULT_PRESET)]
-        args += ["-crf", str(enc.get("crf", 20))]
     elif codec == "h264_nvenc":
         args += ["-c:v", "h264_nvenc"]
         args += ["-preset", enc.get("preset", "p7")]
         args += ["-rc", enc.get("rc", "vbr")]
         args += ["-cq", str(enc.get("cq", 19))]
-        args += ["-b:v", "1800k", "-maxrate", "3500k", "-bufsize", "7000k"]
-        if enc.get("b_pyramid"):
-            args += ["-b-pyramid", "1"]
+        if enc.get("b_ref_mode"):
+            args += ["-b_ref_mode", str(enc["b_ref_mode"])]
         if enc.get("gpu") is not None:
             args += ["-gpu", str(enc["gpu"])]
     elif codec == "h264_amf":
         args += ["-c:v", "h264_amf"]
         args += ["-quality", enc.get("preset", "quality")]
         args += ["-rc", enc.get("rc", "cbr")]
-        args += ["-b:v", "1800k", "-maxrate", "3500k", "-bufsize", "7000k"]
     elif codec == "h264_qsv":
         args += ["-c:v", "h264_qsv"]
         args += ["-preset", enc.get("preset", "veryslow")]
-        if "global_quality" in enc:
-            args += ["-global_quality", str(enc["global_quality"])]
+
+    args += [
+        "-b:v", rate["video_bitrate"],
+        "-maxrate", rate["video_maxrate"],
+        "-bufsize", rate["video_bufsize"],
+        "-profile:v", "high",
+        "-bf", "2",
+        "-g", str(max(1, round(fps / 2))),
+        "-flags", "+cgop",
+    ]
 
     # Common args
     args += ["-r", str(fps)]
     if include_video_filter:
         args += ["-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"]
     if include_audio:
-        args += ["-c:a", "aac", "-b:a", "192k"]
+        args += ["-c:a", "aac", "-b:a", rate["audio_bitrate"], "-ar", "48000"]
     args += ["-movflags", "+faststart"]
     return args
 
@@ -1800,6 +1838,7 @@ def _render_segment_worker(args: dict[str, Any]) -> dict[str, Any]:
     gpu_codec = str(args.get("gpu_codec", "libx264"))
     gpu_preset = str(args.get("gpu_preset", "fast"))
     gpu_opts = dict(args.get("gpu_opts", {}))
+    bitrate_preset = str(args.get("bitrate_preset", DEFAULT_BITRATE_PRESET))
     style = str(args.get("style", "deep-purple"))
     include_audio = bool(args.get("include_audio", True))
     timeline_duration = max(duration, float(args.get("timeline_duration") or duration))
@@ -1926,6 +1965,7 @@ def _render_segment_worker(args: dict[str, Any]) -> dict[str, Any]:
             fps,
             include_video_filter=filter_complex is None,
             include_audio=include_audio,
+            bitrate_preset=bitrate_preset,
         )
         cmd = [
             "ffmpeg", "-y",
@@ -1998,6 +2038,7 @@ def render_segment(
     gpu_codec: str = "libx264",
     gpu_preset: str = "fast",
     gpu_opts: Optional[dict[str, Any]] = None,
+    bitrate_preset: str = DEFAULT_BITRATE_PRESET,
 ) -> None:
     """Render a single segment (legacy direct call, no worker pool)."""
     args = {
@@ -2014,6 +2055,7 @@ def render_segment(
         "gpu_codec": gpu_codec,
         "gpu_preset": gpu_preset,
         "gpu_opts": gpu_opts or {},
+        "bitrate_preset": bitrate_preset,
     }
     result = _render_segment_worker(args)
     if not result.get("ok"):
@@ -2060,6 +2102,7 @@ def mux_master_audio(
     *,
     start: float = 0.0,
     duration: float,
+    audio_bitrate: str = "192k",
     dry_run: bool = False,
 ) -> None:
     """Attach the master once, avoiding AAC priming gaps at chapter joins."""
@@ -2073,7 +2116,8 @@ def mux_master_audio(
         "-map", "1:a:0",
         "-c:v", "copy",
         "-c:a", "aac",
-        "-b:a", "192k",
+        "-b:a", audio_bitrate,
+        "-ar", "48000",
         "-t", f"{duration:.6f}",
         "-shortest",
         "-movflags", "+faststart",
@@ -2349,6 +2393,8 @@ def cmd_render(args: argparse.Namespace) -> None:
             )
 
     editor_project = load_editor_project_config(getattr(args, "editor_project", None))
+    bitrate_preset_name = str(getattr(args, "bitrate_preset", DEFAULT_BITRATE_PRESET))
+    bitrate_profile = RENDER_BITRATE_PRESETS[bitrate_preset_name]
     timeline_duration = max((chapter.end_seconds for chapter in chapters), default=0.0)
     project_duration_value = editor_project.get(
         "duration_seconds",
@@ -2390,9 +2436,15 @@ def cmd_render(args: argparse.Namespace) -> None:
     gpu_name, gpu_enc = detect_gpu_encoder()
     gpu_codec = gpu_enc["codec"]
     gpu_preset = gpu_enc.get("preset", DEFAULT_PRESET)
-    gpu_opts = {k: gpu_enc[k] for k in ("cq", "rc", "b_pyramid", "gpu", "global_quality") if k in gpu_enc}
+    gpu_opts = {k: gpu_enc[k] for k in ("cq", "rc", "b_ref_mode", "gpu", "global_quality") if k in gpu_enc}
 
     log(f"Using encoder: {gpu_enc['label']} ({gpu_codec})")
+    log(
+        f"Bitrate preset: {bitrate_profile['label']} | "
+        f"video {bitrate_profile['video_bitrate']} "
+        f"(max {bitrate_profile['video_maxrate']}) | "
+        f"audio {bitrate_profile['audio_bitrate']}"
+    )
     log(f"Rendering {render_count} of {len(chapters)} panels")
 
     render_panels(
@@ -2454,6 +2506,7 @@ def cmd_render(args: argparse.Namespace) -> None:
             "gpu_codec": gpu_codec,
             "gpu_preset": gpu_preset,
             "gpu_opts": gpu_opts,
+            "bitrate_preset": bitrate_preset_name,
         })
 
     if not segment_args_list:
@@ -2535,6 +2588,7 @@ def cmd_render(args: argparse.Namespace) -> None:
         Path(args.out),
         start=float(segment_args_list[0]["start"]),
         duration=output_duration,
+        audio_bitrate=bitrate_profile["audio_bitrate"],
         dry_run=args.dry_run,
     )
     validate_render_output(
@@ -2545,6 +2599,17 @@ def cmd_render(args: argparse.Namespace) -> None:
         fps=args.fps,
         dry_run=args.dry_run,
     )
+    if not args.dry_run:
+        reclaimed = 0
+        for temporary in [*rendered_segments, video_only, bdir / "concat.txt"]:
+            try:
+                if temporary.is_file():
+                    reclaimed += temporary.stat().st_size
+                    temporary.unlink()
+            except OSError as exc:
+                warn(f"Could not remove render intermediate {temporary.name}: {exc}")
+        if reclaimed:
+            log(f"Cleaned render intermediates: {reclaimed / 1024**3:.2f} GiB reclaimed")
     log(f"Done: {args.out}")
 
 
@@ -2611,6 +2676,12 @@ def main(argv: Optional[list[str]] = None) -> None:
     p_render.add_argument("--out", required=True, help="Output MP4")
     p_render.add_argument("--fps", type=int, default=DEFAULT_FPS)
     p_render.add_argument("--waveform", choices=["static", "ffmpeg"], default="ffmpeg", help="Audio visualization mode")
+    p_render.add_argument(
+        "--bitrate-preset",
+        choices=sorted(RENDER_BITRATE_PRESETS),
+        default=DEFAULT_BITRATE_PRESET,
+        help="YouTube-oriented bitrate profile (all profiles stay at or below 8 Mbps video)",
+    )
     p_render.add_argument("--max-duration", type=float, help="Render only the first N seconds while keeping full chapter context")
     p_render.add_argument("--dry-run", action="store_true")
     p_render.add_argument("--no-parallel", action="store_true", dest="no_parallel", help="Disable parallel segment rendering")
