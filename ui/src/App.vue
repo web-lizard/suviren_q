@@ -92,7 +92,7 @@
           </div>
           <div class="chapter-context" v-if="currentChapter">
             <span>{{ String(currentChapter.index + 1).padStart(2, '0') }}</span>
-            <p><small>Сейчас звучит</small><b>{{ currentChapter.title }}</b></p>
+            <p><b>{{ currentChapter.title }}</b></p>
           </div>
         </div>
 
@@ -116,13 +116,28 @@
             <span v-else class="cover-placeholder"><i>BW</i><b>ОБЛОЖКА</b><small>добавьте изображение</small></span>
           </button>
 
-          <button v-if="layerVisible('title')" type="button" class="composition-layer title-layer"
+          <button v-if="layerVisible('title')" ref="titleLayerEl" type="button" class="composition-layer title-layer"
                   :class="{ selected: selection.type === 'layer' && selection.id === 'title' }"
                   :style="layerStyle('title')" @pointerdown.stop="onLayerPointerDown('title', $event)">
-            <span class="now-playing-label"><i></i>Сейчас звучит</span>
-            <strong>{{ currentChapter?.title || 'Добавьте первую главу' }}</strong>
-            <span class="book-byline">{{ project.title || 'Новая аудиокнига' }}<i></i>{{ project.author || 'Автор не указан' }}</span>
+            <span ref="titleStackEl" class="chapter-stack" lang="ru">
+              <span v-if="previousChapter" class="chapter-neighbor previous" aria-hidden="true">
+                <i>{{ String(previousChapter.index + 1).padStart(2, '0') }}</i><b>{{ previousChapter.title }}</b>
+              </span>
+              <strong>{{ currentChapter?.title || 'Добавьте первую главу' }}</strong>
+              <span v-if="nextChapter" class="chapter-neighbor next" aria-hidden="true">
+                <i>{{ String(nextChapter.index + 1).padStart(2, '0') }}</i><b>{{ nextChapter.title }}</b>
+              </span>
+            </span>
           </button>
+
+          <a class="telegram-qr" :href="TELEGRAM_URL" target="_blank" rel="noopener noreferrer"
+             title="Telegram · Temple of Lizard" draggable="false" @pointerdown.stop @click.stop>
+            <span class="telegram-qr-code">
+              <QrcodeVue :value="TELEGRAM_URL" :size="256" level="H" render-as="svg"
+                          foreground="#17131d" background="#f4efe7" />
+            </span>
+            <span class="telegram-qr-copy"><b>TELEGRAM</b><small>@temple_of_lizard</small></span>
+          </a>
 
           <button v-if="layerVisible('visualizer')" type="button" class="composition-layer visualizer-layer"
                   :class="{ selected: selection.type === 'layer' && selection.id === 'visualizer' }"
@@ -130,7 +145,6 @@
             <canvas ref="visualizerCanvas" aria-label="Визуализация аудио"></canvas>
           </button>
 
-          <div class="scene-corner scene-corner-top"><span>BOOK WUNDERWAFFE</span><i></i></div>
           <div class="scene-corner scene-corner-bottom">
             <span>{{ formatTime(currentTime) }}</span>
             <div><i :style="{ width: `${progressPercent}%` }"></i></div>
@@ -412,8 +426,10 @@
 
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import QrcodeVue from 'qrcode.vue'
 
 const API = import.meta.env.VITE_API_URL || '/api'
+const TELEGRAM_URL = 'https://t.me/temple_of_lizard'
 const AUDIO_EXT = new Set(['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'])
 const VIDEO_EXT = new Set(['mp4', 'mov', 'm4v', 'webm', 'mkv', 'avi'])
 const IMAGE_EXT = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'])
@@ -468,6 +484,8 @@ const videoEl = ref(null)
 const sceneEl = ref(null)
 const visualizerCanvas = ref(null)
 const timelineScroll = ref(null)
+const titleLayerEl = ref(null)
+const titleStackEl = ref(null)
 
 const currentTime = ref(0)
 const audioDuration = ref(0)
@@ -486,6 +504,9 @@ let renderPoll = null
 let noticeTimer = null
 let playbackFrame = null
 let visualFrame = null
+let titleFitFrame = null
+let titleResizeObserver = null
+let titleMeasureCanvas = null
 const objectUrls = new Set()
 
 const assetById = (id) => project.materials.find((item) => item.id === id) || null
@@ -521,15 +542,27 @@ const timelineChapters = computed(() => {
   })
 })
 
-const currentChapter = computed(() => {
-  if (!timelineChapters.value.length) return null
-  let active = timelineChapters.value[0]
-  for (const chapter of timelineChapters.value) {
-    if (currentTime.value >= chapter.start_seconds) active = chapter
-    else break
+const currentChapterIndex = computed(() => {
+  const chapters = timelineChapters.value
+  if (!chapters.length) return -1
+  const time = Number.isFinite(Number(currentTime.value)) ? Math.max(0, Number(currentTime.value)) : 0
+  let low = 0
+  let high = chapters.length - 1
+  let result = 0
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2)
+    if (chapters[middle].start_seconds <= time) {
+      result = middle
+      low = middle + 1
+    } else {
+      high = middle - 1
+    }
   }
-  return active
+  return result
 })
+const currentChapter = computed(() => currentChapterIndex.value >= 0 ? timelineChapters.value[currentChapterIndex.value] : null)
+const previousChapter = computed(() => currentChapterIndex.value > 0 ? timelineChapters.value[currentChapterIndex.value - 1] : null)
+const nextChapter = computed(() => currentChapterIndex.value >= 0 ? timelineChapters.value[currentChapterIndex.value + 1] || null : null)
 
 const currentScene = computed(() => {
   const sorted = [...project.scenes].sort((a, b) => a.start - b.start)
@@ -1028,6 +1061,101 @@ function layerVisible(id) {
   return project.layers[id]?.visible !== false
 }
 
+function measuredTextWidth(context, text, letterSpacing) {
+  const value = String(text || '')
+  return context.measureText(value).width + Math.max(0, value.length - 1) * letterSpacing
+}
+
+function measuredLineCount(context, text, maxWidth, letterSpacing) {
+  let lines = 0
+  for (const paragraph of String(text || '').split(/\r?\n/)) {
+    const words = paragraph.trim().split(/\s+/).filter(Boolean)
+    if (!words.length) {
+      lines += 1
+      continue
+    }
+    let line = ''
+    for (const word of words) {
+      const candidate = line ? `${line} ${word}` : word
+      if (measuredTextWidth(context, candidate, letterSpacing) <= maxWidth) {
+        line = candidate
+        continue
+      }
+      if (line) {
+        lines += 1
+        line = ''
+      }
+      if (measuredTextWidth(context, word, letterSpacing) <= maxWidth) {
+        line = word
+        continue
+      }
+      let fragment = ''
+      for (const character of word) {
+        if (fragment && measuredTextWidth(context, `${fragment}${character}`, letterSpacing) > maxWidth) {
+          lines += 1
+          fragment = character
+        } else {
+          fragment += character
+        }
+      }
+      line = fragment
+    }
+    if (line) lines += 1
+  }
+  return Math.max(1, lines)
+}
+
+function fitChapterTitles() {
+  const stack = titleStackEl.value
+  if (!stack || stack.clientWidth < 2 || stack.clientHeight < 2) return
+
+  const configured = Number(project.layers.title?.fontSize)
+  const maximum = Math.max(16, Math.min(96, Number.isFinite(configured) ? configured : 48))
+  const title = currentChapter.value?.title || 'Добавьте первую главу'
+  const titleElement = stack.querySelector(':scope > strong')
+  const titleStyle = titleElement ? getComputedStyle(titleElement) : null
+  titleMeasureCanvas ||= document.createElement('canvas')
+  const context = titleMeasureCanvas.getContext('2d')
+  if (!context) return
+
+  let low = 24
+  let high = Math.round(maximum * 2)
+  let best = low
+
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2)
+    const candidate = middle / 2
+    const weight = titleStyle?.fontWeight || '640'
+    const family = titleStyle?.fontFamily || 'Inter, sans-serif'
+    context.font = `${weight} ${candidate}px ${family}`
+    const letterSpacing = candidate * -.035
+    const titleLines = measuredLineCount(context, title, stack.clientWidth, letterSpacing)
+    const neighborCount = Number(!!previousChapter.value) + Number(!!nextChapter.value)
+    const neighborHeight = Math.max(8, candidate * .3) * 1.15
+    const gap = Math.max(4, candidate * .18)
+    const contentHeight = titleLines * candidate * 1.04
+      + neighborCount * neighborHeight
+      + Math.max(0, neighborCount) * gap
+    const fits = contentHeight <= stack.clientHeight + 1
+    if (fits) {
+      best = middle
+      low = middle + 1
+    } else {
+      high = middle - 1
+    }
+  }
+
+  stack.style.setProperty('font-size', `${best / 2}px`, 'important')
+}
+
+function scheduleTitleFit() {
+  if (titleFitFrame !== null) cancelAnimationFrame(titleFitFrame)
+  titleFitFrame = requestAnimationFrame(() => {
+    titleFitFrame = null
+    fitChapterTitles()
+  })
+}
+
 function layerStyle(id) {
   const layer = project.layers[id]
   if (!layer) return {}
@@ -1492,12 +1620,39 @@ watch(() => videoSource.value, () => {
   nextTick(() => videoEl.value?.load())
 })
 
+watch([
+  () => previousChapter.value?.id,
+  () => previousChapter.value?.title,
+  () => currentChapter.value?.id,
+  () => currentChapter.value?.title,
+  () => nextChapter.value?.id,
+  () => nextChapter.value?.title,
+  () => project.layers.title?.w,
+  () => project.layers.title?.h,
+  () => project.layers.title?.fontSize,
+  () => project.layers.title?.visible,
+], () => nextTick(scheduleTitleFit), { flush: 'post' })
+
+watch(titleLayerEl, (element, previous) => {
+  if (previous) titleResizeObserver?.unobserve(previous)
+  if (element) {
+    titleResizeObserver?.observe(element)
+    nextTick(scheduleTitleFit)
+  }
+}, { flush: 'post' })
+
 watch(project, () => {
   if (!hydrating.value) dirty.value = true
 }, { deep: true })
 
 onMounted(() => {
   window.addEventListener('keydown', handleKeydown)
+  if (typeof ResizeObserver !== 'undefined') {
+    titleResizeObserver = new ResizeObserver(scheduleTitleFit)
+    if (titleLayerEl.value) titleResizeObserver.observe(titleLayerEl.value)
+  }
+  document.fonts?.ready?.then(scheduleTitleFit).catch(() => {})
+  scheduleTitleFit()
   drawVisualizer()
   loadInitialProject()
 })
@@ -1508,6 +1663,8 @@ onBeforeUnmount(() => {
   cancelAnimationFrame(visualFrame)
   clearInterval(renderPoll)
   clearTimeout(noticeTimer)
+  titleResizeObserver?.disconnect()
+  if (titleFitFrame !== null) cancelAnimationFrame(titleFitFrame)
   releaseObjectUrls()
 })
 </script>

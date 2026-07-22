@@ -1082,6 +1082,298 @@ def truncate_text(text: str, max_len: int = 40) -> str:
     return text[: max_len - 3] + "..."
 
 
+TELEGRAM_CHANNEL_URL = "https://t.me/temple_of_lizard"
+
+
+def _panel_font(font_path: Optional[Path], size: int, *, bold: bool = False):
+    """Load a scalable Cyrillic font for a panel at the requested size."""
+    from PIL import ImageFont
+
+    candidates: list[Path | str] = []
+    if font_path and font_path.exists():
+        candidates.append(font_path)
+
+    fonts_dir = Path(os.environ.get("SystemRoot", "C:\\Windows")) / "Fonts"
+    if bold:
+        candidates.extend((fonts_dir / "segoeuib.ttf", fonts_dir / "arialbd.ttf"))
+    else:
+        candidates.extend((fonts_dir / "segoeui.ttf", fonts_dir / "arial.ttf"))
+
+    for candidate in candidates:
+        try:
+            if isinstance(candidate, Path) and not candidate.exists():
+                continue
+            return ImageFont.truetype(str(candidate), size=max(1, int(size)))
+        except Exception:
+            continue
+
+    try:
+        return ImageFont.load_default(size=max(1, int(size)))
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _panel_text_width(draw: Any, text: str, font: Any) -> int:
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return max(0, bbox[2] - bbox[0])
+
+
+def _wrap_panel_text(draw: Any, text: str, font: Any, max_width: int) -> list[str]:
+    """Greedy pixel-based wrap that never discards text, including long words."""
+    words = " ".join(text.split()).split(" ")
+    if not words or words == [""]:
+        return [""]
+
+    lines: list[str] = []
+    current = ""
+    for raw_word in words:
+        word = raw_word
+        candidate = f"{current} {word}".strip()
+        if current and _panel_text_width(draw, candidate, font) <= max_width:
+            current = candidate
+            continue
+        if not current and _panel_text_width(draw, word, font) <= max_width:
+            current = word
+            continue
+        if current:
+            lines.append(current)
+            current = ""
+
+        # A single token may still be wider than the box. Split it by glyphs,
+        # preserving every character instead of truncating it with an ellipsis.
+        while word and _panel_text_width(draw, word, font) > max_width:
+            lo, hi = 1, len(word)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if _panel_text_width(draw, word[:mid], font) <= max_width:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            split_at = max(1, lo)
+            lines.append(word[:split_at])
+            word = word[split_at:]
+        current = word
+
+    if current:
+        lines.append(current)
+    return lines or [""]
+
+
+def _fit_panel_title(
+    draw: Any,
+    text: str,
+    font_path: Optional[Path],
+    max_width: int,
+    max_height: int,
+    *,
+    max_size: int,
+    min_size: int,
+    max_lines: int = 3,
+) -> tuple[Any, str, int, tuple[int, int]]:
+    """Return the largest font and full wrapped text that fit the title box."""
+    fallback: Optional[tuple[Any, str, int, tuple[int, int]]] = None
+    smallest = max(10, min_size)
+    for size in range(max_size, 9, -2):
+        fnt = _panel_font(font_path, size, bold=True)
+        lines = _wrap_panel_text(draw, text, fnt, max_width)
+        spacing = max(2, round(size * 0.12))
+        rendered = "\n".join(lines)
+        bbox = draw.multiline_textbbox((0, 0), rendered, font=fnt, spacing=spacing)
+        dims = (max(0, bbox[2] - bbox[0]), max(0, bbox[3] - bbox[1]))
+        fallback = (fnt, rendered, spacing, dims)
+        if len(lines) <= max_lines and dims[0] <= max_width and dims[1] <= max_height:
+            return fallback
+        if size <= smallest and dims[1] <= max_height:
+            # Below the preferred minimum we only continue when the full title
+            # still needs more room. No text is removed at the minimum size.
+            continue
+    assert fallback is not None
+    return fallback
+
+
+def _fit_panel_side_font(
+    draw: Any,
+    texts: list[str],
+    font_path: Optional[Path],
+    max_width: int,
+    *,
+    max_size: int,
+    min_size: int = 10,
+) -> Any:
+    """Use one consistent size for both neighbouring chapter lines."""
+    for size in range(max_size, min_size - 1, -1):
+        fnt = _panel_font(font_path, size)
+        if all(_panel_text_width(draw, value, fnt) <= max_width for value in texts):
+            return fnt
+    return _panel_font(font_path, min_size)
+
+
+def _draw_panel_text_top(
+    draw: Any,
+    xy: tuple[int, int],
+    text: str,
+    *,
+    font: Any,
+    fill: tuple[int, ...],
+    spacing: int = 4,
+) -> None:
+    """Draw text with xy referring to its visible top-left, not its ascender."""
+    bbox = draw.multiline_textbbox((0, 0), text, font=font, spacing=spacing)
+    draw.multiline_text(
+        (xy[0] - bbox[0], xy[1] - bbox[1]),
+        text,
+        font=font,
+        fill=fill,
+        spacing=spacing,
+    )
+
+
+def _glitch_panel_background(source: Any, *, seed: int) -> Any:
+    """Add stable, low-alpha cyan/magenta channel slices to a background."""
+    import random
+    from PIL import Image
+
+    base = source.convert("RGBA")
+    width, height = base.size
+    rgb = source.convert("RGB")
+    layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    rng = random.Random(seed)
+    scale = max(0.5, min(width / 1920, height / 1080))
+
+    for band_index in range(7):
+        band_h = max(2, round(rng.randint(3, 10) * scale))
+        y = rng.randint(0, max(0, height - band_h))
+        shift = round(rng.choice((-1, 1)) * rng.randint(4, 14) * scale)
+        shift = shift or 1
+        if shift > 0:
+            band = rgb.crop((0, y, width - shift, y + band_h))
+            dest = (shift, y)
+        else:
+            band = rgb.crop((-shift, y, width, y + band_h))
+            dest = (0, y)
+
+        red, green, blue = band.split()
+        zero = Image.new("L", band.size, 0)
+        alpha = Image.new("L", band.size, rng.randint(15, 29))
+        if band_index % 2:
+            shifted = Image.merge("RGBA", (red, zero, blue, alpha))
+        else:
+            shifted = Image.merge("RGBA", (zero, green, blue, alpha))
+        layer.alpha_composite(shifted, dest=dest)
+
+    return Image.alpha_composite(base, layer)
+
+
+def _prepare_panel_background(
+    background: Optional[Path],
+    size: tuple[int, int],
+    bg_color: tuple[int, int, int],
+) -> Any:
+    """Aspect-fill and softly grade the photographic panel background."""
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+
+    width, height = size
+    base = Image.new("RGBA", size, (*bg_color, 255))
+    if not background or not background.exists():
+        return base
+
+    try:
+        with Image.open(background) as opened:
+            fitted = ImageOps.fit(
+                opened.convert("RGB"),
+                size,
+                method=Image.Resampling.LANCZOS,
+                centering=(0.5, 0.5),
+            )
+        scale = max(0.5, min(width / 1920, height / 1080))
+        fitted = fitted.filter(ImageFilter.GaussianBlur(radius=1.8 * scale))
+        fitted = ImageEnhance.Color(fitted).enhance(0.76)
+        fitted = ImageEnhance.Brightness(fitted).enhance(0.57)
+        return _glitch_panel_background(
+            fitted,
+            seed=0x54454D50 ^ (width << 8) ^ height,
+        )
+    except Exception as exc:
+        warn(f"Could not load background: {background} ({exc})")
+        return base
+
+
+def _draw_telegram_qr(img: Any, font_path: Optional[Path], accent: tuple[int, int, int]) -> Any:
+    """Draw a scan-safe QR and decorate only the card outside its quiet zone."""
+    import qrcode
+    from PIL import Image, ImageDraw, ImageFilter
+    from qrcode.constants import ERROR_CORRECT_H
+
+    width, height = img.size
+    scale = max(0.5, min(width / 1920, height / 1080))
+    card_w = max(132, round(width * 0.108))
+    card_x = width - round(width * 0.042) - card_w
+    card_y = round(height * 0.038)
+    pad = max(8, round(12 * scale))
+    qr_side = card_w - 2 * pad
+    label_h = max(42, round(53 * scale))
+    card_h = qr_side + label_h + 2 * pad
+    radius = max(8, round(14 * scale))
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=ERROR_CORRECT_H,
+        box_size=8,
+        border=4,
+    )
+    qr.add_data(TELEGRAM_CHANNEL_URL)
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="#17131d", back_color="#f4efe7").convert("RGBA")
+    qr_img = qr_img.resize((qr_side, qr_side), Image.Resampling.NEAREST)
+
+    shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    shadow_draw = ImageDraw.Draw(shadow)
+    shadow_draw.rounded_rectangle(
+        (card_x, card_y + round(8 * scale), card_x + card_w, card_y + card_h + round(8 * scale)),
+        radius=radius,
+        fill=(0, 0, 0, 145),
+    )
+    shadow = shadow.filter(ImageFilter.GaussianBlur(radius=max(5, round(14 * scale))))
+    img = Image.alpha_composite(img, shadow)
+
+    card = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    card_draw = ImageDraw.Draw(card)
+    card_draw.rounded_rectangle(
+        (card_x, card_y, card_x + card_w, card_y + card_h),
+        radius=radius,
+        fill=(15, 13, 19, 224),
+        outline=(255, 255, 255, 34),
+        width=max(1, round(scale)),
+    )
+    line_margin = round(card_w * 0.16)
+    card_draw.line(
+        (card_x + line_margin, card_y, card_x + card_w - line_margin, card_y),
+        fill=(*accent, 220),
+        width=max(1, round(2 * scale)),
+    )
+    card.alpha_composite(qr_img, dest=(card_x + pad, card_y + pad))
+
+    label_x = card_x + pad
+    label_y = card_y + pad + qr_side + max(7, round(8 * scale))
+    label_font = _panel_font(font_path, max(10, round(14 * scale)), bold=True)
+    handle_font = _panel_font(font_path, max(9, round(11 * scale)))
+    _draw_panel_text_top(
+        card_draw,
+        (label_x, label_y),
+        "TELEGRAM",
+        font=label_font,
+        fill=(*accent, 255),
+    )
+    _draw_panel_text_top(
+        card_draw,
+        (label_x, label_y + max(17, round(20 * scale))),
+        "@temple_of_lizard",
+        font=handle_font,
+        fill=(244, 239, 231, 158),
+    )
+    return Image.alpha_composite(img, card)
+
+
 def draw_panel(
     out: Path,
     chapters: list[Chapter],
@@ -1093,7 +1385,7 @@ def draw_panel(
     height: int = DEFAULT_HEIGHT,
     style: str = "deep-purple",
 ) -> None:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
     W, H = width, height
 
@@ -1107,80 +1399,161 @@ def draw_panel(
     progress_bg = palette["progress_bg"]
     wave_color = palette["waveform"]
     title_glow = palette["title_glow"]
-    img = Image.new("RGBA", (W, H), bg_color)
-
-    if background and background.exists():
-        try:
-            bg_img = Image.open(background).convert("RGBA")
-            bg_img = bg_img.resize((W, H), Image.LANCZOS)
-            img = Image.alpha_composite(img, bg_img)
-        except Exception:
-            warn(f"Could not load background: {background}")
-
-    draw = ImageDraw.Draw(img)
-
-    # Load fonts
-    ff = None
-    fb = None
-    if font and font.exists():
-        try:
-            ff = ImageFont.truetype(str(font), size=32)
-            fb = ImageFont.truetype(str(font), size=52)
-        except Exception:
-            pass
-    if ff is None:
-        try:
-            ff = ImageFont.truetype("segoeui.ttf", 32)
-        except Exception:
-            ff = ImageFont.load_default()
-    if fb is None:
-        try:
-            fb = ImageFont.truetype("segoeui.ttf", 52)
-        except Exception:
-            fb = ImageFont.load_default()
+    img = _prepare_panel_background(background, (W, H), bg_color)
+    scale = max(0.5, min(W / 1920, H / 1080))
 
     # Cover image
     ch = chapters[current_index]
-    cover_size = int(H * 0.42)
-    cover_x = int(W * 0.04)
-    cover_y = int((H - cover_size) // 2 - 20)
+    cover_x = round(W * 0.07)
+    cover_y = round(H * 0.17)
+    cover_w = round(W * 0.27)
+    cover_h = round(H * 0.66)
 
     if cover.exists():
         try:
-            cv = Image.open(cover).convert("RGBA")
-            cv = cv.resize((cover_size, cover_size), Image.LANCZOS)
-            # Rounded corners
-            r = int(cover_size * 0.03)
-            m = Image.new("RGBA", (cover_size, cover_size), (0, 0, 0, 0))
-            m_draw = ImageDraw.Draw(m)
-            m_draw.rounded_rectangle([(0, 0), (cover_size, cover_size)], radius=r, fill=(255, 255, 255, 255))
-            img.paste(cv, (cover_x, cover_y), mask=m)
+            with Image.open(cover) as opened:
+                cv = ImageOps.fit(
+                    opened.convert("RGBA"),
+                    (cover_w, cover_h),
+                    method=Image.Resampling.LANCZOS,
+                    centering=(0.5, 0.5),
+                )
+            radius = max(8, round(17 * scale))
+            mask = Image.new("L", (cover_w, cover_h), 0)
+            ImageDraw.Draw(mask).rounded_rectangle(
+                (0, 0, cover_w - 1, cover_h - 1),
+                radius=radius,
+                fill=255,
+            )
+
+            shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            ImageDraw.Draw(shadow).rounded_rectangle(
+                (
+                    cover_x,
+                    cover_y + round(10 * scale),
+                    cover_x + cover_w,
+                    cover_y + cover_h + round(10 * scale),
+                ),
+                radius=radius,
+                fill=(0, 0, 0, 165),
+            )
+            shadow = shadow.filter(ImageFilter.GaussianBlur(radius=max(6, round(20 * scale))))
+            img = Image.alpha_composite(img, shadow)
+
+            cover_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            cover_layer.paste(cv, (cover_x, cover_y), mask)
+            cover_draw = ImageDraw.Draw(cover_layer)
+            cover_draw.rounded_rectangle(
+                (cover_x, cover_y, cover_x + cover_w - 1, cover_y + cover_h - 1),
+                radius=radius,
+                outline=(*accent, 118),
+                width=max(1, round(2 * scale)),
+            )
+            img = Image.alpha_composite(img, cover_layer)
         except Exception as e:
             warn(f"Could not place cover: {e}")
 
-    # Title
+    # Previous/current/next chapter stack. Neighbours live on a transparent
+    # layer so alpha=128 remains a real 50% after the final RGB conversion.
     title_text = ch.title.strip() or f"Chapter {current_index + 1}"
-    draw.text((int(W * 0.42), int(H * 0.22)), title_text, fill=text_color, font=fb)
+    title_x = round(W * 0.39)
+    title_y = round(H * 0.23)
+    title_w = round(W * 0.54)
+    title_h = round(H * 0.31)
+    title_pad_x = max(12, round(title_w * 0.025))
+    available_w = title_w - 2 * title_pad_x
 
-    # Chapter list
-    start_y = int(H * 0.38)
-    max_visible = 8
-    half = max_visible // 2
-    start_i = max(0, current_index - half)
-    end_i = min(len(chapters), start_i + max_visible)
-    if end_i - start_i < max_visible:
-        start_i = max(0, end_i - max_visible)
+    text_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    text_draw = ImageDraw.Draw(text_layer)
+    previous = chapters[current_index - 1] if current_index > 0 else None
+    following = chapters[current_index + 1] if current_index + 1 < len(chapters) else None
+    side_values = []
+    if previous:
+        side_values.append(f"{current_index:02d}  {previous.title.strip()}")
+    if following:
+        side_values.append(f"{current_index + 2:02d}  {following.title.strip()}")
 
-    for i in range(start_i, end_i):
-        c = chapters[i]
-        y = start_y + (i - start_i) * 42
-        is_active = i == current_index
-        prefix = f"{i+1:02d}."
-        tc = accent if is_active else text_dim
-        time_str = seconds_to_timecode(c.start_seconds, millis=False)
-        title_str = truncate_text(c.title, 42)
-        line = f"{prefix} {title_str}  {time_str}"
-        draw.text((int(W * 0.42), y), line, fill=tc, font=ff)
+    side_font = _fit_panel_side_font(
+        text_draw,
+        side_values,
+        font,
+        available_w,
+        max_size=max(14, round(25 * scale)),
+    )
+    side_bbox = text_draw.textbbox((0, 0), "Др", font=side_font)
+    side_h = max(1, side_bbox[3] - side_bbox[1])
+    side_count = int(previous is not None) + int(following is not None)
+    stack_gap = max(7, round(15 * scale))
+    current_max_h = max(
+        1,
+        title_h - side_count * side_h - side_count * stack_gap,
+    )
+    current_font, current_text, current_spacing, current_dims = _fit_panel_title(
+        text_draw,
+        title_text,
+        font,
+        available_w,
+        current_max_h,
+        max_size=max(28, round(68 * scale)),
+        min_size=max(18, round(28 * scale)),
+        max_lines=3,
+    )
+    stack_h = current_dims[1] + side_count * (side_h + stack_gap)
+    cursor_y = title_y + max(0, (title_h - stack_h) // 2)
+
+    def draw_side(chapter_number: int, value: str, y: int) -> None:
+        prefix = f"{chapter_number:02d}"
+        prefix_w = _panel_text_width(text_draw, f"{prefix}  ", side_font)
+        _draw_panel_text_top(
+            text_draw,
+            (title_x + title_pad_x, y),
+            prefix,
+            font=side_font,
+            fill=(*accent, 128),
+        )
+        _draw_panel_text_top(
+            text_draw,
+            (title_x + title_pad_x + prefix_w, y),
+            value,
+            font=side_font,
+            fill=(*text_color, 128),
+        )
+
+    if previous:
+        draw_side(current_index, previous.title.strip(), cursor_y)
+        cursor_y += side_h + stack_gap
+
+    if title_glow:
+        glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        glow_draw = ImageDraw.Draw(glow)
+        _draw_panel_text_top(
+            glow_draw,
+            (title_x + title_pad_x, cursor_y),
+            current_text,
+            font=current_font,
+            fill=(*accent2, 52),
+            spacing=current_spacing,
+        )
+        glow = glow.filter(ImageFilter.GaussianBlur(radius=max(2, round(5 * scale))))
+        text_layer = Image.alpha_composite(glow, text_layer)
+        text_draw = ImageDraw.Draw(text_layer)
+
+    _draw_panel_text_top(
+        text_draw,
+        (title_x + title_pad_x, cursor_y),
+        current_text,
+        font=current_font,
+        fill=(*text_color, 255),
+        spacing=current_spacing,
+    )
+    cursor_y += current_dims[1] + stack_gap
+
+    if following:
+        draw_side(current_index + 2, following.title.strip(), cursor_y)
+
+    img = Image.alpha_composite(img, text_layer)
+
+    draw = ImageDraw.Draw(img, "RGBA")
 
     # Progress bar bottom
     bar_y = H - int(H * 0.08)
@@ -1194,22 +1567,29 @@ def draw_panel(
         if prog_w > 0:
             draw.rounded_rectangle([(bar_x, bar_y), (bar_x + prog_w, bar_y + bar_h)], radius=4, fill=accent)
 
-    # Waveform bar
-    wave_y = H - int(H * 0.20)
-    wave_h = int(H * 0.07)
-    bar_count = 64
+    # Waveform bar, kept inside the right-side visualizer region.
+    wave_x = round(W * 0.38)
+    wave_y = round(H * 0.69)
+    wave_w = round(W * 0.56)
+    wave_h = round(H * 0.12)
+    wave_mid = wave_y + wave_h // 2
+    bar_count = 120
     import random
     rng = random.Random(ch.start_seconds)  # deterministic
+    draw.line((wave_x, wave_mid, wave_x + wave_w, wave_mid), fill=(*accent, 88), width=max(1, round(scale)))
     for n in range(bar_count):
-        bw = max(3, (int(W * 0.85)) // bar_count - 1)
-        bx = int(W * 0.08) + n * (bw + 1)
-        bh = max(2, int(wave_h * (0.15 + 0.85 * rng.random())))
-        by = wave_y + (wave_h - bh) // 2
-        draw.rectangle([(bx, by), (bx + bw, by + bh)], fill=wave_color)
+        bx = wave_x + round(n * wave_w / max(1, bar_count - 1))
+        bh = max(2, round(wave_h * (0.06 + 0.52 * rng.random() ** 2)))
+        draw.line((bx, wave_mid - bh // 2, bx, wave_mid + bh // 2), fill=(*wave_color, 154), width=max(1, round(2 * scale)))
 
     # Chapter count
     footer = f"Chapter {current_index + 1} / {len(chapters)}"
-    draw.text((int(W * 0.04), H - int(H * 0.14)), footer, fill=text_dim, font=ff)
+    footer_font = _panel_font(font, max(12, round(22 * scale)))
+    draw.text((int(W * 0.04), H - int(H * 0.14)), footer, fill=(*text_dim, 205), font=footer_font)
+
+    # QR is deliberately last: its modules and quiet zone must never be blurred
+    # or displaced by the background glitch treatment.
+    img = _draw_telegram_qr(img, font, accent)
 
     # Save
     img.convert("RGB").save(out, "PNG")
@@ -1240,7 +1620,17 @@ def render_panels(
     for i in indices:
         out = out_dir / f"{i:03d}.png"
         log(f"Drawing panel {i+1}/{len(chapters)}: {chapters[i].title}")
-        draw_panel(out, chapters=chapters, current_index=i, cover=cover, background=background, font=font, width=width, height=height)
+        draw_panel(
+            out,
+            chapters=chapters,
+            current_index=i,
+            cover=cover,
+            background=background,
+            font=font,
+            width=width,
+            height=height,
+            style=style,
+        )
         paths.append(out)
     return paths
 
@@ -1595,6 +1985,7 @@ def cmd_render(args: argparse.Namespace) -> None:
         only_index=None,
         width=args.width,
         height=args.height,
+        style=args.style,
     )
 
     # Build segment args

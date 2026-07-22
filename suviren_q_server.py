@@ -1172,6 +1172,12 @@ def build_render_cmd(
         else CHAPTERS_PATH
     )
     out = export_output_path(test_mode)
+    editor_theme = str((load_editor_project() or {}).get("theme") or "amber")
+    render_style = {
+        "amber": "obsidian",
+        "violet": "deep-purple",
+        "mono": "mono",
+    }.get(editor_theme, "obsidian")
     cmd = [
         sys.executable,
         str(MAIN_SCRIPT),
@@ -1184,6 +1190,7 @@ def build_render_cmd(
         "--waveform", "static",
         "--width", "1920",
         "--height", "1080",
+        "--style", render_style,
     ]
     if background:
         cmd += ["--background", str(background)]
