@@ -1576,9 +1576,9 @@ def draw_panel(
     following = chapters[current_index + 1] if current_index + 1 < len(chapters) else None
     side_values = []
     if previous:
-        side_values.append(f"{current_index:02d}  {previous.title.strip()}")
+        side_values.append(previous.title.strip())
     if following:
-        side_values.append(f"{current_index + 2:02d}  {following.title.strip()}")
+        side_values.append(following.title.strip())
 
     side_font = _fit_panel_side_font(
         text_draw,
@@ -1612,26 +1612,17 @@ def draw_panel(
     stack_h = current_dims[1] + side_count * (side_h + stack_gap)
     cursor_y = title_y + max(0, (title_h - stack_h) // 2)
 
-    def draw_side(chapter_number: int, value: str, y: int) -> None:
-        prefix = f"{chapter_number:02d}"
-        prefix_w = _panel_text_width(text_draw, f"{prefix}  ", side_font)
+    def draw_side(value: str, y: int) -> None:
         _draw_panel_text_top(
             text_draw,
             (title_x + title_pad_x, y),
-            prefix,
-            font=side_font,
-            fill=(*accent, 128),
-        )
-        _draw_panel_text_top(
-            text_draw,
-            (title_x + title_pad_x + prefix_w, y),
             value,
             font=side_font,
             fill=(*text_color, 128),
         )
 
     if previous:
-        draw_side(current_index, previous.title.strip(), cursor_y)
+        draw_side(previous.title.strip(), cursor_y)
         cursor_y += side_h + stack_gap
 
     if title_glow:
@@ -1660,7 +1651,7 @@ def draw_panel(
     cursor_y += current_dims[1] + stack_gap
 
     if following:
-        draw_side(current_index + 2, following.title.strip(), cursor_y)
+        draw_side(following.title.strip(), cursor_y)
 
     if title_visible:
         img = Image.alpha_composite(img, text_layer)
@@ -1869,25 +1860,34 @@ def _render_segment_worker(args: dict[str, Any]) -> dict[str, Any]:
         wave_y = percent_pixel("y", 59.0, height)
         wave_w = max(64, percent_pixel("w", 56.0, width))
         wave_h = max(48, percent_pixel("h", 23.0, height))
+        bar_count = max(64, min(112, round(wave_w / max(7, 11 * width / 1920))))
+        bar_gap = max(1, round(2 * width / 1920))
         filter_parts.extend(
             [
-                "[1:a]asetpts=PTS-STARTPTS,asplit=2[wave_fill_audio][wave_line_audio]",
                 (
-                    f"[wave_fill_audio]showwaves=s={wave_w}x{wave_h}:mode=cline:rate={fps}:"
-                    f"colors=0x{accent2_hex}:scale=sqrt:draw=full,format=rgba,"
-                    "colorkey=0x000000:0.05:0.0,colorchannelmixer=aa=0.18[wave_fill]"
+                    "[1:a]asetpts=PTS-STARTPTS,"
+                    "aformat=sample_fmts=fltp:channel_layouts=mono,"
+                    "volume=3,alimiter=limit=0.95[reactive_audio]"
                 ),
                 (
-                    f"[wave_line_audio]showwaves=s={wave_w}x{wave_h}:mode=p2p:rate={fps}:"
-                    f"colors=0x{accent_hex}:scale=sqrt:draw=full,format=rgba,"
-                    "colorkey=0x000000:0.05:0.0,colorchannelmixer=aa=0.96[wave_line]"
+                    f"[reactive_audio]showfreqs=s={bar_count}x{wave_h}:rate={fps}:"
+                    "mode=bar:ascale=cbrt:fscale=log:win_size=2048:overlap=1:"
+                    f"averaging=2:colors=white,scale={wave_w}:{wave_h}:flags=neighbor,"
+                    f"format=gray,drawgrid=w=iw/{bar_count}:h=ih:t={bar_gap}:"
+                    "c=black@1:replace=1[wave_mask]"
                 ),
                 (
-                    f"[base][wave_fill]overlay=x={wave_x}:y={wave_y}:"
-                    "shortest=0:eof_action=pass:repeatlast=0:format=auto[with_wave_fill]"
+                    f"gradients=s={wave_w}x{wave_h}:r={fps}:d={duration:.6f}:"
+                    f"c0=0x{accent_hex}:c1=0xb750da:c2=0x55ddcf:"
+                    f"c3=0x{accent2_hex}:n=4:x0=0:y0=0:x1={wave_w}:y1=0:"
+                    "speed=0.02,format=rgba[wave_gradient]"
                 ),
                 (
-                    f"[with_wave_fill][wave_line]overlay=x={wave_x}:y={wave_y}:"
+                    "[wave_gradient][wave_mask]alphamerge=shortest=1:repeatlast=0,"
+                    "colorchannelmixer=aa=0.94[wave_bars]"
+                ),
+                (
+                    f"[base][wave_bars]overlay=x={wave_x}:y={wave_y}:"
                     "shortest=0:eof_action=pass:repeatlast=0:format=auto[with_wave]"
                 ),
             ]

@@ -658,13 +658,6 @@ input:disabled {
   max-width: 44%;
 }
 
-.chapter-context > span {
-  color: var(--accent);
-  font-size: 14px;
-  font-weight: 300;
-  font-variant-numeric: tabular-nums;
-}
-
 .chapter-context p {
   display: grid;
   min-width: 0;
@@ -969,17 +962,6 @@ input:disabled {
   letter-spacing: -.01em;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.chapter-neighbor i {
-  min-width: 2.1em;
-  flex: 0 0 auto;
-  color: var(--accent);
-  font-size: .78em;
-  font-style: normal;
-  font-variant-numeric: tabular-nums;
-  font-weight: 720;
-  letter-spacing: .12em;
 }
 
 .chapter-neighbor b {
@@ -1850,18 +1832,6 @@ input[type="range"] {
   border-color: rgba(var(--accent-rgb), .72);
   background: rgba(var(--accent-rgb), .16);
   color: #e2c98f;
-}
-
-.chapter-clip > span {
-  display: grid;
-  place-items: center;
-  min-width: 15px;
-  height: 15px;
-  border-radius: 3px;
-  background: rgba(255, 255, 255, .06);
-  font-size: 7px;
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
 }
 
 .chapter-clip b,

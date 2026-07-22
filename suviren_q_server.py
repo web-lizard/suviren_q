@@ -1446,12 +1446,20 @@ def get_waveform(
     force: bool = Query(False),
 ) -> dict[str, Any]:
     """Generate downsampled waveform data from audio file."""
-    audio_path = get_export_inputs().get("audio")
+    inputs = get_export_inputs()
+    audio_path = inputs.get("audio")
     if not audio_path or not audio_path.is_file():
         raise HTTPException(status_code=404, detail="No audio file found")
     waveform_path = BUILD_DIR / "waveform.json"
     stat = audio_path.stat()
-    cache_key = f"{server_path(audio_path)}:{stat.st_size}:{stat.st_mtime_ns}:{samples}"
+    chapter_duration = max(
+        (float(item.get("end_seconds", 0) or 0) for item in inputs.get("chapter_items", [])),
+        default=0.0,
+    )
+    cache_key = (
+        f"{server_path(audio_path)}:{stat.st_size}:{stat.st_mtime_ns}:"
+        f"{samples}:{chapter_duration:.3f}:envelope-v3"
+    )
     if waveform_path.exists() and not force:
         try:
             data = json.loads(waveform_path.read_text(encoding="utf-8"))
@@ -1460,13 +1468,23 @@ def get_waveform(
         except Exception:
             pass
     # Decode directly to a deliberately tiny sample rate. Even a 16-hour book
-    # stays below 1 MB instead of producing gigabytes of temporary 22 kHz PCM.
+    # stays small instead of producing gigabytes of temporary 22 kHz PCM.
+    duration_hint = max(quick_audio_duration(audio_path) or 0.0, chapter_duration)
     try:
-        duration_hint = quick_audio_duration(audio_path) or 0.0
-        sample_rate = max(8, min(4000, math.ceil(samples / max(duration_hint, 1.0))))
+        # If a damaged/giant container cannot be probed and has no chapter
+        # timeline, stay at a bounded rate instead of buffering hundreds of MB.
+        sample_rate = (
+            max(8, min(4000, math.ceil(samples / max(duration_hint, 1.0))))
+            if duration_hint > 0
+            else max(8, min(64, math.ceil(samples / 60)))
+        )
         process = subprocess.run(
             ["ffmpeg", "-v", "error", "-i", str(audio_path), "-vn",
-             "-ac", "1", "-ar", str(sample_rate), "-f", "s16le", "pipe:1"],
+             "-af",
+             f"aformat=channel_layouts=mono,aresample=8000,"
+             f"aeval=abs(val(0)),aresample={sample_rate}",
+             "-ac", "1",
+             "-f", "s16le", "pipe:1"],
             capture_output=True, timeout=120, check=True,
             **hidden_process_options(),
         )
@@ -1476,18 +1494,30 @@ def get_waveform(
         if not raw:
             raise ValueError("FFmpeg returned no waveform samples")
         raw_samples = list(struct.unpack(f"<{len(raw)//2}h", raw))
-        # Downsample
-        step = max(1, len(raw_samples) // samples)
-        downsampled = [abs(raw_samples[i]) for i in range(0, len(raw_samples), step)]
-        # Normalize to 0-1
-        max_val = max(downsampled) if downsampled else 1
-        normalized = [round(v / max_val, 4) for v in downsampled]
-        # Limit to requested samples
-        normalized = normalized[:samples]
+        # Downsample the rectified envelope into peak/RMS buckets. Picking one
+        # raw PCM value per bucket often lands near a zero crossing and makes
+        # long spoken-word recordings look almost flat.
+        bucket_count = min(samples, len(raw_samples))
+        downsampled = []
+        for index in range(bucket_count):
+            start = index * len(raw_samples) // bucket_count
+            end = (index + 1) * len(raw_samples) // bucket_count
+            bucket = raw_samples[start:end]
+            if not bucket:
+                continue
+            peak = max(abs(value) for value in bucket)
+            rms = math.sqrt(sum(value * value for value in bucket) / len(bucket))
+            downsampled.append(peak * 0.72 + rms * 0.28)
+        # A percentile reference keeps one unusually loud transient from
+        # flattening the remaining 16 hours of speech.
+        ordered = sorted(downsampled)
+        reference = ordered[min(len(ordered) - 1, round(len(ordered) * 0.98))] if ordered else 1
+        reference = max(1.0, reference)
+        normalized = [round(min(1.0, value / reference), 4) for value in downsampled]
         result = {
             "samples": normalized,
             "count": len(normalized),
-            "max": round(max_val, 2),
+            "max": round(reference, 2),
             "duration_sec": round(duration_hint or len(raw_samples) / sample_rate, 1),
             "cacheKey": cache_key,
         }
@@ -1495,33 +1525,46 @@ def get_waveform(
         return result
     except FileNotFoundError:
         # ffmpeg not found — generate synthetic waveform
-        return generate_synthetic_waveform(audio_path, samples)
+        return generate_synthetic_waveform(
+            audio_path, samples, cache_key=cache_key, duration_hint=duration_hint
+        )
     except subprocess.CalledProcessError:
         # ffmpeg failed — fallback
-        return generate_synthetic_waveform(audio_path, samples)
+        return generate_synthetic_waveform(
+            audio_path, samples, cache_key=cache_key, duration_hint=duration_hint
+        )
     except Exception as exc:
         # Fallback
-        return generate_synthetic_waveform(audio_path, samples)
+        return generate_synthetic_waveform(
+            audio_path, samples, cache_key=cache_key, duration_hint=duration_hint
+        )
 
 
-def generate_synthetic_waveform(audio_path: Path, samples: int) -> dict[str, Any]:
+def generate_synthetic_waveform(
+    audio_path: Path,
+    samples: int,
+    *,
+    cache_key: str = "",
+    duration_hint: float = 0.0,
+) -> dict[str, Any]:
     """Generate synthetic waveform data when ffmpeg is unavailable."""
     import random
     random.seed(42)
     # Try to get duration from ffprobe
-    duration_sec = 0
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries",
-             "format=duration", "-of", "csv=p=0",
-             str(audio_path)],
-            capture_output=True, text=True, timeout=30,
-            **hidden_process_options(),
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            duration_sec = float(result.stdout.strip())
-    except Exception:
-        pass
+    duration_sec = duration_hint
+    if duration_sec <= 0:
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries",
+                 "format=duration", "-of", "csv=p=0",
+                 str(audio_path)],
+                capture_output=True, text=True, timeout=30,
+                **hidden_process_options(),
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                duration_sec = float(result.stdout.strip())
+        except Exception:
+            pass
     # Generate envelope-shaped random data (like a real waveform)
     n = samples
     data = []
@@ -1539,9 +1582,10 @@ def generate_synthetic_waveform(audio_path: Path, samples: int) -> dict[str, Any
         "duration_sec": round(duration_sec, 1),
         "synthetic": True,
     }
+    if cache_key:
+        result["cacheKey"] = cache_key
     waveform_path = BUILD_DIR / "waveform.json"
-    waveform_path.parent.mkdir(parents=True, exist_ok=True)
-    waveform_path.write_text(json.dumps(result), encoding="utf-8")
+    atomic_write_json(waveform_path, result)
     return result
 
 

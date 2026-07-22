@@ -91,7 +91,6 @@
             <strong>{{ project.title || 'Новая аудиокнига' }}</strong>
           </div>
           <div class="chapter-context" v-if="currentChapter">
-            <span>{{ String(currentChapter.index + 1).padStart(2, '0') }}</span>
             <p><b>{{ currentChapter.title }}</b></p>
           </div>
         </div>
@@ -121,11 +120,11 @@
                   :style="layerStyle('title')" @pointerdown.stop="onLayerPointerDown('title', $event)">
             <span ref="titleStackEl" class="chapter-stack" lang="ru">
               <span v-if="previousChapter" class="chapter-neighbor previous" aria-hidden="true">
-                <i>{{ String(previousChapter.index + 1).padStart(2, '0') }}</i><b>{{ previousChapter.title }}</b>
+                <b>{{ previousChapter.title }}</b>
               </span>
               <strong>{{ currentChapter?.title || 'Добавьте первую главу' }}</strong>
               <span v-if="nextChapter" class="chapter-neighbor next" aria-hidden="true">
-                <i>{{ String(nextChapter.index + 1).padStart(2, '0') }}</i><b>{{ nextChapter.title }}</b>
+                <b>{{ nextChapter.title }}</b>
               </span>
             </span>
           </button>
@@ -338,7 +337,7 @@
                     :class="{ active: currentChapter?.id === chapter.id, selected: selection.type === 'chapter' && selection.id === chapter.id }"
                     :style="clipStyle(chapter.start_seconds, chapter.end_seconds, 0.35)"
                     @click.stop="selectChapter(chapter)">
-              <span>{{ chapter.index + 1 }}</span><b>{{ chapter.title }}</b>
+              <b>{{ chapter.title }}</b>
             </button>
           </div>
 
@@ -539,6 +538,17 @@ let visualFrame = null
 let titleFitFrame = null
 let titleResizeObserver = null
 let titleMeasureCanvas = null
+let visualAudioContext = null
+let visualAnalyser = null
+let visualStreamSource = null
+let visualizerStream = null
+let visualizerMaster = null
+let visualizerFrequencyData = null
+let visualizerConnectPending = null
+let visualizerLastConnectAttempt = 0
+let visualizerGeneration = 0
+const visualizerLevels = new Float32Array(72)
+const visualizerPeaks = new Float32Array(72)
 const objectUrls = new Set()
 
 const assetById = (id) => project.materials.find((item) => item.id === id) || null
@@ -944,7 +954,7 @@ function hydrateDiscoveredMaterials(data) {
 async function refreshWaveform() {
   if (!backend.online || !audioAsset.value) return
   try {
-    const result = await apiRequest('/waveform?samples=1800')
+    const result = await apiRequest('/waveform?samples=10000')
     if (Array.isArray(result.samples)) waveformSamples.value = result.samples
   } catch { /* visualizer has a deterministic idle fallback */ }
 }
@@ -1352,6 +1362,95 @@ function secondaryElement() {
   return masterKind.value === 'audio' && videoSource.value ? videoEl.value : null
 }
 
+function releaseLiveVisualizer() {
+  try { visualStreamSource?.disconnect() } catch { /* already disconnected */ }
+  try { visualAnalyser?.disconnect() } catch { /* analyser has no outputs */ }
+  for (const track of visualizerStream?.getTracks?.() || []) {
+    try { track.stop() } catch { /* already stopped */ }
+  }
+  visualStreamSource = null
+  visualAnalyser = null
+  visualizerStream = null
+  visualizerMaster = null
+  visualizerFrequencyData = null
+}
+
+function disconnectLiveVisualizer({ clearPending = true } = {}) {
+  visualizerGeneration += 1
+  releaseLiveVisualizer()
+  if (clearPending) visualizerConnectPending = null
+}
+
+async function connectLiveVisualizer() {
+  const master = masterElement()
+  if (!master || !playing.value) return false
+  if (visualizerConnectPending) return visualizerConnectPending
+
+  visualizerLastConnectAttempt = performance.now()
+  const capture = master.captureStream || master.mozCaptureStream
+  const AudioContextClass = globalThis.AudioContext || globalThis.webkitAudioContext
+  if (typeof capture !== 'function' || !AudioContextClass) return false
+
+  const generation = visualizerGeneration
+  const request = (async () => {
+    let stream = null
+    let source = null
+    let analyser = null
+    try {
+      const liveTracks = visualizerStream?.getAudioTracks?.()
+        ?.some((track) => track.readyState === 'live')
+      if (visualAnalyser && visualizerMaster === master && liveTracks) {
+        if (visualAudioContext?.state === 'suspended') await visualAudioContext.resume()
+        return generation === visualizerGeneration
+          && masterElement() === master
+          && playing.value
+          && visualAudioContext?.state === 'running'
+      }
+
+      stream = capture.call(master)
+      if (!stream?.getAudioTracks?.().length) return false
+      if (!visualAudioContext || visualAudioContext.state === 'closed') {
+        visualAudioContext = new AudioContextClass()
+      }
+      if (visualAudioContext.state === 'suspended') await visualAudioContext.resume()
+      if (generation !== visualizerGeneration || masterElement() !== master || !playing.value) return false
+
+      analyser = visualAudioContext.createAnalyser()
+      analyser.fftSize = 2048
+      analyser.smoothingTimeConstant = 0.62
+      analyser.minDecibels = -84
+      analyser.maxDecibels = -10
+      source = visualAudioContext.createMediaStreamSource(stream)
+      source.connect(analyser)
+
+      releaseLiveVisualizer()
+      visualStreamSource = source
+      visualAnalyser = analyser
+      visualizerStream = stream
+      visualizerMaster = master
+      visualizerFrequencyData = new Uint8Array(analyser.frequencyBinCount)
+      stream = null
+      source = null
+      analyser = null
+      return true
+    } catch {
+      return false
+    } finally {
+      try { source?.disconnect() } catch { /* connection was never published */ }
+      try { analyser?.disconnect() } catch { /* analyser was never published */ }
+      for (const track of stream?.getTracks?.() || []) {
+        try { track.stop() } catch { /* temporary capture already stopped */ }
+      }
+    }
+  })()
+  visualizerConnectPending = request
+  try {
+    return await request
+  } finally {
+    if (visualizerConnectPending === request) visualizerConnectPending = null
+  }
+}
+
 function secondaryTimeAt(absoluteTime) {
   const secondary = secondaryElement()
   const secondaryDuration = Number(secondary?.duration)
@@ -1384,6 +1483,7 @@ async function togglePlay() {
   }
   try {
     await master.play()
+    void connectLiveVisualizer()
     if (secondary) secondary.play().catch(() => {})
   } catch (error) {
     setNotice(`Не удалось воспроизвести файл: ${error.message}`, 'error', 6500)
@@ -1441,6 +1541,7 @@ function onMediaTime(kind) {
 function onMediaPlay(kind) {
   if (kind !== masterKind.value) return
   playing.value = true
+  void connectLiveVisualizer()
   tickPlayback()
 }
 
@@ -1448,12 +1549,14 @@ function onMediaPause(kind) {
   if (kind !== masterKind.value) return
   playing.value = false
   cancelAnimationFrame(playbackFrame)
+  visualAudioContext?.suspend().catch(() => {})
   secondaryElement()?.pause()
 }
 
 function onMediaEnded(kind) {
   if (kind !== masterKind.value) return
   pauseAll()
+  disconnectLiveVisualizer()
 }
 
 function onMediaError(kind) {
@@ -1493,6 +1596,75 @@ function seekFromTimeline(event) {
   seekTo((event.clientX - rect.left) / rect.width * duration.value)
 }
 
+function visualizerValues(now) {
+  const count = visualizerLevels.length
+  const live = playing.value
+    && visualAnalyser
+    && visualizerFrequencyData
+    && visualizerMaster === masterElement()
+    && visualizerStream?.getAudioTracks?.().some((track) => track.readyState === 'live')
+    && visualAudioContext?.state === 'running'
+
+  if (playing.value && !live && !visualizerConnectPending && now - visualizerLastConnectAttempt > 1200) {
+    void connectLiveVisualizer()
+  }
+
+  let targets = null
+  if (live) {
+    visualAnalyser.getByteFrequencyData(visualizerFrequencyData)
+    const binHz = visualAudioContext.sampleRate / visualAnalyser.fftSize
+    const minFrequency = 70
+    const maxFrequency = Math.min(12000, visualAudioContext.sampleRate / 2)
+    const spread = maxFrequency / minFrequency
+    targets = Array.from({ length: count }, (_, index) => {
+      const low = minFrequency * spread ** (index / count)
+      const high = minFrequency * spread ** ((index + 1) / count)
+      const first = Math.max(1, Math.floor(low / binHz))
+      const last = Math.max(first + 1, Math.min(visualizerFrequencyData.length, Math.ceil(high / binHz)))
+      let peak = 0
+      let sum = 0
+      for (let bin = first; bin < last; bin += 1) {
+        const value = visualizerFrequencyData[bin]
+        peak = Math.max(peak, value)
+        sum += value
+      }
+      const raw = (peak * 0.72 + sum / Math.max(1, last - first) * 0.28) / 255
+      const normalized = Math.max(0, (raw - 0.035) / 0.965)
+      return Math.min(1, normalized ** 0.58 * 1.18)
+    })
+  } else {
+    const source = waveformSamples.value
+    const cursor = source.length && duration.value
+      ? Math.floor(currentTime.value / duration.value * Math.max(0, source.length - 1))
+      : 0
+    targets = Array.from({ length: count }, (_, index) => {
+      const sample = source.length
+        ? Math.abs(Number(source[Math.max(0, Math.min(source.length - 1, cursor + (index % 11) - 5))]) || 0)
+        : 0.26
+      const shimmer = 0.22 + Math.abs(
+        Math.sin(now * 0.0052 + index * 0.71)
+        * Math.cos(now * 0.0017 - index * 0.19),
+      ) * 0.86
+      const energy = Math.min(1, sample ** 0.52 * 1.3)
+      return playing.value ? Math.min(1, energy * shimmer) : Math.max(0.035, energy * 0.3)
+    })
+  }
+
+  for (let index = 0; index < count; index += 1) {
+    const current = visualizerLevels[index]
+    const target = targets[index]
+    const response = target > current ? 0.62 : 0.13
+    visualizerLevels[index] = current + (target - current) * response
+    visualizerPeaks[index] = Math.max(visualizerLevels[index], visualizerPeaks[index] * (playing.value ? 0.965 : 0.92))
+  }
+  return visualizerLevels
+}
+
+function addRoundedBar(context, x, y, width, height, radius) {
+  if (typeof context.roundRect === 'function') context.roundRect(x, y, width, height, radius)
+  else context.rect(x, y, width, height)
+}
+
 function drawVisualizer() {
   const canvas = visualizerCanvas.value
   if (canvas) {
@@ -1505,63 +1677,80 @@ function drawVisualizer() {
       canvas.height = height
     }
     const context = canvas.getContext('2d')
+    const now = performance.now()
+    const values = visualizerValues(now)
     context.clearRect(0, 0, width, height)
 
-    context.strokeStyle = 'rgba(255,255,255,.075)'
-    context.lineWidth = 1
-    for (let i = 1; i < 5; i += 1) {
+    context.strokeStyle = 'rgba(255,255,255,.055)'
+    context.lineWidth = Math.max(1, ratio * 0.55)
+    for (let row = 1; row < 5; row += 1) {
       context.beginPath()
-      context.moveTo(0, height * i / 5)
-      context.lineTo(width, height * i / 5)
+      context.moveTo(0, height * row / 5)
+      context.lineTo(width, height * row / 5)
       context.stroke()
     }
 
-    const count = 96
-    const source = waveformSamples.value
-    const offset = duration.value ? Math.floor(currentTime.value / duration.value * Math.max(0, source.length - count)) : 0
-    const motion = playing.value ? currentTime.value * 3.2 : 0
-    const values = Array.from({ length: count }, (_, index) => {
-      if (source.length) {
-        const sample = Math.abs(Number(source[(offset + index * 7) % source.length]) || 0)
-        const pulse = playing.value ? 0.78 + Math.abs(Math.sin(motion + index * 0.37)) * 0.3 : 0.92
-        return Math.min(1, Math.max(0.035, sample * 1.22 * pulse))
-      }
-      return 0.18 + Math.abs(Math.sin(index * 0.31 + currentTime.value * 0.25) * Math.cos(index * 0.09)) * 0.48
-    })
+    const travel = Math.sin(now * 0.00035) * width * 0.28
+    const gradient = context.createLinearGradient(-width * 0.35 + travel, 0, width * 1.35 + travel, 0)
+    gradient.addColorStop(0, '#ffad27')
+    gradient.addColorStop(0.28, '#d74fe8')
+    gradient.addColorStop(0.55, '#55ddcf')
+    gradient.addColorStop(0.78, '#b750da')
+    gradient.addColorStop(1, '#ffad27')
 
-    const points = values.map((value, index) => ({
-      x: index / (values.length - 1) * width,
-      y: height * (0.82 - Math.pow(value, 0.72) * 0.64),
-    }))
-    const gradient = context.createLinearGradient(0, 0, 0, height)
-    gradient.addColorStop(0, 'rgba(183, 80, 218, .48)')
-    gradient.addColorStop(0.68, 'rgba(111, 61, 164, .16)')
-    gradient.addColorStop(1, 'rgba(10, 10, 15, 0)')
-    context.beginPath()
-    context.moveTo(0, height)
-    for (const point of points) context.lineTo(point.x, point.y)
-    context.lineTo(width, height)
-    context.closePath()
+    const baseline = height * 0.78
+    const slot = width / values.length
+    const barWidth = Math.max(1.2 * ratio, slot * 0.58)
+    const maximumBarHeight = height * 0.68
+
+    context.save()
     context.fillStyle = gradient
-    context.fill()
-
+    context.shadowColor = 'rgba(201, 73, 226, .62)'
+    context.shadowBlur = 11 * ratio
     context.beginPath()
-    points.forEach((point, index) => index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y))
-    context.strokeStyle = 'rgba(255, 183, 49, .96)'
-    context.lineWidth = Math.max(1.4, ratio * 1.15)
-    context.shadowColor = 'rgba(255, 174, 39, .45)'
-    context.shadowBlur = 10 * ratio
-    context.stroke()
-    context.shadowBlur = 0
-
-    context.beginPath()
-    points.forEach((point, index) => {
-      const y = height * 0.76 + (point.y - height * 0.5) * 0.22
-      index ? context.lineTo(point.x, y) : context.moveTo(point.x, y)
+    values.forEach((value, index) => {
+      const barHeight = Math.max(1.5 * ratio, value ** 0.86 * maximumBarHeight)
+      const x = index * slot + (slot - barWidth) / 2
+      addRoundedBar(context, x, baseline - barHeight, barWidth, barHeight, barWidth / 2)
     })
-    context.strokeStyle = 'rgba(99, 220, 205, .58)'
-    context.lineWidth = Math.max(1, ratio * 0.75)
+    context.fill()
+    context.restore()
+
+    context.save()
+    context.globalAlpha = 0.16
+    context.fillStyle = gradient
+    context.beginPath()
+    values.forEach((value, index) => {
+      const reflection = Math.max(1, value ** 0.86 * height * 0.12)
+      const x = index * slot + (slot - barWidth) / 2
+      addRoundedBar(context, x, baseline + 3 * ratio, barWidth, reflection, barWidth / 2)
+    })
+    context.fill()
+    context.restore()
+
+    context.save()
+    context.strokeStyle = gradient
+    context.globalAlpha = 0.82
+    context.lineWidth = Math.max(1, ratio * 0.85)
+    visualizerPeaks.forEach((peak, index) => {
+      const x = index * slot + slot * 0.23
+      const y = baseline - peak ** 0.86 * maximumBarHeight - 2.5 * ratio
+      context.beginPath()
+      context.moveTo(x, y)
+      context.lineTo(x + barWidth, y)
+      context.stroke()
+    })
+    context.restore()
+
+    context.save()
+    context.globalAlpha = 0.34
+    context.strokeStyle = gradient
+    context.lineWidth = Math.max(1, ratio * 0.6)
+    context.beginPath()
+    context.moveTo(0, baseline + ratio)
+    context.lineTo(width, baseline + ratio)
     context.stroke()
+    context.restore()
   }
   visualFrame = requestAnimationFrame(drawVisualizer)
 }
@@ -1659,12 +1848,18 @@ function handleKeydown(event) {
 
 watch(() => audioSource.value, () => {
   pauseAll()
+  disconnectLiveVisualizer()
+  visualizerLevels.fill(0)
+  visualizerPeaks.fill(0)
   audioDuration.value = 0
   nextTick(() => audioEl.value?.load())
 })
 
 watch(() => videoSource.value, () => {
   pauseAll()
+  disconnectLiveVisualizer()
+  visualizerLevels.fill(0)
+  visualizerPeaks.fill(0)
   videoDuration.value = 0
   nextTick(() => videoEl.value?.load())
 })
@@ -1714,6 +1909,8 @@ onBeforeUnmount(() => {
   clearTimeout(noticeTimer)
   titleResizeObserver?.disconnect()
   if (titleFitFrame !== null) cancelAnimationFrame(titleFitFrame)
+  disconnectLiveVisualizer()
+  visualAudioContext?.close().catch(() => {})
   releaseObjectUrls()
 })
 </script>
