@@ -106,3 +106,15 @@ test('text navigator maps words to the timeline and plays selected excerpts', ()
   assert.match(source, /class="timeline-excerpt-range"/)
   assert.match(source, /Привязка слов расчётная/)
 })
+
+test('ordinary book playback is not mistaken for a finished text excerpt', () => {
+  const start = source.indexOf('function stopAtExcerptEnd()')
+  const end = source.indexOf('function scrollTimelineToTime', start)
+  const guard = source.slice(start, end)
+  assert.match(guard, /selectedEnd === null/)
+  assert.ok(
+    guard.indexOf('selectedEnd === null') < guard.indexOf('Number(selectedEnd)'),
+    'null excerpt guard must run before numeric conversion',
+  )
+  assert.match(source, /playing\.value \|\| !!\(master && !master\.paused\)/)
+})

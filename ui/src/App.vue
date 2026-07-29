@@ -3630,7 +3630,9 @@ async function playSelectedExcerpt() {
 }
 
 function stopAtExcerptEnd() {
-  const end = Number(excerptPlaybackEnd.value)
+  const selectedEnd = excerptPlaybackEnd.value
+  if (selectedEnd === null) return false
+  const end = Number(selectedEnd)
   if (!Number.isFinite(end) || currentTime.value < end - 0.015) return false
   pauseAll()
   seekTo(end)
@@ -4135,7 +4137,8 @@ function startTimelineScrub(event) {
   if (event.button !== undefined && event.button !== 0) return
   event.preventDefault()
   removeTimelinePointerListeners()
-  resumeAfterTimelineScrub = playing.value
+  const master = masterElement()
+  resumeAfterTimelineScrub = playing.value || !!(master && !master.paused)
   pauseAll()
   timelineScrubbing.value = true
   seekTo(timelineTimeFromPointer(event))
