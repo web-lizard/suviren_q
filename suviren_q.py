@@ -34,8 +34,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 APP_NAME = "book-wunderwaffe-studio"
-APP_VERSION = "2.0.0"
-APP_TITLE = f"BOOK WUNDERWAFFE Studio {APP_VERSION}"
+APP_VERSION = "3.0.0"
+APP_TITLE = f"Book Wunderwaffe Studio {APP_VERSION}"
 BUILD_DIR_NAME = "_suviren_q_build"
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
@@ -970,7 +970,7 @@ def detect_chapters_from_rpp(
     """
     Extract chapters from a specific RPP track.
 
-    KEY BEHAVIOR (as of BOOK WUNDERWAFFE Studio 1.1):
+    KEY BEHAVIOR (as of BOOK WUNDERWAFFE Studio 3.0):
     - Uses ALL items from the specified track (NOT filtered by chapter_pattern).
     - Chapter_pattern is ignored; we take every item on the book track.
     - Items are sorted by POSITION.

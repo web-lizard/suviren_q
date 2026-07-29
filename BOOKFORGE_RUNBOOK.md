@@ -1,7 +1,7 @@
 # BookForge Engine — Runbook v1
 
 > [!WARNING]
-> Архив раннего CLI-прототипа. Для BOOK WUNDERWAFFE Studio 1.1.0 используйте актуальные инструкции в [README.md](README.md); архитектурные и render-команды ниже сохранены только для истории.
+> Архив раннего CLI-прототипа. Для BOOK WUNDERWAFFE Studio 3.0.0 используйте актуальные инструкции в [README.md](README.md); архитектурные и render-команды ниже сохранены только для истории.
 
 ## 1. Что это
 

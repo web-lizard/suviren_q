@@ -9,7 +9,7 @@ if not exist "%APP_PYTHONW%" set "APP_PYTHONW=pythonw.exe"
 
 "%APP_PYTHON%" -c "from PySide6.QtWebEngineWidgets import QWebEngineView; import PIL, qrcode, fastapi, uvicorn, edge_tts" >nul 2>&1
 if errorlevel 1 (
-    echo Installing or updating Bookender Studio runtime...
+    echo Installing or updating Book Wunderwaffe Studio runtime...
     "%APP_PYTHON%" -m pip install --disable-pip-version-check -r "%~dp0requirements.txt"
     if errorlevel 1 (
         echo [ERROR] Desktop dependencies could not be installed.

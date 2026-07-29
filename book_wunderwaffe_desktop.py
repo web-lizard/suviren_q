@@ -248,7 +248,7 @@ def run_desktop(*, window_smoke_test: bool = False) -> int:
         QMessageBox.information(
             None,
             app_name,
-            "Bookender Studio уже запущена.\n\n"
+            "Book Wunderwaffe Studio уже запущена.\n\n"
             "Используйте открытое окно, чтобы проект и рендер не конфликтовали.",
         )
         return 0

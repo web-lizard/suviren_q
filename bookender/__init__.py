@@ -1,4 +1,4 @@
-"""Bookender Studio's local-first project and book domain."""
+"""Book Wunderwaffe Studio's local-first project and book domain."""
 
 from .database import BookenderDatabase
 from .repository import ProjectRepository

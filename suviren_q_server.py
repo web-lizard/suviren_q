@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bookender Studio API
+Book Wunderwaffe Studio API
 
 Provides endpoints for:
   - /api/book-project — data auto-discovery from data/
@@ -58,8 +58,8 @@ LAYOUT_PATH = BUILD_DIR / "layout.json"
 EDITOR_PROJECT_PATH = BUILD_DIR / "editor-project.json"
 CHAPTERS_PATH = BUILD_DIR / "chapters.detected.json"
 
-APP_NAME = "Bookender Studio"
-APP_VERSION = "2.0.0"
+APP_NAME = "Book Wunderwaffe Studio"
+APP_VERSION = "3.0.0"
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg", ".opus"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
@@ -710,7 +710,7 @@ def discover_data_files() -> dict[str, Any]:
 
 
 def get_default_layout() -> dict:
-    """Return the default Bookender Studio composition layout."""
+    """Return the default Book Wunderwaffe Studio composition layout."""
     return {
         "scene": {"width": 1920, "height": 1080, "fps": 30},
         "objects": {

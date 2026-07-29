@@ -3,7 +3,7 @@
 """
 install_suviren_q.py
 
-Bootstrap installer for BOOK WUNDERWAFFE Studio 1.1.0.
+Bootstrap installer for BOOK WUNDERWAFFE Studio 3.0.0.
 
 This script prepares a local Windows-friendly Python environment:
 - checks Python version
@@ -30,7 +30,7 @@ from typing import Iterable
 
 
 APP_NAME = "book-wunderwaffe-studio"
-APP_FULL_NAME = "BOOK WUNDERWAFFE Studio 1.1.0"
+APP_FULL_NAME = "BOOK WUNDERWAFFE Studio 3.0.0"
 
 ROOT = Path(__file__).resolve().parent
 MAIN_SCRIPT = ROOT / "suviren_q.py"

@@ -183,7 +183,7 @@ class TtsService:
         clean_text = " ".join(str(text or "").split())[:500]
         if not clean_text:
             clean_text = (
-                "Это короткая проба голоса Bookender Studio. "
+                "Это короткая проба голоса Book Wunderwaffe Studio. "
                 "Вы можете изменить скорость и высоту тона."
             )
         normalized = self._normalized_settings(settings)

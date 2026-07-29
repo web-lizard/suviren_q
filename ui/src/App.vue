@@ -1,11 +1,11 @@
 <template>
   <div class="studio" :class="[`theme-${project.theme}`, `workspace-${activeWorkspace}`, { 'is-loading': loading }]">
     <header class="topbar">
-      <div class="brand" aria-label="Bookender Studio">
+      <div class="brand" aria-label="Book Wunderwaffe Studio">
         <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
         <span class="brand-copy">
-          <strong>BOOKENDER STUDIO</strong>
-          <small>BOOK · VOICE · VIDEO · v{{ backend.version || '2.0.0' }}</small>
+          <strong>BOOK WUNDERWAFFE STUDIO</strong>
+          <small>BOOK · VOICE · VIDEO · v{{ backend.version || '3.0.0' }}</small>
         </span>
       </div>
 
@@ -796,7 +796,7 @@
     <div v-if="showProjectManager" class="modal-backdrop" @mousedown.self="showProjectManager = false">
       <section class="project-manager-modal" role="dialog" aria-modal="true" aria-labelledby="project-manager-title">
         <header>
-          <div><span class="eyebrow">Локальная библиотека</span><h2 id="project-manager-title">Проекты Bookender</h2></div>
+          <div><span class="eyebrow">Локальная библиотека</span><h2 id="project-manager-title">Проекты Book Wunderwaffe</h2></div>
           <button type="button" @click="showProjectManager = false" aria-label="Закрыть">×</button>
         </header>
         <label class="project-manager-search">
@@ -827,7 +827,7 @@
 
     <div v-if="loading" class="loading-screen">
       <span class="loading-mark"><i></i><i></i><i></i></span>
-      <strong>BOOKENDER STUDIO</strong>
+      <strong>BOOK WUNDERWAFFE STUDIO</strong>
       <small>{{ loadingMessage }}</small>
     </div>
   </div>
