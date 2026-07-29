@@ -56,7 +56,7 @@
         <button class="action-button" type="button" :disabled="!activeProjectUuid" @click="backupActiveProject">
           <span aria-hidden="true">◫</span><b>Резервная копия</b>
         </button>
-        <button class="export-button" type="button" :disabled="!activeProjectRecord?.book" @click="setWorkspace('video')">
+        <button class="export-button" type="button" :disabled="!activeProjectRecord?.book" @click="openBookInVideo">
           <span aria-hidden="true">→</span><b>В видеокнигу</b>
         </button>
       </nav>
@@ -339,7 +339,7 @@
       </aside>
     </main>
 
-    <main v-else class="book-workspace">
+    <main v-else class="book-workspace" :class="`inspector-${bookInspectorState}`">
       <aside v-if="activeProjectRecord?.book" class="book-chapters panel-shell">
         <div class="panel-heading">
           <div><span class="eyebrow">Структура</span><h2>Главы</h2></div>
@@ -356,12 +356,16 @@
             <span>{{ chapter.position + 1 }}</span>
             <b>{{ chapter.title }}</b>
             <small>{{ chapter.content.length.toLocaleString('ru-RU') }} зн.</small>
+            <i class="chapter-audio-state"
+               :class="chapterAudioState(chapter)"
+               :title="chapterAudioStateLabel(chapter)"></i>
           </button>
         </div>
         <div class="chapter-list-actions">
           <button type="button" @click="createBookChapter">＋ Глава</button>
           <button type="button" :disabled="!currentBookChapter" @click="moveBookChapter(-1)">↑</button>
           <button type="button" :disabled="!currentBookChapter" @click="moveBookChapter(1)">↓</button>
+          <button type="button" :disabled="!currentBookChapter" title="Дублировать главу" @click="duplicateBookChapter">⧉</button>
           <button class="danger" type="button" :disabled="!currentBookChapter" @click="archiveBookChapter">Удалить</button>
         </div>
       </aside>
@@ -372,19 +376,41 @@
             <span class="eyebrow">{{ activeProjectRecord.book.author || activeProjectRecord.author || 'Без автора' }}</span>
             <h1>{{ activeProjectRecord.book.title }}</h1>
           </div>
-          <span class="book-save-indicator" :class="bookSaveState"><i></i>{{ bookSaveLabel }}</span>
+          <div class="book-editor-head-actions">
+            <span class="book-save-indicator" :class="bookSaveState"><i></i>{{ bookSaveLabel }}</span>
+            <button v-if="bookInspectorState === 'hidden'" type="button" @click="setBookInspectorState('open')">Настройки</button>
+          </div>
         </header>
         <template v-if="currentBookChapter">
           <input v-model="bookChapterTitle" class="book-chapter-title" type="text"
                  aria-label="Название главы" @input="markBookDirty" />
-          <textarea v-model="bookChapterContent" class="book-text-editor"
+          <textarea ref="bookTextEditor" v-model="bookChapterContent" class="book-text-editor"
                     spellcheck="true" aria-label="Текст главы"
                     placeholder="Начните писать…" @input="markBookDirty"></textarea>
+          <div v-if="bookPlayerAsset" class="book-audio-player">
+            <audio ref="bookAudioEl" :src="bookPlayerUrl" preload="metadata"
+                   @loadedmetadata="onBookAudioMetadata" @timeupdate="onBookAudioTime"
+                   @play="bookPlayerPlaying = true" @pause="bookPlayerPlaying = false"
+                   @ended="bookPlayerPlaying = false"></audio>
+            <div class="book-player-copy">
+              <small>{{ bookPlayerAsset.temporary ? 'Проба голоса' : 'Озвучка главы' }}</small>
+              <b>{{ bookPlayerTitle }}</b>
+            </div>
+            <button type="button" :disabled="!previousChapterAudio" title="Предыдущая версия" @click="selectAdjacentChapterAudio(-1)">‹</button>
+            <button class="book-player-play" type="button" @click="toggleBookPlayer">{{ bookPlayerPlaying ? 'Ⅱ' : '▶' }}</button>
+            <button type="button" title="Остановить" @click="stopBookPlayer">■</button>
+            <button type="button" :disabled="!nextChapterAudio" title="Следующая версия" @click="selectAdjacentChapterAudio(1)">›</button>
+            <span>{{ formatTime(bookPlayerTime, true) }}</span>
+            <input class="book-player-scrubber" type="range" min="0" :max="Math.max(bookPlayerDuration, .01)"
+                   step=".01" :value="bookPlayerTime" @input="seekBookPlayer(Number($event.target.value))" />
+            <span>{{ formatTime(bookPlayerDuration, true) }}</span>
+            <label title="Громкость"><span>◖</span><input v-model.number="bookPlayerVolume" type="range" min="0" max="1" step=".01" @input="applyBookPlayerVolume" /></label>
+          </div>
           <footer class="book-editor-footer">
             <span>{{ bookWordCount.toLocaleString('ru-RU') }} слов</span>
             <span>{{ bookChapterContent.length.toLocaleString('ru-RU') }} символов</span>
-            <span v-if="currentChapterAudio" :class="{ stale: currentChapterAudio.source_text_hash !== currentBookChapter.content_hash }">
-              {{ currentChapterAudio.source_text_hash === currentBookChapter.content_hash ? 'Озвучка актуальна' : 'Текст изменён после озвучки' }}
+            <span v-if="currentChapterAudio" :class="{ stale: currentChapterAudio.is_stale }">
+              {{ currentChapterAudio.is_stale ? 'Озвучка устарела' : 'Озвучка актуальна' }}
             </span>
           </footer>
         </template>
@@ -395,48 +421,130 @@
         </div>
       </section>
 
-      <aside v-if="activeProjectRecord?.book" class="book-inspector panel-shell">
-        <div class="panel-heading"><div><span class="eyebrow">Книга</span><h2>Настройки</h2></div></div>
-        <label class="field-label">Название книги
-          <input v-model="bookMetadata.title" type="text" @change="saveBookMetadata" />
-        </label>
-        <label class="field-label">Автор
-          <input v-model="bookMetadata.author" type="text" @change="saveBookMetadata" />
-        </label>
-        <label class="field-label">Описание
-          <textarea v-model="bookMetadata.description" rows="4" @change="saveBookMetadata"></textarea>
-        </label>
-        <div class="book-tts-panel">
-          <span class="section-title">Озвучка</span>
-          <label class="field-label">Голос
-            <select v-model="bookTts.voice" @change="saveBookTtsSettings">
-              <option value="ru-RU-SvetlanaNeural">Светлана</option>
-              <option value="ru-RU-DmitryNeural">Дмитрий</option>
-            </select>
-          </label>
-          <div class="field-grid">
-            <label class="field-label">Скорость<input v-model="bookTts.rate" type="text" @change="saveBookTtsSettings" /></label>
-            <label class="field-label">Тон<input v-model="bookTts.pitch" type="text" @change="saveBookTtsSettings" /></label>
+      <aside v-if="activeProjectRecord?.book && bookInspectorState !== 'hidden'"
+             class="book-inspector panel-shell" :class="{ collapsed: bookInspectorState === 'collapsed' }">
+        <button v-if="bookInspectorState === 'collapsed'" class="book-inspector-rail" type="button"
+                @click="setBookInspectorState('open')"><span>Настройки</span></button>
+        <template v-else>
+          <div class="panel-heading">
+            <div><span class="eyebrow">Книга</span><h2>Инспектор</h2></div>
+            <div class="inspector-toggle-actions">
+              <button type="button" title="Свернуть" @click="setBookInspectorState('collapsed')">›</button>
+              <button type="button" title="Скрыть" @click="setBookInspectorState('hidden')">×</button>
+            </div>
           </div>
-          <button class="book-primary" type="button" :disabled="!currentBookChapter || activeTtsJobRunning" @click="narrateCurrentChapter">
-            {{ activeTtsJobRunning ? 'Озвучивание идёт в фоне…' : 'Озвучить текущую главу' }}
-          </button>
-          <button class="book-secondary" type="button" :disabled="activeTtsJobRunning" @click="narrateWholeBook">
-            Озвучить всю книгу
-          </button>
-          <p v-if="latestTtsJob" class="book-job-state" :class="latestTtsJob.status">
-            {{ ttsJobLabel(latestTtsJob) }}
-          </p>
-        </div>
-        <div class="book-audio-list">
-          <span class="section-title">Аудиофайлы · {{ activeProjectRecord.audio_assets?.length || 0 }}</span>
-          <div v-for="asset in activeProjectRecord.audio_assets || []" :key="asset.id">
-            <b>{{ chapterTitleForAudio(asset) }}</b>
-            <small>{{ asset.generation_status }}</small>
-            <audio v-if="!asset.file_path.startsWith('external:')" controls preload="none"
-                   :src="`${API}/project-media/${encodeURI(asset.file_path)}`"></audio>
+          <div class="book-inspector-scroll">
+            <details>
+              <summary>Книга</summary>
+              <label class="field-label">Название
+                <input v-model="bookMetadata.title" type="text" @change="saveBookMetadata" />
+              </label>
+              <label class="field-label">Автор
+                <input v-model="bookMetadata.author" type="text" @change="saveBookMetadata" />
+              </label>
+              <label class="field-label">Описание
+                <textarea v-model="bookMetadata.description" rows="4" @change="saveBookMetadata"></textarea>
+              </label>
+            </details>
+
+            <details open>
+              <summary>Озвучка</summary>
+              <div class="book-tts-panel">
+                <p class="tts-runtime-state" :class="{ unavailable: !ttsRuntime.available }">
+                  <i></i>{{ ttsRuntime.message || 'Проверяю компонент озвучки…' }}
+                </p>
+                <div class="voice-filters">
+                  <input v-model.trim="voiceSearch" type="search" placeholder="Поиск голоса" />
+                  <select v-model="voiceLanguage">
+                    <option value="">Все языки</option>
+                    <option v-for="language in voiceLanguages" :key="language" :value="language">{{ language.toUpperCase() }}</option>
+                  </select>
+                </div>
+                <label class="field-label">Голос
+                  <select v-model="bookTts.voice" @change="saveBookTtsSettings">
+                    <option v-for="voice in filteredTtsVoices" :key="voice.id" :value="voice.id">
+                      {{ voiceLabel(voice) }}
+                    </option>
+                  </select>
+                </label>
+                <div class="field-grid">
+                  <label class="field-label">Скорость
+                    <select v-model="bookTts.rate" @change="saveBookTtsSettings">
+                      <option v-for="preset in RATE_PRESETS" :key="preset.value" :value="preset.value">{{ preset.label }} · {{ preset.value }}</option>
+                    </select>
+                  </label>
+                  <label class="field-label">Высота тона
+                    <select v-model="bookTts.pitch" @change="saveBookTtsSettings">
+                      <option v-for="preset in PITCH_PRESETS" :key="preset.value" :value="preset.value">{{ preset.label }} · {{ preset.value }}</option>
+                    </select>
+                  </label>
+                </div>
+                <label class="field-label">Громкость синтеза
+                  <select v-model="bookTts.volume" @change="saveBookTtsSettings">
+                    <option v-for="preset in VOLUME_PRESETS" :key="preset.value" :value="preset.value">{{ preset.label }} · {{ preset.value }}</option>
+                  </select>
+                </label>
+                <div class="book-tts-actions">
+                  <button class="book-secondary" type="button" :disabled="previewLoading || !ttsRuntime.available" @click="previewBookVoice">
+                    {{ previewLoading ? 'Создаю пробу…' : 'Проба голоса' }}
+                  </button>
+                  <button class="book-primary" type="button" :disabled="!currentBookChapter || activeTtsJobRunning || !ttsRuntime.available" @click="narrateCurrentChapter">
+                    {{ activeTtsJobRunning ? 'Озвучивание идёт…' : 'Озвучить главу' }}
+                  </button>
+                  <button class="book-secondary" type="button" :disabled="activeTtsJobRunning || !ttsRuntime.available" @click="narrateWholeBook">
+                    Озвучить всю книгу
+                  </button>
+                </div>
+                <p v-if="latestTtsJob" class="book-job-state" :class="latestTtsJob.status">
+                  {{ ttsJobLabel(latestTtsJob) }}
+                  <button v-if="latestTtsJob.status === 'failed'" type="button" @click="narrateCurrentChapter">Повторить</button>
+                  <button v-if="latestTtsJob.status === 'failed'" type="button" @click="openTtsLog">Технический лог</button>
+                </p>
+                <div v-if="visibleTtsJobs.length > 1" class="tts-batch-list">
+                  <span v-for="job in visibleTtsJobs.slice(0, 12)" :key="job.uuid" :class="job.status">
+                    <b>{{ chapterTitleForJob(job) }}</b><i>{{ ttsJobShortLabel(job.status) }}</i>
+                  </span>
+                </div>
+              </div>
+            </details>
+
+            <details open>
+              <summary>Аудио · {{ currentChapterAudios.length }}</summary>
+              <div class="book-audio-list">
+                <p v-if="!currentChapterAudios.length" class="book-audio-empty">
+                  У текущей главы пока нет озвучки. Выберите голос и создайте первую версию.
+                </p>
+                <article v-for="asset in currentChapterAudios" :key="asset.id"
+                         :class="{ active: asset.is_active, stale: asset.is_stale, selected: selectedBookAudioId === asset.id }">
+                  <button class="audio-version-main" type="button" @click="selectBookAudio(asset, true)">
+                    <span><b>{{ asset.title || `Версия ${asset.version_number}` }}</b><i v-if="asset.is_active">активная</i></span>
+                    <small>{{ formatProjectDate(asset.created_at) }} · {{ voiceShortLabel(asset.voice) }}</small>
+                    <small>{{ asset.rate }} · {{ pitchPresetLabel(asset.pitch) }} · {{ formatTime(asset.duration || 0, true) }}</small>
+                    <em v-if="asset.is_stale">Озвучка устарела</em>
+                  </button>
+                  <div class="audio-version-actions">
+                    <button type="button" title="Воспроизвести" @click="selectBookAudio(asset, true)">▶</button>
+                    <button type="button" :disabled="asset.is_active" title="Сделать активной" @click="activateBookAudio(asset)">✓</button>
+                    <button type="button" title="Переименовать" @click="renameBookAudio(asset)">✎</button>
+                    <button type="button" title="Открыть папку" @click="openBookAudioFolder(asset)">⌞</button>
+                    <button type="button" title="Передать в видео" @click="sendBookAudioToVideo(asset)">→</button>
+                    <button class="danger" type="button" title="Удалить версию" @click="deleteBookAudio(asset)">×</button>
+                  </div>
+                </article>
+              </div>
+            </details>
+
+            <details>
+              <summary>Экспорт</summary>
+              <button class="book-primary" type="button" @click="openBookInVideo">Передать книгу в видеоредактор</button>
+            </details>
+            <details>
+              <summary>Техническое</summary>
+              <button class="book-secondary" type="button" @click="openTtsLog">Открыть журнал TTS</button>
+              <p class="technical-note">Интерпретатор: {{ backend.python || 'не определён' }}</p>
+            </details>
           </div>
-        </div>
+        </template>
       </aside>
 
       <section v-else class="book-missing">
@@ -638,6 +746,27 @@ const RENDER_PRESETS = Object.freeze({
   },
 })
 const renderPresetOptions = Object.values(RENDER_PRESETS)
+const RATE_PRESETS = Object.freeze([
+  { label: 'Медленно', value: '-25%' },
+  { label: 'Немного медленнее', value: '-10%' },
+  { label: 'Обычно', value: '+0%' },
+  { label: 'Немного быстрее', value: '+15%' },
+  { label: 'Быстро', value: '+30%' },
+])
+const PITCH_PRESETS = Object.freeze([
+  { label: 'Очень низкий', value: '-40Hz' },
+  { label: 'Низкий', value: '-25Hz' },
+  { label: 'Немного ниже', value: '-10Hz' },
+  { label: 'Нормальный', value: '+0Hz' },
+  { label: 'Немного выше', value: '+10Hz' },
+  { label: 'Высокий', value: '+25Hz' },
+  { label: 'Очень высокий', value: '+40Hz' },
+])
+const VOLUME_PRESETS = Object.freeze([
+  { label: 'Тише', value: '-20%' },
+  { label: 'Обычно', value: '+0%' },
+  { label: 'Громче', value: '+20%' },
+])
 
 const DEFAULT_LAYERS = {
   cover: { visible: true, x: 7, y: 17, w: 27, h: 66 },
@@ -674,7 +803,7 @@ function freshProject() {
 }
 
 const project = reactive(freshProject())
-const backend = reactive({ online: false, checking: true, version: '' })
+const backend = reactive({ online: false, checking: true, version: '', python: '' })
 const selection = reactive({ type: 'project', id: null })
 const notice = reactive({ text: '', kind: 'info' })
 const activeWorkspace = ref('book')
@@ -691,6 +820,7 @@ const currentBookChapterId = ref(null)
 const bookChapterTitle = ref('')
 const bookChapterContent = ref('')
 const bookSaveState = ref('saved')
+const bookInspectorState = ref(localStorage.getItem('bookender.bookInspector') || 'open')
 const bookMetadata = reactive({ title: '', author: '', description: '' })
 const bookTts = reactive({
   voice: 'ru-RU-SvetlanaNeural',
@@ -700,6 +830,18 @@ const bookTts = reactive({
   provider: 'edge-tts',
 })
 const ttsJobs = ref([])
+const ttsSessionStartedAt = Date.now()
+const ttsRuntime = reactive({ available: false, message: '', provider: 'edge-tts', version: '' })
+const ttsVoices = ref([])
+const voiceSearch = ref('')
+const voiceLanguage = ref('ru')
+const previewLoading = ref(false)
+const previewAudio = ref(null)
+const selectedBookAudioId = ref(null)
+const bookPlayerTime = ref(0)
+const bookPlayerDuration = ref(0)
+const bookPlayerPlaying = ref(false)
+const bookPlayerVolume = ref(0.86)
 let bookAutosaveTimer = null
 let ttsPollTimer = null
 
@@ -710,6 +852,8 @@ const saving = ref(false)
 const hydrating = ref(true)
 const assetInput = ref(null)
 const projectInput = ref(null)
+const bookTextEditor = ref(null)
+const bookAudioEl = ref(null)
 const audioEl = ref(null)
 const videoEl = ref(null)
 const sceneEl = ref(null)
@@ -786,11 +930,54 @@ const bookSaveLabel = computed(() => ({
   saved: 'Сохранено',
   error: 'Ошибка сохранения',
 }[bookSaveState.value] || 'Сохранено'))
-const currentChapterAudio = computed(() => (
-  activeProjectRecord.value?.audio_assets?.find((asset) => asset.chapter_id === currentBookChapterId.value) || null
+const currentChapterAudios = computed(() => (
+  (activeProjectRecord.value?.audio_assets || [])
+    .filter((asset) => asset.chapter_id === currentBookChapterId.value)
+    .sort((a, b) => Number(b.version_number || b.id) - Number(a.version_number || a.id))
 ))
-const latestTtsJob = computed(() => ttsJobs.value[0] || null)
-const activeTtsJobRunning = computed(() => ['queued', 'running'].includes(latestTtsJob.value?.status))
+const currentChapterAudio = computed(() => (
+  currentChapterAudios.value.find((asset) => asset.is_active)
+  || currentChapterAudios.value[0]
+  || null
+))
+const selectedBookAudio = computed(() => (
+  currentChapterAudios.value.find((asset) => asset.id === selectedBookAudioId.value)
+  || currentChapterAudio.value
+  || null
+))
+const bookPlayerAsset = computed(() => previewAudio.value || selectedBookAudio.value)
+const bookPlayerUrl = computed(() => {
+  const asset = bookPlayerAsset.value
+  if (!asset?.file_path || asset.file_path.startsWith('external:')) return ''
+  return `${API}/project-media/${asset.file_path.split('/').map(encodeURIComponent).join('/')}`
+})
+const bookPlayerTitle = computed(() => {
+  if (previewAudio.value) return `Проба · ${voiceShortLabel(previewAudio.value.voice)}`
+  return selectedBookAudio.value?.title || `Версия ${selectedBookAudio.value?.version_number || ''}`
+})
+const selectedAudioIndex = computed(() => (
+  currentChapterAudios.value.findIndex((asset) => asset.id === selectedBookAudio.value?.id)
+))
+const previousChapterAudio = computed(() => currentChapterAudios.value[selectedAudioIndex.value + 1] || null)
+const nextChapterAudio = computed(() => currentChapterAudios.value[selectedAudioIndex.value - 1] || null)
+const voiceLanguages = computed(() => (
+  [...new Set(ttsVoices.value.map((voice) => voice.language).filter(Boolean))].sort((a, b) => (
+    a === 'ru' ? -1 : b === 'ru' ? 1 : a.localeCompare(b)
+  ))
+))
+const filteredTtsVoices = computed(() => {
+  const query = voiceSearch.value.toLocaleLowerCase('ru-RU')
+  return ttsVoices.value.filter((voice) => (
+    (!voiceLanguage.value || voice.language === voiceLanguage.value)
+    && (!query || `${voice.name} ${voice.friendly_name} ${voice.id} ${voice.locale}`.toLocaleLowerCase('ru-RU').includes(query))
+  ))
+})
+const visibleTtsJobs = computed(() => ttsJobs.value.filter((job) => (
+  ['queued', 'running'].includes(job.status)
+  || new Date(job.created_at).getTime() >= ttsSessionStartedAt
+)))
+const latestTtsJob = computed(() => visibleTtsJobs.value[0] || null)
+const activeTtsJobRunning = computed(() => ttsJobs.value.some((job) => ['queued', 'running'].includes(job.status)))
 const audioSource = computed(() => assetUrl(audioAsset.value))
 const videoSource = computed(() => assetUrl(videoAsset.value))
 const coverSource = computed(() => assetUrl(coverAsset.value))
@@ -1166,28 +1353,96 @@ function formatProjectDate(value) {
   return new Intl.DateTimeFormat('ru-RU', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(value))
 }
 
+function normalizedVoiceId(value) {
+  const voice = String(value || '')
+  const folded = voice.toLocaleLowerCase('ru-RU')
+  if (folded.includes('дмит') || folded === 'dmitry') return 'ru-RU-DmitryNeural'
+  if (folded.includes('свет') || folded === 'svetlana') return 'ru-RU-SvetlanaNeural'
+  return voice || 'ru-RU-SvetlanaNeural'
+}
+
+function normalizePreset(value, presets, fallback) {
+  return presets.some((preset) => preset.value === value) ? value : fallback
+}
+
+function setBookInspectorState(state) {
+  bookInspectorState.value = ['open', 'collapsed', 'hidden'].includes(state) ? state : 'open'
+  localStorage.setItem('bookender.bookInspector', bookInspectorState.value)
+}
+
+function voiceLabel(voice) {
+  const name = voice.name || voice.id
+  const gender = ({ Female: 'жен.', Male: 'муж.' }[voice.gender] || voice.gender || '')
+  return `${name} · ${voice.locale}${gender ? ` · ${gender}` : ''}`
+}
+
+function voiceShortLabel(voiceId) {
+  const voice = ttsVoices.value.find((item) => item.id === voiceId)
+  return voice?.name || voiceId || 'голос не указан'
+}
+
+function pitchPresetLabel(value) {
+  return PITCH_PRESETS.find((preset) => preset.value === value)?.label || value || 'Нормальный'
+}
+
+async function loadTtsRuntime({ refresh = false } = {}) {
+  try {
+    const status = await apiRequest('/tts/status')
+    Object.assign(ttsRuntime, status)
+    if (!status.available) return
+    const result = await apiRequest(`/tts/voices${refresh ? '?refresh=true' : ''}`)
+    ttsVoices.value = result.voices || []
+    if (!ttsVoices.value.some((voice) => voice.id === bookTts.voice)) {
+      const fallback = ttsVoices.value.find((voice) => voice.id === 'ru-RU-SvetlanaNeural')
+        || ttsVoices.value[0]
+      if (fallback) bookTts.voice = fallback.id
+    }
+  } catch (error) {
+    ttsRuntime.available = false
+    ttsRuntime.message = error.message || 'Модуль озвучки не запущен. Проверьте установку компонентов TTS.'
+  }
+}
+
 function hydrateBookState(record) {
   const book = record?.book
   bookMetadata.title = book?.title || record?.title || ''
   bookMetadata.author = book?.author || record?.author || ''
   bookMetadata.description = book?.description || record?.description || ''
   Object.assign(bookTts, {
-    voice: record?.tts_settings?.voice || 'ru-RU-SvetlanaNeural',
-    rate: record?.tts_settings?.rate || '+0%',
-    pitch: record?.tts_settings?.pitch || '+0Hz',
-    volume: record?.tts_settings?.volume || '+0%',
+    voice: normalizedVoiceId(record?.tts_settings?.voice),
+    rate: normalizePreset(record?.tts_settings?.rate, RATE_PRESETS, '+0%'),
+    pitch: normalizePreset(record?.tts_settings?.pitch, PITCH_PRESETS, '+0Hz'),
+    volume: normalizePreset(record?.tts_settings?.volume, VOLUME_PRESETS, '+0%'),
     provider: record?.tts_settings?.provider || 'edge-tts',
   })
+  const selectedVoice = ttsVoices.value.find((voice) => voice.id === bookTts.voice)
+  if (selectedVoice?.language) voiceLanguage.value = selectedVoice.language
   const chapters = record?.chapters || []
   const preferred = chapters.find((item) => item.id === currentBookChapterId.value) || chapters[0] || null
   currentBookChapterId.value = preferred?.id || null
   bookChapterTitle.value = preferred?.title || ''
   bookChapterContent.value = preferred?.content || ''
   bookSaveState.value = 'saved'
+  previewAudio.value = null
+  const chapterAssets = (record?.audio_assets || []).filter((asset) => asset.chapter_id === preferred?.id)
+  selectedBookAudioId.value = (
+    chapterAssets.find((asset) => asset.is_active)?.id
+    || chapterAssets[0]?.id
+    || null
+  )
+  stopBookPlayer()
 }
 
 function addBookAudioToVideo(record) {
+  const grouped = new Map()
   for (const audio of record?.audio_assets || []) {
+    const key = audio.chapter_id ?? `book-${audio.id}`
+    const current = grouped.get(key)
+    if (!current || audio.is_active || (!current.is_active && Number(audio.version_number || audio.id) > Number(current.version_number || current.id))) {
+      grouped.set(key, audio)
+    }
+  }
+  for (const audio of grouped.values()) {
     if (!audio.file_path || audio.file_path.startsWith('external:')) continue
     const serverPath = audio.file_path
     if (project.materials.some((item) => item.serverPath === serverPath)) continue
@@ -1357,6 +1612,10 @@ async function selectBookChapter(chapterId) {
   bookChapterTitle.value = chapter.title
   bookChapterContent.value = chapter.content
   bookSaveState.value = 'saved'
+  previewAudio.value = null
+  const assets = (activeProjectRecord.value?.audio_assets || []).filter((asset) => asset.chapter_id === chapterId)
+  selectedBookAudioId.value = assets.find((asset) => asset.is_active)?.id || assets[0]?.id || null
+  stopBookPlayer()
 }
 
 function markBookDirty() {
@@ -1381,6 +1640,11 @@ async function saveCurrentChapter({ silent = false } = {}) {
     )
     const index = activeProjectRecord.value.chapters.findIndex((item) => item.id === saved.id)
     if (index >= 0) activeProjectRecord.value.chapters[index] = saved
+    for (const asset of activeProjectRecord.value.audio_assets || []) {
+      if (asset.chapter_id === saved.id) {
+        asset.is_stale = Boolean(asset.source_text_hash && asset.source_text_hash !== saved.content_hash)
+      }
+    }
     bookSaveState.value = 'saved'
     if (!silent) setNotice('Глава сохранена', 'success', 1800)
     return true
@@ -1404,6 +1668,25 @@ async function createBookChapter() {
     await selectBookChapter(chapter.id)
   } catch (error) {
     setNotice(`Не удалось создать главу: ${error.message}`, 'error')
+  }
+}
+
+async function duplicateBookChapter() {
+  const chapter = currentBookChapter.value
+  if (!chapter || !(await saveCurrentChapter({ silent: true }))) return
+  try {
+    const duplicate = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/chapters`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: `${bookChapterTitle.value || chapter.title} — копия`,
+        content: bookChapterContent.value,
+      }),
+    })
+    activeProjectRecord.value.chapters.push(duplicate)
+    await selectBookChapter(duplicate.id)
+  } catch (error) {
+    setNotice(`Не удалось дублировать главу: ${error.message}`, 'error')
   }
 }
 
@@ -1464,13 +1747,16 @@ async function saveBookTtsSettings() {
       body: JSON.stringify(bookTts),
     })
     activeProjectRecord.value.tts_settings = settings
+    return true
   } catch (error) {
     setNotice(`Не удалось сохранить настройки TTS: ${error.message}`, 'error')
+    return false
   }
 }
 
 async function narrateCurrentChapter() {
   if (!currentBookChapter.value || !(await saveCurrentChapter({ silent: true }))) return
+  if (!(await saveBookTtsSettings())) return
   try {
     const job = await apiRequest(
       `/projects/${encodeURIComponent(activeProjectUuid.value)}/chapters/${currentBookChapter.value.id}/tts`,
@@ -1485,6 +1771,7 @@ async function narrateCurrentChapter() {
 
 async function narrateWholeBook() {
   if (!(await saveCurrentChapter({ silent: true }))) return
+  if (!(await saveBookTtsSettings())) return
   if (!window.confirm('Поставить все непустые главы в последовательную очередь озвучивания?')) return
   try {
     const result = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/tts`, { method: 'POST' })
@@ -1507,7 +1794,12 @@ function pollTtsBook() {
         const record = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}`)
         activeProjectRecord.value = record
         hydrateBookState(record)
-        setNotice('Озвучивание книги завершено', 'success')
+        const failed = visibleTtsJobs.value.filter((job) => job.status === 'failed').length
+        setNotice(
+          failed ? `Очередь завершена, ошибок: ${failed}. Готовые файлы сохранены.` : 'Озвучивание книги завершено',
+          failed ? 'warning' : 'success',
+          7000,
+        )
       }
     } catch {
       clearInterval(ttsPollTimer)
@@ -1527,8 +1819,13 @@ function pollTtsJob(jobUuid) {
         const record = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}`)
         activeProjectRecord.value = record
         hydrateBookState(record)
-        if (job.status === 'done') setNotice('Озвучка главы готова', 'success')
-        else setNotice(`Ошибка озвучивания: ${job.error}`, 'error', 8000)
+        if (job.status === 'done') {
+          const ready = record.audio_assets?.find((asset) => asset.file_path === job.output_path)
+          if (ready) selectBookAudio(ready, true)
+          setNotice('Озвучка главы готова', 'success')
+        } else {
+          setNotice(job.user_error || 'Модуль озвучки не запущен. Проверьте установку компонентов TTS.', 'error', 8000)
+        }
       }
     } catch {
       clearInterval(ttsPollTimer)
@@ -1541,8 +1838,187 @@ function ttsJobLabel(job) {
     queued: 'Задача поставлена в очередь',
     running: 'Озвучивание выполняется в фоне',
     done: 'Озвучка готова',
-    failed: `Ошибка: ${job.error || 'неизвестная ошибка'}`,
+    failed: job.user_error || 'Модуль озвучки не запущен. Проверьте установку компонентов TTS.',
   }[job.status] || job.status)
+}
+
+function ttsJobShortLabel(status) {
+  return ({
+    queued: 'ожидает',
+    running: 'генерируется',
+    done: 'готово',
+    failed: 'ошибка',
+    cancelled: 'отменено',
+    skipped: 'пропущено',
+  }[status] || status)
+}
+
+function chapterTitleForJob(job) {
+  return activeProjectRecord.value?.chapters?.find((chapter) => chapter.id === job.chapter_id)?.title || 'Глава'
+}
+
+async function previewBookVoice() {
+  if (!activeProjectUuid.value || previewLoading.value) return
+  if (!(await saveBookTtsSettings())) return
+  const editor = bookTextEditor.value
+  const selected = editor && editor.selectionStart !== editor.selectionEnd
+    ? bookChapterContent.value.slice(editor.selectionStart, editor.selectionEnd)
+    : ''
+  previewLoading.value = true
+  try {
+    previewAudio.value = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/tts-preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...bookTts, text: selected }),
+    })
+    selectedBookAudioId.value = null
+    await nextTick()
+    bookAudioEl.value?.load()
+    await bookAudioEl.value?.play()
+  } catch (error) {
+    setNotice(error.message || 'Не удалось создать пробу голоса.', 'error', 7000)
+  } finally {
+    previewLoading.value = false
+  }
+}
+
+function selectBookAudio(asset, autoplay = false) {
+  previewAudio.value = null
+  selectedBookAudioId.value = asset.id
+  bookPlayerTime.value = 0
+  bookPlayerDuration.value = Number(asset.duration || 0)
+  nextTick(async () => {
+    bookAudioEl.value?.load()
+    if (autoplay) {
+      try { await bookAudioEl.value?.play() } catch { /* browser may require another click */ }
+    }
+  })
+}
+
+function selectAdjacentChapterAudio(direction) {
+  const asset = direction < 0 ? previousChapterAudio.value : nextChapterAudio.value
+  if (asset) selectBookAudio(asset, true)
+}
+
+function toggleBookPlayer() {
+  const player = bookAudioEl.value
+  if (!player) return
+  if (player.paused) player.play().catch(() => setNotice('Не удалось воспроизвести аудиофайл.', 'error'))
+  else player.pause()
+}
+
+function stopBookPlayer() {
+  const player = bookAudioEl.value
+  if (player) {
+    player.pause()
+    player.currentTime = 0
+  }
+  bookPlayerPlaying.value = false
+  bookPlayerTime.value = 0
+}
+
+function seekBookPlayer(value) {
+  if (!bookAudioEl.value) return
+  bookAudioEl.value.currentTime = Math.max(0, Math.min(value, bookPlayerDuration.value || value))
+}
+
+function applyBookPlayerVolume() {
+  if (bookAudioEl.value) bookAudioEl.value.volume = bookPlayerVolume.value
+}
+
+function onBookAudioMetadata() {
+  const player = bookAudioEl.value
+  bookPlayerDuration.value = Number.isFinite(player?.duration) ? player.duration : Number(bookPlayerAsset.value?.duration || 0)
+  applyBookPlayerVolume()
+}
+
+function onBookAudioTime() {
+  bookPlayerTime.value = bookAudioEl.value?.currentTime || 0
+}
+
+async function refreshActiveProjectRecord() {
+  const record = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}`)
+  const chapterId = currentBookChapterId.value
+  activeProjectRecord.value = record
+  currentBookChapterId.value = chapterId
+  return record
+}
+
+async function activateBookAudio(asset) {
+  try {
+    await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/audio/${asset.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ is_active: true }),
+    })
+    await refreshActiveProjectRecord()
+    selectedBookAudioId.value = asset.id
+  } catch (error) {
+    setNotice(`Не удалось выбрать версию: ${error.message}`, 'error')
+  }
+}
+
+async function renameBookAudio(asset) {
+  const title = window.prompt('Название версии озвучки', asset.title || `Версия ${asset.version_number}`)
+  if (!title) return
+  try {
+    await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/audio/${asset.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    })
+    await refreshActiveProjectRecord()
+  } catch (error) {
+    setNotice(`Не удалось переименовать аудио: ${error.message}`, 'error')
+  }
+}
+
+async function openBookAudioFolder(asset) {
+  try {
+    await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/audio/${asset.id}/open-folder`, { method: 'POST' })
+  } catch (error) {
+    setNotice(`Не удалось открыть папку: ${error.message}`, 'error')
+  }
+}
+
+async function deleteBookAudio(asset) {
+  if (!window.confirm(`Удалить аудиоверсию «${asset.title || asset.file_path}»? Это действие удалит файл с диска.`)) return
+  try {
+    await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/audio/${asset.id}`, { method: 'DELETE' })
+    if (selectedBookAudioId.value === asset.id) selectedBookAudioId.value = null
+    await refreshActiveProjectRecord()
+  } catch (error) {
+    setNotice(`Не удалось удалить аудио: ${error.message}`, 'error')
+  }
+}
+
+async function sendBookAudioToVideo(asset) {
+  if (!asset.is_active) await activateBookAudio(asset)
+  await openBookInVideo()
+  const material = project.materials.find((item) => item.serverPath === asset.file_path)
+  if (material) {
+    project.audioAssetId = material.id
+    dirty.value = true
+    await saveProject({ silent: true })
+  }
+}
+
+async function openTtsLog() {
+  try {
+    await apiRequest('/tts/open-log', { method: 'POST' })
+  } catch (error) {
+    setNotice(error.message || 'Не удалось открыть технический лог.', 'error')
+  }
+}
+
+function chapterAudioState(chapter) {
+  const assets = (activeProjectRecord.value?.audio_assets || []).filter((asset) => asset.chapter_id === chapter.id)
+  if (!assets.length) return 'none'
+  return assets.some((asset) => !asset.is_stale) ? 'ready' : 'stale'
+}
+
+function chapterAudioStateLabel(chapter) {
+  return ({ none: 'Нет озвучки', ready: 'Озвучка готова', stale: 'Озвучка устарела' }[chapterAudioState(chapter)])
 }
 
 function chapterTitleForAudio(asset) {
@@ -1570,6 +2046,25 @@ async function createVideoEditionForActiveBook() {
   }
 }
 
+async function openBookInVideo() {
+  if (!(await saveCurrentChapter({ silent: true }))) return
+  if (!activeVideoEditionId.value) {
+    const shouldCreate = window.confirm('У книги ещё нет видеоверсии. Создать её сейчас?')
+    if (!shouldCreate) return
+    await createVideoEditionForActiveBook()
+    if (!activeVideoEditionId.value) return
+  }
+  addBookAudioToVideo(activeProjectRecord.value)
+  if (activeVideoEditionId.value) {
+    await publishVideoCompatibility(
+      activeProjectUuid.value,
+      activeVideoEditionId.value,
+      serializeProject(),
+    )
+  }
+  activeWorkspace.value = 'video'
+}
+
 async function backupActiveProject() {
   if (!activeProjectUuid.value) return
   try {
@@ -1587,6 +2082,8 @@ async function loadInitialProject() {
     const health = await apiRequest('/health')
     backend.online = !!health.ok
     backend.version = health.version || ''
+    backend.python = health.python || ''
+    Object.assign(ttsRuntime, health.tts || {})
   } catch {
     backend.online = false
   } finally {
@@ -1595,6 +2092,7 @@ async function loadInitialProject() {
 
   let restored = false
   if (backend.online) {
+    void loadTtsRuntime()
     loadingMessage.value = 'Загружаю библиотеку проектов…'
     try {
       const activeUuid = await loadProjectCatalog()
@@ -2609,6 +3107,15 @@ watch(() => videoSource.value, () => {
   nextTick(() => videoEl.value?.load())
 })
 
+watch(() => bookPlayerUrl.value, () => {
+  stopBookPlayer()
+  bookPlayerDuration.value = Number(bookPlayerAsset.value?.duration || 0)
+  nextTick(() => {
+    bookAudioEl.value?.load()
+    applyBookPlayerVolume()
+  })
+})
+
 watch([
   () => previousChapter.value?.id,
   () => previousChapter.value?.title,
@@ -2650,6 +3157,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeydown)
   window.removeEventListener('beforeunload', handleBeforeUnload)
+  stopBookPlayer()
   pauseAll()
   cancelAnimationFrame(visualFrame)
   clearInterval(renderPoll)
