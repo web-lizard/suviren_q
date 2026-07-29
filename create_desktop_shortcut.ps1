@@ -5,7 +5,7 @@ $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $launcherPath = Join-Path $projectRoot 'run.bat'
-$iconPath = Join-Path $projectRoot 'assets\book-wunderwaffe.ico'
+$iconPath = Join-Path $projectRoot 'assets\bookender-studio.ico'
 $desktopPath = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
 $shortcutPath = Join-Path $desktopPath 'BOOK WUNDERWAFFE Studio.lnk'
 

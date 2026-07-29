@@ -30,7 +30,8 @@ UI_ROOT = ROOT / "ui"
 UI_DIST = UI_ROOT / "dist"
 UI_INDEX = UI_DIST / "index.html"
 HOST = "127.0.0.1"
-APP_ICON = ROOT / "assets" / "book-wunderwaffe.ico"
+APP_ICON = ROOT / "assets" / "bookender-studio.ico"
+APP_ICON_PNG = ROOT / "assets" / "bookender-studio-icon.png"
 
 
 def hidden_process_options() -> dict[str, int]:
@@ -235,8 +236,10 @@ def run_desktop(*, window_smoke_test: bool = False) -> int:
     QApplication.setApplicationVersion(app_version)
     qt_app = QApplication.instance() or QApplication(sys.argv)
     qt_app.setQuitOnLastWindowClosed(True)
-    if APP_ICON.is_file():
-        qt_app.setWindowIcon(QIcon(str(APP_ICON)))
+    icon_path = APP_ICON if APP_ICON.is_file() else APP_ICON_PNG
+    app_icon = QIcon(str(icon_path)) if icon_path.is_file() else QIcon()
+    if not app_icon.isNull():
+        qt_app.setWindowIcon(app_icon)
 
     data_dir = Path(QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation))
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -279,8 +282,8 @@ def run_desktop(*, window_smoke_test: bool = False) -> int:
             self.setWindowTitle(f"{app_name} · {app_version}")
             self.resize(1600, 960)
             self.setMinimumSize(1120, 720)
-            if APP_ICON.is_file():
-                self.setWindowIcon(QIcon(str(APP_ICON)))
+            if not app_icon.isNull():
+                self.setWindowIcon(app_icon)
 
             self.view = QWebEngineView(self)
             profile = QWebEngineProfile.defaultProfile()
