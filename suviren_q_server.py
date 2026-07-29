@@ -24,6 +24,7 @@ import threading
 import time
 import uuid
 import wave
+import zipfile
 import struct
 import math
 from pathlib import Path
@@ -1200,6 +1201,191 @@ def project_http_error(exc: Exception) -> HTTPException:
     )
 
 
+def safe_book_export_name(value: Any, fallback: str) -> str:
+    name = re.sub(r'[\x00-\x1f<>:"/\\|?*]+', "_", str(value or ""))
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    return name[:100].rstrip(" .") or fallback
+
+
+def chapter_export_text(chapter: dict[str, Any], position: int) -> str:
+    title = str(chapter.get("title") or f"Глава {position}")
+    content = str(chapter.get("content") or "").strip()
+    return f"{title}\r\n{'=' * len(title)}\r\n\r\n{content}\r\n"
+
+
+def complete_book_export_text(project: dict[str, Any]) -> str:
+    book = project.get("book") or {}
+    title = str(book.get("title") or project.get("title") or "Книга")
+    author = str(book.get("author") or project.get("author") or "").strip()
+    description = str(
+        book.get("description") or project.get("description") or ""
+    ).strip()
+    sections = [title, "=" * len(title)]
+    if author:
+        sections.extend(["", f"Автор: {author}"])
+    if description:
+        sections.extend(["", description])
+    for position, chapter in enumerate(project.get("chapters") or [], 1):
+        chapter_title = chapter.get("title") or f"Глава {position}"
+        sections.extend(
+            [
+                "",
+                "",
+                f"Глава {position}. {chapter_title}",
+                "-" * 48,
+                "",
+                str(chapter.get("content") or "").strip(),
+            ]
+        )
+    return "\ufeff" + "\r\n".join(sections).rstrip() + "\r\n"
+
+
+def project_export_media_path(
+    project: dict[str, Any], relative_path: Any
+) -> Path | None:
+    if not relative_path:
+        return None
+    project_root = (USER_DATA / str(project["project_folder"])).resolve()
+    path = (USER_DATA / str(relative_path)).resolve()
+    if not is_within(path, project_root) or not path.is_file():
+        return None
+    return path
+
+
+def create_book_export(
+    project_uuid: str,
+    *,
+    mode: str,
+    chapter_id: int | None = None,
+    include_media: bool = True,
+) -> tuple[Path, str]:
+    project = PROJECT_REPOSITORY.get_project(project_uuid, include_details=True)
+    if not project.get("book"):
+        raise ValueError("У этого проекта нет текстовой книги.")
+    chapters = project.get("chapters") or []
+    if not chapters:
+        raise ValueError("В книге пока нет глав для экспорта.")
+
+    title = safe_book_export_name(
+        project["book"].get("title") or project.get("title"),
+        "Книга",
+    )
+    project_root = (USER_DATA / str(project["project_folder"])).resolve()
+    export_dir = (project_root / "exports").resolve()
+    if not is_within(export_dir, project_root):
+        raise ValueError("Некорректный каталог экспорта проекта.")
+    export_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+
+    if mode == "complete":
+        output = export_dir / f"{title} — вся книга — {stamp}.txt"
+        output.write_text(complete_book_export_text(project), encoding="utf-8")
+        return output, "text/plain; charset=utf-8"
+
+    if mode == "chapter":
+        chapter = next(
+            (item for item in chapters if int(item["id"]) == int(chapter_id or 0)),
+            None,
+        )
+        if chapter is None:
+            raise ValueError("Выбранная глава не найдена.")
+        position = chapters.index(chapter) + 1
+        chapter_name = safe_book_export_name(chapter.get("title"), f"Глава {position}")
+        output = export_dir / f"{position:03d} — {chapter_name} — {stamp}.txt"
+        output.write_text(
+            "\ufeff" + chapter_export_text(chapter, position),
+            encoding="utf-8",
+        )
+        return output, "text/plain; charset=utf-8"
+
+    if mode != "chapters":
+        raise ValueError("Неизвестный режим экспорта книги.")
+
+    output = export_dir / f"{title} — по главам — {stamp}.zip"
+    active_audio: dict[int, dict[str, Any]] = {}
+    for asset in project.get("audio_assets") or []:
+        chapter_key = int(asset.get("chapter_id") or 0)
+        current = active_audio.get(chapter_key)
+        rank = (
+            int(bool(asset.get("is_active"))),
+            int(asset.get("version_number") or 0),
+            int(asset.get("id") or 0),
+        )
+        current_rank = (
+            int(bool(current and current.get("is_active"))),
+            int((current or {}).get("version_number") or 0),
+            int((current or {}).get("id") or 0),
+        )
+        if chapter_key and (current is None or rank > current_rank):
+            active_audio[chapter_key] = asset
+
+    chapter_images: dict[int, dict[str, Any]] = {}
+    for asset in project.get("visual_assets") or []:
+        chapter_key = int(asset.get("chapter_id") or 0)
+        if asset.get("asset_type") != "chapter-image" or not chapter_key:
+            continue
+        current = chapter_images.get(chapter_key)
+        if current is None or int(asset["id"]) > int(current["id"]):
+            chapter_images[chapter_key] = asset
+
+    manifest_chapters = []
+    with zipfile.ZipFile(
+        output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+    ) as archive:
+        archive.writestr(
+            "00 - О книге.txt",
+            complete_book_export_text({**project, "chapters": []}).encode("utf-8"),
+        )
+        for position, chapter in enumerate(chapters, 1):
+            chapter_name = safe_book_export_name(
+                chapter.get("title"), f"Глава {position}"
+            )
+            folder = f"{position:03d} - {chapter_name}"
+            archive.writestr(
+                f"{folder}/{position:03d} - {chapter_name}.txt",
+                ("\ufeff" + chapter_export_text(chapter, position)).encode("utf-8"),
+            )
+            manifest_item: dict[str, Any] = {
+                "position": position,
+                "chapter_id": int(chapter["id"]),
+                "title": chapter.get("title") or f"Глава {position}",
+            }
+            if include_media:
+                audio = active_audio.get(int(chapter["id"]))
+                audio_path = project_export_media_path(
+                    project, audio.get("file_path") if audio else None
+                )
+                if audio_path:
+                    audio_name = f"Озвучка{audio_path.suffix.lower()}"
+                    archive.write(audio_path, f"{folder}/{audio_name}")
+                    manifest_item["audio"] = f"{folder}/{audio_name}"
+                image = chapter_images.get(int(chapter["id"]))
+                image_path = project_export_media_path(
+                    project, image.get("file_path") if image else None
+                )
+                if image_path:
+                    image_name = f"Изображение{image_path.suffix.lower()}"
+                    archive.write(image_path, f"{folder}/{image_name}")
+                    manifest_item["image"] = f"{folder}/{image_name}"
+            manifest_chapters.append(manifest_item)
+        archive.writestr(
+            "manifest.json",
+            json.dumps(
+                {
+                    "project_uuid": project_uuid,
+                    "title": project["book"].get("title") or project.get("title"),
+                    "author": project["book"].get("author") or project.get("author"),
+                    "chapter_count": len(chapters),
+                    "includes_media": include_media,
+                    "chapters": manifest_chapters,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8"),
+        )
+    return output, "application/zip"
+
+
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return {
@@ -1305,6 +1491,29 @@ def backup_bookender_project(project_uuid: str) -> dict[str, Any]:
     try:
         destination = PROJECT_REPOSITORY.backup_project(project_uuid)
         return {"ok": True, "path": str(destination)}
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.get("/api/projects/{project_uuid}/book-export")
+def export_bookender_project(
+    project_uuid: str,
+    mode: str = Query("complete"),
+    chapter_id: int | None = Query(None),
+    include_media: bool = Query(True),
+):
+    try:
+        output, media_type = create_book_export(
+            project_uuid,
+            mode=mode,
+            chapter_id=chapter_id,
+            include_media=include_media,
+        )
+        return FileResponse(
+            str(output),
+            media_type=media_type,
+            filename=output.name,
+        )
     except Exception as exc:
         raise project_http_error(exc) from exc
 

@@ -57,6 +57,10 @@
         <button class="action-button" type="button" :disabled="!activeProjectUuid" @click="backupActiveProject">
           <span aria-hidden="true">◫</span><b>Резервная копия</b>
         </button>
+        <button class="book-export-button" type="button" :disabled="!activeProjectRecord?.book"
+                @click="openBookExport">
+          <span aria-hidden="true">⇩</span><b>Экспорт книги</b>
+        </button>
         <button class="export-button" type="button" :disabled="!activeProjectRecord?.book" @click="openBookInVideo">
           <span aria-hidden="true">→</span><b>В видеокнигу</b>
         </button>
@@ -574,7 +578,10 @@
 
             <details>
               <summary>Экспорт</summary>
-              <button class="book-primary" type="button" @click="openBookInVideo">Передать книгу в видеоредактор</button>
+              <div class="book-inspector-export">
+                <button class="book-primary" type="button" @click="openBookExport">⇩ Скачать книгу</button>
+                <button class="book-secondary" type="button" @click="openBookInVideo">Передать в видеоредактор</button>
+              </div>
             </details>
             <details>
               <summary>Техническое</summary>
@@ -716,6 +723,49 @@
           <button v-if="renderJob.status === 'failed'" type="button" class="modal-primary" @click="renderJob = null">Вернуться к настройкам</button>
           <pre v-if="renderJob.status === 'failed' && renderJob.log?.length" class="render-error">{{ renderJob.log.slice(-4).join('\n') }}</pre>
         </template>
+      </section>
+    </div>
+
+    <div v-if="showBookExport" class="modal-backdrop" @mousedown.self="showBookExport = false">
+      <section class="book-export-modal" role="dialog" aria-modal="true" aria-labelledby="book-export-title">
+        <header>
+          <div>
+            <span class="eyebrow">Текст и материалы</span>
+            <h2 id="book-export-title">Экспорт книги</h2>
+            <p>{{ activeProjectRecord?.book?.title }} · {{ activeProjectRecord?.chapters?.length || 0 }} глав</p>
+          </div>
+          <button type="button" @click="showBookExport = false" aria-label="Закрыть">×</button>
+        </header>
+
+        <div class="book-export-choices">
+          <button type="button" :disabled="bookExportBusy" @click="downloadBookExport('complete')">
+            <span class="book-export-choice-icon">▤</span>
+            <span><b>Вся книга</b><small>Один аккуратно собранный TXT-файл</small></span>
+            <i>TXT</i>
+          </button>
+          <button type="button" :disabled="bookExportBusy || !currentBookChapter" @click="downloadBookExport('chapter')">
+            <span class="book-export-choice-icon">¶</span>
+            <span><b>Текущая глава</b><small>{{ currentBookChapter?.title || 'Глава не выбрана' }}</small></span>
+            <i>TXT</i>
+          </button>
+          <button class="featured" type="button" :disabled="bookExportBusy" @click="downloadBookExport('chapters')">
+            <span class="book-export-choice-icon">▦</span>
+            <span><b>Книга по главам</b><small>Каждая глава — отдельная папка и TXT</small></span>
+            <i>ZIP</i>
+          </button>
+        </div>
+
+        <label class="switch-row book-export-media-switch">
+          <span>
+            <b>Добавить материалы глав</b>
+            <small>Активная озвучка и изображение попадут в поглавный ZIP</small>
+          </span>
+          <input v-model="bookExportIncludeMedia" type="checkbox" /><i></i>
+        </label>
+        <footer>
+          <span>Файлы сохраняются также в папке <b>exports</b> текущего проекта.</span>
+          <i v-if="bookExportBusy">Собираю экспорт…</i>
+        </footer>
       </section>
     </div>
 
@@ -913,6 +963,9 @@ const waveformSamples = ref([])
 const timelineZoom = ref(1)
 
 const showExport = ref(false)
+const showBookExport = ref(false)
+const bookExportBusy = ref(false)
+const bookExportIncludeMedia = ref(true)
 const exportTest = ref(true)
 const exportReadiness = ref(null)
 const startingExport = ref(false)
@@ -3334,6 +3387,70 @@ async function openExport() {
         }
       }
     } catch { /* client checks remain visible */ }
+  }
+}
+
+function openBookExport() {
+  if (!activeProjectRecord.value?.book) return
+  showBookExport.value = true
+}
+
+function responseDownloadName(response, fallback) {
+  const disposition = response.headers.get('content-disposition') || ''
+  const encoded = disposition.match(/filename\*=utf-8''([^;]+)/i)?.[1]
+  if (encoded) {
+    try { return decodeURIComponent(encoded) } catch { /* use plain fallback */ }
+  }
+  return disposition.match(/filename="?([^";]+)"?/i)?.[1] || fallback
+}
+
+async function downloadBookExport(mode) {
+  if (!activeProjectUuid.value || bookExportBusy.value) return
+  if (!(await saveCurrentChapter({ silent: true }))) {
+    setNotice('Сначала нужно сохранить текущую главу', 'error')
+    return
+  }
+  bookExportBusy.value = true
+  try {
+    const params = new URLSearchParams({
+      mode,
+      include_media: String(bookExportIncludeMedia.value),
+    })
+    if (mode === 'chapter' && currentBookChapterId.value) {
+      params.set('chapter_id', String(currentBookChapterId.value))
+    }
+    const response = await fetch(
+      `${API}/projects/${encodeURIComponent(activeProjectUuid.value)}/book-export?${params}`,
+    )
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}))
+      throw new Error(
+        typeof payload.detail === 'string'
+          ? payload.detail
+          : 'Сервер не смог собрать файл книги',
+      )
+    }
+    const extension = mode === 'chapters' ? 'zip' : 'txt'
+    const blob = await response.blob()
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = responseDownloadName(response, `Книга.${extension}`)
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 1500)
+    setNotice(
+      mode === 'chapters'
+        ? 'Поглавный архив книги готов'
+        : 'Текст книги экспортирован',
+      'success',
+      5500,
+    )
+  } catch (error) {
+    setNotice(`Не удалось экспортировать книгу: ${error.message}`, 'error', 7500)
+  } finally {
+    bookExportBusy.value = false
   }
 }
 

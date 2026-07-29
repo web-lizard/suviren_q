@@ -17,3 +17,11 @@ test('chapter images and optional reading captions reach the video workspace', (
   assert.match(source, /project\.captions\.enabled/)
   assert.match(source, /currentReadingCaption/)
 })
+
+test('book export is visible and supports whole, current, and chapter bundle modes', () => {
+  assert.match(source, />Экспорт книги</)
+  assert.match(source, /downloadBookExport\('complete'\)/)
+  assert.match(source, /downloadBookExport\('chapter'\)/)
+  assert.match(source, /downloadBookExport\('chapters'\)/)
+  assert.match(source, /bookExportIncludeMedia/)
+})
