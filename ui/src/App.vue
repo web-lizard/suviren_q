@@ -844,6 +844,8 @@ const bookPlayerPlaying = ref(false)
 const bookPlayerVolume = ref(0.86)
 let bookAutosaveTimer = null
 let ttsPollTimer = null
+let bookPlayerLoadToken = 0
+let bookPlayerShouldAutoplay = false
 
 const loading = ref(true)
 const loadingMessage = ref('Подключаю медиадвижок…')
@@ -1866,15 +1868,14 @@ async function previewBookVoice() {
     : ''
   previewLoading.value = true
   try {
-    previewAudio.value = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/tts-preview`, {
+    const preview = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/tts-preview`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...bookTts, text: selected }),
     })
+    bookPlayerShouldAutoplay = true
+    previewAudio.value = preview
     selectedBookAudioId.value = null
-    await nextTick()
-    bookAudioEl.value?.load()
-    await bookAudioEl.value?.play()
   } catch (error) {
     setNotice(error.message || 'Не удалось создать пробу голоса.', 'error', 7000)
   } finally {
@@ -1883,16 +1884,16 @@ async function previewBookVoice() {
 }
 
 function selectBookAudio(asset, autoplay = false) {
+  const previousUrl = bookPlayerUrl.value
+  bookPlayerShouldAutoplay = autoplay
   previewAudio.value = null
   selectedBookAudioId.value = asset.id
   bookPlayerTime.value = 0
   bookPlayerDuration.value = Number(asset.duration || 0)
-  nextTick(async () => {
-    bookAudioEl.value?.load()
-    if (autoplay) {
-      try { await bookAudioEl.value?.play() } catch { /* browser may require another click */ }
-    }
-  })
+  if (bookPlayerUrl.value === previousUrl) {
+    bookPlayerShouldAutoplay = false
+    void reloadBookPlayer(autoplay)
+  }
 }
 
 function selectAdjacentChapterAudio(direction) {
@@ -1908,6 +1909,7 @@ function toggleBookPlayer() {
 }
 
 function stopBookPlayer() {
+  bookPlayerLoadToken += 1
   const player = bookAudioEl.value
   if (player) {
     player.pause()
@@ -1915,6 +1917,50 @@ function stopBookPlayer() {
   }
   bookPlayerPlaying.value = false
   bookPlayerTime.value = 0
+}
+
+async function reloadBookPlayer(autoplay = false) {
+  const token = ++bookPlayerLoadToken
+  await nextTick()
+  const player = bookAudioEl.value
+  if (!player || !bookPlayerUrl.value || token !== bookPlayerLoadToken) return
+  player.pause()
+  player.currentTime = 0
+  bookPlayerPlaying.value = false
+  bookPlayerTime.value = 0
+  bookPlayerDuration.value = Number(bookPlayerAsset.value?.duration || 0)
+  applyBookPlayerVolume()
+  if (!autoplay) return
+  const ready = await waitForBookPlayerReady(player)
+  if (token !== bookPlayerLoadToken) return
+  if (!ready) {
+    setNotice('Аудиофайл создан, но плеер не смог его загрузить. Нажмите ▶ или создайте пробу ещё раз.', 'error', 7000)
+    return
+  }
+  try {
+    await player.play()
+  } catch (error) {
+    if (token !== bookPlayerLoadToken) return
+    setNotice('Аудиофайл создан, но браузер не разрешил автозапуск. Нажмите ▶ в плеере.', 'error', 7000)
+  }
+}
+
+function waitForBookPlayerReady(player) {
+  if (player.readyState >= 3) return Promise.resolve(true)
+  return new Promise((resolve) => {
+    let timeoutId = null
+    const finish = (ready) => {
+      player.removeEventListener('canplay', onReady)
+      player.removeEventListener('error', onError)
+      if (timeoutId !== null) window.clearTimeout(timeoutId)
+      resolve(ready)
+    }
+    const onReady = () => finish(true)
+    const onError = () => finish(false)
+    player.addEventListener('canplay', onReady, { once: true })
+    player.addEventListener('error', onError, { once: true })
+    timeoutId = window.setTimeout(() => finish(player.readyState >= 2), 8000)
+  })
 }
 
 function seekBookPlayer(value) {
@@ -3108,13 +3154,10 @@ watch(() => videoSource.value, () => {
 })
 
 watch(() => bookPlayerUrl.value, () => {
-  stopBookPlayer()
-  bookPlayerDuration.value = Number(bookPlayerAsset.value?.duration || 0)
-  nextTick(() => {
-    bookAudioEl.value?.load()
-    applyBookPlayerVolume()
-  })
-})
+  const autoplay = bookPlayerShouldAutoplay
+  bookPlayerShouldAutoplay = false
+  void reloadBookPlayer(autoplay)
+}, { flush: 'sync' })
 
 watch([
   () => previousChapter.value?.id,
