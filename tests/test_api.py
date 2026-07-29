@@ -85,6 +85,25 @@ class ProjectApiTests(unittest.TestCase):
         )
         self.assertEqual(listing["active_project_uuid"], project["uuid"])
 
+    def test_render_command_includes_selected_music(self) -> None:
+        server.EDITOR_PROJECT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        server.EDITOR_PROJECT_PATH.write_text("{}", encoding="utf-8")
+        inputs = {
+            "audio": Path("voice.mp3"),
+            "music": Path("music.flac"),
+            "cover": Path("cover.png"),
+            "background": None,
+            "chapters": server.CHAPTERS_PATH,
+        }
+        with (
+            patch.object(server, "BUILD_DIR", self.user_data / "render"),
+            patch.object(server, "get_export_inputs", return_value=inputs),
+            patch.object(server, "load_editor_project", return_value={"theme": "violet"}),
+        ):
+            command = server.build_render_cmd(test_mode=True)
+        self.assertIn("--music", command)
+        self.assertEqual(command[command.index("--music") + 1], "music.flac")
+
 
 if __name__ == "__main__":
     unittest.main()

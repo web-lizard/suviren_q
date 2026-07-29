@@ -91,6 +91,9 @@
 
       <input ref="assetInput" class="visually-hidden" type="file" multiple
              accept="audio/*,video/*,image/png,image/jpeg,image/webp,image/gif" @change="onAssetInput" />
+      <input ref="musicInput" class="visually-hidden" type="file"
+             accept="audio/mpeg,audio/wav,audio/mp4,audio/aac,audio/flac,audio/ogg,audio/opus"
+             @change="onMusicInput" />
       <input ref="projectInput" class="visually-hidden" type="file" accept="application/json,.json" @change="onProjectInput" />
       <input ref="bookChapterImageInput" class="visually-hidden" type="file"
              accept="image/png,image/jpeg,image/webp,image/bmp,image/gif"
@@ -256,6 +259,9 @@
                  @loadedmetadata="onMediaMetadata('audio')" @timeupdate="onMediaTime('audio')"
                  @play="onMediaPlay('audio')" @pause="onMediaPause('audio')"
                  @ended="onMediaEnded('audio')" @error="onMediaError('audio')"></audio>
+          <audio ref="musicEl" :src="musicSource" crossorigin="anonymous" preload="metadata"
+                 :loop="project.music.loop" @loadedmetadata="onMusicMetadata"
+                 @error="onMusicError"></audio>
         </div>
       </section>
 
@@ -300,6 +306,42 @@
               </label>
             </div>
 
+            <div class="inspector-section music-mixer">
+              <div class="mixer-heading">
+                <span class="section-title">Музыка</span>
+                <button type="button" @click="musicInput?.click()">＋ Добавить</button>
+              </div>
+              <label class="field-label">Музыкальная дорожка
+                <select v-model="project.musicAssetId" @change="onMusicSelectionChanged">
+                  <option :value="null">Без музыки</option>
+                  <option v-for="asset in musicCandidates" :key="asset.id" :value="asset.id">{{ asset.name }}</option>
+                </select>
+              </label>
+              <template v-if="musicAsset">
+                <label class="switch-row">
+                  <span><b>Музыка включена</b><small>Смешивать с озвучкой в MP4</small></span>
+                  <input v-model="project.music.enabled" type="checkbox" @change="applyMusicMix" /><i></i>
+                </label>
+                <label class="switch-row">
+                  <span><b>Повторять по кругу</b><small>На всю длину книги</small></span>
+                  <input v-model="project.music.loop" type="checkbox" /><i></i>
+                </label>
+                <label class="mixer-slider">
+                  <span><b>Громкость</b><output>{{ Math.round(project.music.volume * 100) }}%</output></span>
+                  <input v-model.number="project.music.volume" type="range" min="0" max="1" step="0.01" @input="applyMusicMix" />
+                </label>
+                <div class="simple-eq">
+                  <span class="section-title">Простой эквалайзер</span>
+                  <label v-for="band in MUSIC_EQ_BANDS" :key="band.key">
+                    <span><b>{{ band.label }}</b><output>{{ formatDb(project.music[band.key]) }}</output></span>
+                    <input v-model.number="project.music[band.key]" type="range" min="-12" max="12" step="1" @input="applyMusicMix" />
+                  </label>
+                </div>
+                <button type="button" class="jump-button" @click="resetMusicMix">Сбросить звук музыки</button>
+              </template>
+              <p v-else class="mixer-empty">Добавьте MP3, WAV, M4A, FLAC, OGG или OPUS. Музыка появится отдельной дорожкой на таймлайне.</p>
+            </div>
+
             <div class="project-readiness">
               <span class="section-title">Готовность</span>
               <div><i :class="{ done: !!audioAsset }"></i><span>Аудио</span><b>{{ audioAsset ? 'готово' : 'нужно' }}</b></div>
@@ -322,7 +364,8 @@
               <button type="button" :class="{ active: project.backgroundAssetId === selectedAsset.id }" @click="assignAsset('background', selectedAsset.id)">Как фон</button>
             </div>
             <div class="role-actions" v-else-if="selectedAsset.type === 'audio'">
-              <button type="button" class="wide" :class="{ active: project.audioAssetId === selectedAsset.id }" @click="assignAsset('audio', selectedAsset.id)">Основная аудиокнига</button>
+              <button type="button" :class="{ active: project.audioAssetId === selectedAsset.id }" @click="assignAsset('audio', selectedAsset.id)">Основная озвучка</button>
+              <button type="button" :class="{ active: project.musicAssetId === selectedAsset.id }" @click="assignAsset('music', selectedAsset.id)">Музыка</button>
             </div>
             <div class="role-actions" v-else-if="selectedAsset.type === 'video'">
               <button type="button" class="wide" :class="{ active: project.videoAssetId === selectedAsset.id }" @click="assignAsset('video', selectedAsset.id)">Видео сцены</button>
@@ -687,6 +730,7 @@
           <div><span class="track-icon scene"></span>Сцены</div>
           <div><span class="track-icon visual"></span>Видео / фон</div>
           <div><span class="track-icon audio"></span>Аудио</div>
+          <div><span class="track-icon music"></span>Музыка</div>
         </div>
         <div class="timeline-content" :style="{ width: `${timelineZoom * 100}%` }">
           <div class="timeline-ruler">
@@ -736,6 +780,17 @@
             </button>
           </div>
 
+          <div class="timeline-lane music-lane" @pointerdown.self="seekFromTimeline">
+            <button v-if="musicAsset" type="button" class="music-clip"
+                    :class="{ muted: !project.music.enabled }"
+                    :style="clipStyle(0, duration, 100)"
+                    @click.stop="select('asset', musicAsset.id)">
+              <span aria-hidden="true">♫</span>
+              <b>{{ musicAsset.name }}</b>
+              <small>{{ project.music.enabled ? `${Math.round(project.music.volume * 100)}% · EQ ${musicEqSummary}` : 'выключена' }}</small>
+            </button>
+          </div>
+
           <div class="timeline-playhead" :style="{ left: `${progressPercent}%` }"><i></i><span></span></div>
         </div>
       </div>
@@ -769,6 +824,7 @@
             <div><span>Длительность</span><b>{{ formatTime(duration, true) }}</b></div>
             <div><span>Оценка полного файла</span><b>≈ {{ estimatedFullRenderSize }}</b></div>
             <div><span>Главы</span><b>{{ project.chapters.length }}</b></div>
+            <div><span>Музыка</span><b>{{ musicAsset && project.music.enabled ? `${musicAsset.name} · ${Math.round(project.music.volume * 100)}%` : 'нет' }}</b></div>
           </div>
           <label class="switch-row export-test-switch">
             <span><b>Тестовый фрагмент</b><small>Первые 60 секунд — быстрее проверить оформление</small></span>
@@ -928,6 +984,19 @@ const VOLUME_PRESETS = Object.freeze([
   { label: 'Обычно', value: '+0%' },
   { label: 'Громче', value: '+20%' },
 ])
+const MUSIC_EQ_BANDS = Object.freeze([
+  { key: 'bass', label: 'НЧ' },
+  { key: 'mid', label: 'СЧ' },
+  { key: 'treble', label: 'ВЧ' },
+])
+const DEFAULT_MUSIC_MIX = Object.freeze({
+  enabled: true,
+  loop: true,
+  volume: 0.16,
+  bass: 0,
+  mid: 0,
+  treble: 0,
+})
 
 const DEFAULT_LAYERS = {
   cover: { visible: true, x: 7, y: 17, w: 27, h: 66 },
@@ -954,10 +1023,12 @@ function freshProject() {
     glitch: true,
     renderPreset: 'balanced',
     audioAssetId: null,
+    musicAssetId: null,
     videoAssetId: null,
     coverAssetId: null,
     backgroundAssetId: null,
     captions: { enabled: false, wordsPerCard: 14 },
+    music: clone(DEFAULT_MUSIC_MIX),
     materials: [],
     chapters: [],
     scenes: [{ id: uid('scene'), name: 'Основная сцена', start: 0, end: 60, backgroundAssetId: null }],
@@ -1019,11 +1090,13 @@ const saving = ref(false)
 const videoPreparing = ref(false)
 const hydrating = ref(true)
 const assetInput = ref(null)
+const musicInput = ref(null)
 const projectInput = ref(null)
 const bookChapterImageInput = ref(null)
 const bookTextEditor = ref(null)
 const bookAudioEl = ref(null)
 const audioEl = ref(null)
+const musicEl = ref(null)
 const videoEl = ref(null)
 const sceneEl = ref(null)
 const visualizerCanvas = ref(null)
@@ -1063,16 +1136,28 @@ let visualizerFrequencyData = null
 let visualizerConnectPending = null
 let visualizerLastConnectAttempt = 0
 let visualizerGeneration = 0
+let musicAudioContext = null
+let musicMediaSource = null
+let musicLowFilter = null
+let musicMidFilter = null
+let musicHighFilter = null
+let musicGain = null
 const visualizerLevels = new Float32Array(72)
 const visualizerPeaks = new Float32Array(72)
 const objectUrls = new Set()
 
 const assetById = (id) => project.materials.find((item) => item.id === id) || null
 const audioAsset = computed(() => assetById(project.audioAssetId))
+const musicAsset = computed(() => assetById(project.musicAssetId))
 const videoAsset = computed(() => assetById(project.videoAssetId))
 const coverAsset = computed(() => assetById(project.coverAssetId))
 const backgroundAsset = computed(() => assetById(project.backgroundAssetId))
 const imageAssets = computed(() => project.materials.filter((item) => item.type === 'image'))
+const musicCandidates = computed(() => project.materials.filter((item) => (
+  item.type === 'audio'
+  && item.id !== project.audioAssetId
+  && !['chapter-audio', 'book-master'].includes(item.role)
+)))
 const videoAudioChapters = computed(() => (
   project.chapters.filter((chapter) => chapter.audioAssetId && assetById(chapter.audioAssetId))
 ))
@@ -1213,6 +1298,7 @@ const ttsProgressState = computed(() => {
   }
 })
 const audioSource = computed(() => assetUrl(audioAsset.value))
+const musicSource = computed(() => assetUrl(musicAsset.value))
 const videoSource = computed(() => assetUrl(videoAsset.value))
 const coverSource = computed(() => assetUrl(coverAsset.value))
 
@@ -1237,6 +1323,10 @@ const estimatedPeakRenderBytes = computed(() => {
   return Math.ceil((videoBytes * 3 + audioBytes + 128 * 1024 ** 2) * 1.08)
 })
 const progressPercent = computed(() => duration.value ? Math.min(100, Math.max(0, currentTime.value / duration.value * 100)) : 0)
+const musicEqSummary = computed(() => {
+  const values = MUSIC_EQ_BANDS.map((band) => Number(project.music?.[band.key]) || 0)
+  return values.every((value) => value === 0) ? 'ровно' : values.map((value) => `${value > 0 ? '+' : ''}${value}`).join('/')
+})
 
 const timelineChapters = computed(() => {
   const sorted = [...project.chapters].sort((a, b) => a.start_seconds - b.start_seconds)
@@ -1387,6 +1477,7 @@ function materialLabel(type) {
 function materialRole(asset) {
   const roles = []
   if (project.audioAssetId === asset.id) roles.push('Основное аудио')
+  if (project.musicAssetId === asset.id) roles.push('Музыка')
   if (project.videoAssetId === asset.id) roles.push('Видео сцены')
   if (project.coverAssetId === asset.id) roles.push('Обложка')
   if (project.backgroundAssetId === asset.id) roles.push('Фон')
@@ -1410,6 +1501,11 @@ function formatBytes(bytes) {
   if (size >= 1024 ** 3) return `${(size / 1024 ** 3).toFixed(1)} ГБ`
   if (size >= 1024 ** 2) return `${(size / 1024 ** 2).toFixed(1)} МБ`
   return `${Math.max(1, Math.round(size / 1024))} КБ`
+}
+
+function formatDb(value) {
+  const amount = Number(value) || 0
+  return `${amount > 0 ? '+' : ''}${amount} дБ`
 }
 
 function mediaUrl(path) {
@@ -1458,6 +1554,7 @@ function normalizeProject(value) {
     ...base,
     ...source,
     captions: { ...base.captions, ...(source.captions || {}) },
+    music: { ...base.music, ...(source.music || {}) },
     renderPreset: RENDER_PRESETS[source.renderPreset] ? source.renderPreset : base.renderPreset,
     materials: Array.isArray(source.materials) ? source.materials.map((asset) => ({
       ...asset,
@@ -1495,6 +1592,7 @@ function replaceProject(value) {
   currentTime.value = 0
   nextTick(() => {
     audioEl.value?.load()
+    musicEl.value?.load()
     videoEl.value?.load()
     hydrating.value = false
   })
@@ -2817,6 +2915,11 @@ function onAssetInput(event) {
   event.target.value = ''
 }
 
+function onMusicInput(event) {
+  importFiles(event.target.files, { asMusic: true })
+  event.target.value = ''
+}
+
 async function onBookChapterImageInput(event) {
   const file = event.target.files?.[0]
   event.target.value = ''
@@ -2873,12 +2976,16 @@ function onDrop(event) {
   importFiles(event.dataTransfer?.files)
 }
 
-function importFiles(fileList) {
+function importFiles(fileList, { asMusic = false } = {}) {
   const files = [...(fileList || [])]
   if (!files.length) return
   let accepted = 0
   for (const file of files) {
     const type = materialType(file.name, file.type)
+    if (asMusic && type !== 'audio') {
+      setNotice(`Для музыкальной дорожки нужен аудиофайл: «${file.name}»`, 'error', 6000)
+      continue
+    }
     if (!type) {
       setNotice(`Формат «${file.name}» не поддерживается`, 'error', 6000)
       continue
@@ -2888,9 +2995,15 @@ function importFiles(fileList) {
     const asset = {
       id: uid('asset'), type, name: file.name, size: file.size, mime: file.type,
       file, src, serverPath: '', status: backend.online ? 'uploading' : 'local', progress: 0,
+      role: asMusic ? 'music' : undefined,
     }
     project.materials.push(asset)
-    assignImportedAsset(asset)
+    if (asMusic) {
+      project.musicAssetId = asset.id
+      project.music.enabled = true
+    } else {
+      assignImportedAsset(asset)
+    }
     accepted += 1
     if (backend.online) uploadAsset(asset)
   }
@@ -2899,7 +3012,9 @@ function importFiles(fileList) {
     setNotice(`Добавлено файлов: ${accepted}`, 'success')
     nextTick(() => {
       audioEl.value?.load()
+      musicEl.value?.load()
       videoEl.value?.load()
+      applyMusicMix()
     })
   }
 }
@@ -2939,15 +3054,32 @@ function uploadAsset(asset) {
     asset.progress = 1
     dirty.value = true
     if (asset.type === 'audio' && project.audioAssetId === asset.id) await refreshWaveform()
+    if (asset.type === 'audio' && project.musicAssetId === asset.id) {
+      nextTick(() => {
+        musicEl.value?.load()
+        applyMusicMix()
+      })
+    }
   }
   xhr.send(asset.file)
 }
 
 function assignAsset(role, id) {
+  if (role === 'music' && project.audioAssetId === id) project.audioAssetId = null
+  if (role === 'audio' && project.musicAssetId === id) project.musicAssetId = null
   project[`${role}AssetId`] = id
+  if (role === 'music') {
+    const asset = assetById(id)
+    if (asset) asset.role = 'music'
+    project.music.enabled = true
+  }
   dirty.value = true
   nextTick(() => {
     if (role === 'audio') { audioEl.value?.load(); refreshWaveform() }
+    if (role === 'music') {
+      musicEl.value?.load()
+      applyMusicMix()
+    }
     if (role === 'video') videoEl.value?.load()
   })
 }
@@ -2955,8 +3087,8 @@ function assignAsset(role, id) {
 function removeAsset(id) {
   const asset = assetById(id)
   if (!asset) return
-  if (project.audioAssetId === id || project.videoAssetId === id) pauseAll()
-  for (const key of ['audioAssetId', 'videoAssetId', 'coverAssetId', 'backgroundAssetId']) {
+  if (project.audioAssetId === id || project.musicAssetId === id || project.videoAssetId === id) pauseAll()
+  for (const key of ['audioAssetId', 'musicAssetId', 'videoAssetId', 'coverAssetId', 'backgroundAssetId']) {
     if (project[key] === id) project[key] = null
   }
   for (const scene of project.scenes) if (scene.backgroundAssetId === id) scene.backgroundAssetId = null
@@ -3226,6 +3358,102 @@ function secondaryElement() {
   return masterKind.value === 'audio' && videoSource.value ? videoEl.value : null
 }
 
+function musicTimeAt(absoluteTime) {
+  const music = musicEl.value
+  const musicDuration = Number(music?.duration)
+  if (!Number.isFinite(musicDuration) || musicDuration <= 0) return Math.max(0, absoluteTime)
+  if (project.music.loop) return Math.max(0, absoluteTime) % musicDuration
+  return Math.min(Math.max(0, absoluteTime), Math.max(0, musicDuration - 0.02))
+}
+
+async function ensureMusicGraph() {
+  const element = musicEl.value
+  const AudioContextClass = globalThis.AudioContext || globalThis.webkitAudioContext
+  if (!element || !AudioContextClass) return false
+  try {
+    if (!musicAudioContext || musicAudioContext.state === 'closed') {
+      musicAudioContext = new AudioContextClass()
+    }
+    if (!musicMediaSource) {
+      musicMediaSource = musicAudioContext.createMediaElementSource(element)
+      musicLowFilter = musicAudioContext.createBiquadFilter()
+      musicLowFilter.type = 'lowshelf'
+      musicLowFilter.frequency.value = 120
+      musicMidFilter = musicAudioContext.createBiquadFilter()
+      musicMidFilter.type = 'peaking'
+      musicMidFilter.frequency.value = 1100
+      musicMidFilter.Q.value = 0.85
+      musicHighFilter = musicAudioContext.createBiquadFilter()
+      musicHighFilter.type = 'highshelf'
+      musicHighFilter.frequency.value = 7000
+      musicGain = musicAudioContext.createGain()
+      musicMediaSource
+        .connect(musicLowFilter)
+        .connect(musicMidFilter)
+        .connect(musicHighFilter)
+        .connect(musicGain)
+        .connect(musicAudioContext.destination)
+    }
+    if (musicAudioContext.state === 'suspended') await musicAudioContext.resume()
+    return true
+  } catch {
+    return false
+  }
+}
+
+function applyMusicMix() {
+  const element = musicEl.value
+  const enabled = !!project.music.enabled && !!musicSource.value
+  const level = enabled ? Math.max(0, Math.min(1, Number(project.music.volume) || 0)) : 0
+  const now = musicAudioContext?.currentTime || 0
+  if (musicLowFilter) musicLowFilter.gain.setTargetAtTime(Math.max(-12, Math.min(12, Number(project.music.bass) || 0)), now, 0.015)
+  if (musicMidFilter) musicMidFilter.gain.setTargetAtTime(Math.max(-12, Math.min(12, Number(project.music.mid) || 0)), now, 0.015)
+  if (musicHighFilter) musicHighFilter.gain.setTargetAtTime(Math.max(-12, Math.min(12, Number(project.music.treble) || 0)), now, 0.015)
+  if (musicGain) musicGain.gain.setTargetAtTime(level, now, 0.015)
+  if (element) {
+    element.volume = musicGain ? 1 : level
+    element.loop = !!project.music.loop
+    if (!enabled) element.pause()
+  }
+}
+
+async function startMusicPreview(absoluteTime) {
+  const element = musicEl.value
+  if (!element || !musicSource.value || !project.music.enabled) return
+  const target = musicTimeAt(absoluteTime)
+  if (Math.abs((element.currentTime || 0) - target) > 0.08) {
+    try { element.currentTime = target } catch { /* metadata not ready */ }
+  }
+  await ensureMusicGraph()
+  applyMusicMix()
+  await element.play()
+}
+
+function onMusicMetadata() {
+  const element = musicEl.value
+  if (element) {
+    try { element.currentTime = musicTimeAt(currentTime.value) } catch { /* metadata not ready */ }
+  }
+  applyMusicMix()
+}
+
+function onMusicError() {
+  if (musicSource.value) setNotice('Музыкальный файл недоступен или не поддерживается браузером.', 'error', 6500)
+}
+
+function onMusicSelectionChanged() {
+  pauseAll()
+  nextTick(() => {
+    musicEl.value?.load()
+    applyMusicMix()
+  })
+}
+
+function resetMusicMix() {
+  Object.assign(project.music, clone(DEFAULT_MUSIC_MIX))
+  applyMusicMix()
+}
+
 function releaseLiveVisualizer() {
   try { visualStreamSource?.disconnect() } catch { /* already disconnected */ }
   try { visualAnalyser?.disconnect() } catch { /* analyser has no outputs */ }
@@ -3346,10 +3574,16 @@ async function togglePlay() {
     if (Math.abs(secondary.currentTime - target) > 0.08) secondary.currentTime = target
   }
   try {
+    await startMusicPreview(master.currentTime)
+  } catch (error) {
+    setNotice(`Музыка не запустилась, озвучка продолжит играть: ${error.message}`, 'warning', 6000)
+  }
+  try {
     await master.play()
     void connectLiveVisualizer()
     if (secondary) secondary.play().catch(() => {})
   } catch (error) {
+    musicEl.value?.pause()
     setNotice(`Не удалось воспроизвести файл: ${error.message}`, 'error', 6500)
   }
 }
@@ -3357,6 +3591,7 @@ async function togglePlay() {
 function pauseAll() {
   audioEl.value?.pause()
   videoEl.value?.pause()
+  musicEl.value?.pause()
   playing.value = false
   cancelAnimationFrame(playbackFrame)
 }
@@ -3373,9 +3608,13 @@ function seekBy(offset) {
 function seekTo(value) {
   const next = Math.max(0, Math.min(Number(value) || 0, duration.value || Number(value) || 0))
   currentTime.value = next
-  for (const element of [audioEl.value, videoEl.value]) {
+  for (const element of [audioEl.value, videoEl.value, musicEl.value]) {
     if (element && Number.isFinite(element.duration) && Math.abs(element.currentTime - next) > 0.02) {
-      const target = element === secondaryElement() ? secondaryTimeAt(next) : Math.min(next, element.duration)
+      const target = element === musicEl.value
+        ? musicTimeAt(next)
+        : element === secondaryElement()
+          ? secondaryTimeAt(next)
+          : Math.min(next, element.duration)
       try { element.currentTime = target } catch { /* metadata not ready */ }
     }
   }
@@ -3400,6 +3639,9 @@ function onMediaTime(kind) {
   const secondary = secondaryElement()
   const secondaryTarget = secondaryTimeAt(master.currentTime)
   if (secondary && Math.abs(secondary.currentTime - secondaryTarget) > 0.22) secondary.currentTime = secondaryTarget
+  const music = musicEl.value
+  const musicTarget = musicTimeAt(master.currentTime)
+  if (music && project.music.enabled && Math.abs(music.currentTime - musicTarget) > 0.28) music.currentTime = musicTarget
 }
 
 function onMediaPlay(kind) {
@@ -3415,6 +3657,7 @@ function onMediaPause(kind) {
   cancelAnimationFrame(playbackFrame)
   visualAudioContext?.suspend().catch(() => {})
   secondaryElement()?.pause()
+  musicEl.value?.pause()
 }
 
 function onMediaEnded(kind) {
@@ -3793,6 +4036,14 @@ watch(() => videoSource.value, () => {
   nextTick(() => videoEl.value?.load())
 })
 
+watch(() => musicSource.value, () => {
+  musicEl.value?.pause()
+  nextTick(() => {
+    musicEl.value?.load()
+    applyMusicMix()
+  })
+})
+
 watch(() => bookPlayerUrl.value, () => {
   const autoplay = bookPlayerShouldAutoplay
   bookPlayerShouldAutoplay = false
@@ -3851,6 +4102,7 @@ onBeforeUnmount(() => {
   if (titleFitFrame !== null) cancelAnimationFrame(titleFitFrame)
   disconnectLiveVisualizer()
   visualAudioContext?.close().catch(() => {})
+  musicAudioContext?.close().catch(() => {})
   releaseObjectUrls()
 })
 

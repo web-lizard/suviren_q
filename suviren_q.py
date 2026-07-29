@@ -2256,25 +2256,73 @@ def concat_segments(segments: list[Path], out: Path, concat_txt: Path, *, dry_ru
     run_cmd(cmd, dry_run=dry_run)
 
 
+def build_music_mix_filter(config: dict[str, Any], duration: float) -> str:
+    """Build a conservative three-band music bed under the spoken master."""
+    def bounded(key: str, default: float, minimum: float, maximum: float) -> float:
+        try:
+            value = float(config.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(minimum, min(maximum, value))
+
+    volume = bounded("volume", 0.16, 0.0, 1.0)
+    bass = bounded("bass", 0.0, -12.0, 12.0)
+    mid = bounded("mid", 0.0, -12.0, 12.0)
+    treble = bounded("treble", 0.0, -12.0, 12.0)
+    fade_duration = min(1.5, max(0.1, duration / 4))
+    fade_out_start = max(0.0, duration - fade_duration)
+    return (
+        "[1:a]aresample=48000,asetpts=PTS-STARTPTS[voice];"
+        "[2:a]aresample=48000,asetpts=PTS-STARTPTS,"
+        f"equalizer=f=120:t=q:w=1:g={bass:.2f},"
+        f"equalizer=f=1100:t=q:w=1:g={mid:.2f},"
+        f"equalizer=f=7000:t=q:w=1:g={treble:.2f},"
+        f"volume={volume:.4f},"
+        f"afade=t=in:st=0:d={fade_duration:.3f},"
+        f"afade=t=out:st={fade_out_start:.3f}:d={fade_duration:.3f}[music];"
+        "[voice][music]amix=inputs=2:duration=first:dropout_transition=0:"
+        "normalize=0,alimiter=limit=0.95:attack=5:release=50[mixed]"
+    )
+
+
 def mux_master_audio(
     video: Path,
     audio: Path,
     out: Path,
     *,
+    music: Optional[Path] = None,
+    music_config: Optional[dict[str, Any]] = None,
     start: float = 0.0,
     duration: float,
     audio_bitrate: str = "192k",
     dry_run: bool = False,
 ) -> None:
-    """Attach the master once, avoiding AAC priming gaps at chapter joins."""
+    """Attach narration once and optionally mix a looped, equalized music bed."""
     ensure_dir(out.parent if out.parent != Path("") else Path.cwd())
     cmd = [
         "ffmpeg", "-y",
         "-i", str(video),
         "-ss", f"{max(0.0, start):.6f}",
         "-i", str(audio),
-        "-map", "0:v:0",
-        "-map", "1:a:0",
+    ]
+    config = dict(music_config or {})
+    music_enabled = music is not None and config.get("enabled", True) is not False
+    if music_enabled:
+        if config.get("loop", True) is not False:
+            cmd += ["-stream_loop", "-1"]
+        cmd += [
+            "-ss", f"{max(0.0, start):.6f}",
+            "-i", str(music),
+            "-filter_complex", build_music_mix_filter(config, duration),
+            "-map", "0:v:0",
+            "-map", "[mixed]",
+        ]
+    else:
+        cmd += [
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+        ]
+    cmd += [
         "-c:v", "copy",
         "-c:a", "aac",
         "-b:a", audio_bitrate,
@@ -2521,6 +2569,9 @@ def cmd_render(args: argparse.Namespace) -> None:
     audio = Path(args.audio)
     if not audio.exists():
         fail(f"Audio not found: {audio}")
+    music = Path(args.music) if getattr(args, "music", None) else None
+    if music is not None and not music.exists():
+        fail(f"Music not found: {music}")
     cover = Path(args.cover)
     if not cover.exists():
         fail(f"Cover not found: {cover}")
@@ -2554,6 +2605,11 @@ def cmd_render(args: argparse.Namespace) -> None:
             )
 
     editor_project = load_editor_project_config(getattr(args, "editor_project", None))
+    music_config = (
+        editor_project.get("music")
+        if isinstance(editor_project.get("music"), dict)
+        else {}
+    )
     bitrate_preset_name = str(getattr(args, "bitrate_preset", DEFAULT_BITRATE_PRESET))
     bitrate_profile = RENDER_BITRATE_PRESETS[bitrate_preset_name]
     timeline_duration = max((chapter.end_seconds for chapter in chapters), default=0.0)
@@ -2760,6 +2816,8 @@ def cmd_render(args: argparse.Namespace) -> None:
         video_only,
         audio,
         Path(args.out),
+        music=music,
+        music_config=music_config,
         start=float(segment_args_list[0]["start"]),
         duration=output_duration,
         audio_bitrate=bitrate_profile["audio_bitrate"],
@@ -2838,6 +2896,7 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     p_render = sub.add_parser("render", help="Render final MP4 with GPU acceleration")
     p_render.add_argument("--audio", required=True, help="MP3/WAV/M4A audiobook audio")
+    p_render.add_argument("--music", help="Optional background music mixed under narration")
     p_render.add_argument("--chapters", help="chapters JSON/CSV. If omitted, use --rpp extraction")
     p_render.add_argument("--rpp", help="Optional REAPER .rpp if chapters are not provided")
     p_render.add_argument("--rpp-track", default="КНИГА ОЗВУЧКА")

@@ -845,6 +845,7 @@ def get_export_inputs() -> dict[str, Any]:
 
     role_specs = {
         "audio": ("audioAssetId", AUDIO_EXTENSIONS),
+        "music": ("musicAssetId", AUDIO_EXTENSIONS),
         "video": ("videoAssetId", VIDEO_EXTENSIONS),
         "cover": ("coverAssetId", IMAGE_EXTENSIONS),
         "background": ("backgroundAssetId", IMAGE_EXTENSIONS),
@@ -1116,7 +1117,7 @@ def export_readiness_payload() -> dict[str, Any]:
         missing.append("Pillow")
 
     assets: dict[str, Any] = {}
-    for key in ("audio", "video", "cover", "background"):
+    for key in ("audio", "music", "video", "cover", "background"):
         path = inputs.get(key)
         assets[key] = {
             **(file_info(path) if path else {"path": "", "exists": False, "size": 0}),
@@ -1971,6 +1972,7 @@ def build_render_cmd(
         )
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     audio: Path = inputs["audio"]
+    music: Path | None = inputs["music"]
     cover: Path = inputs["cover"]
     background: Path | None = inputs["background"]
     # Keep the complete chapter list even for a 60-second test. This preserves
@@ -2005,6 +2007,8 @@ def build_render_cmd(
     ]
     if EDITOR_PROJECT_PATH.is_file():
         cmd += ["--editor-project", str(EDITOR_PROJECT_PATH)]
+    if music:
+        cmd += ["--music", str(music)]
     if test_mode:
         cmd += ["--max-duration", "60"]
     if background:

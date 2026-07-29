@@ -4,10 +4,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from suviren_q import (
+    build_music_mix_filter,
     escape_drawtext_text,
     load_chapters,
+    mux_master_audio,
     reading_caption_chunks,
 )
 
@@ -40,6 +43,35 @@ class VideoBookFeatureTests(unittest.TestCase):
             line_width=120,
         )
         self.assertGreater(narrow[0][2].count("\n"), wide[0][2].count("\n"))
+
+    def test_music_mix_has_volume_three_band_eq_and_limiter(self) -> None:
+        audio_filter = build_music_mix_filter(
+            {"volume": 0.22, "bass": 3, "mid": -2, "treble": 4},
+            20.0,
+        )
+        self.assertIn("volume=0.2200", audio_filter)
+        self.assertIn("f=120:t=q:w=1:g=3.00", audio_filter)
+        self.assertIn("f=1100:t=q:w=1:g=-2.00", audio_filter)
+        self.assertIn("f=7000:t=q:w=1:g=4.00", audio_filter)
+        self.assertIn("amix=inputs=2", audio_filter)
+        self.assertIn("alimiter=limit=0.95", audio_filter)
+
+    def test_music_mux_loops_and_maps_the_mixed_audio(self) -> None:
+        with patch("suviren_q.run_cmd") as run:
+            mux_master_audio(
+                Path("video.mp4"),
+                Path("voice.mp3"),
+                Path("result.mp4"),
+                music=Path("music.flac"),
+                music_config={"enabled": True, "loop": True, "volume": 0.16},
+                duration=30.0,
+                dry_run=True,
+            )
+        command = run.call_args.args[0]
+        self.assertIn("-stream_loop", command)
+        self.assertIn("music.flac", command)
+        self.assertIn("-filter_complex", command)
+        self.assertIn("[mixed]", command)
 
     def test_chapter_json_preserves_text_and_image(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -26,6 +26,16 @@ test('reading captions are a movable layer with adjustable typography', () => {
   assert.match(source, /source\.layers\?\.caption/)
 })
 
+test('video projects support a separate music bed with volume and three-band EQ', () => {
+  assert.match(source, /musicAssetId/)
+  assert.match(source, /MUSIC_EQ_BANDS/)
+  assert.match(source, /project\.music\.volume/)
+  assert.match(source, /project\.music\[band\.key\]/)
+  assert.match(source, /class="timeline-lane music-lane"/)
+  assert.match(source, /ensureMusicGraph/)
+  assert.match(source, /createBiquadFilter/)
+})
+
 test('opening video rebuilds narrated chapters and exposes chapter audio clips', () => {
   assert.match(source, /workspace === 'video' && activeProjectRecord\.value\?\.book/)
   assert.match(source, /await openBookInVideo\(\)/)
