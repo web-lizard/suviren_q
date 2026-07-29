@@ -35,12 +35,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
+from bookender.logging import log_event
 from bookender.paths import DATABASE_PATH, USER_DATA
 from bookender.repository import (
     ProjectNotFoundError,
     ProjectRepository,
 )
-from bookender.tts import TtsService
+from bookender.tts import (
+    TTS_FAILED_MESSAGE,
+    TTS_UNAVAILABLE_MESSAGE,
+    TtsService,
+    TtsUnavailableError,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -169,6 +175,15 @@ class TtsSettingsRequest(BaseModel):
     volume: str = "+0%"
     provider: str = "edge-tts"
     extra: dict[str, Any] = {}
+
+
+class TtsPreviewRequest(TtsSettingsRequest):
+    text: str = ""
+
+
+class AudioAssetUpdateRequest(BaseModel):
+    title: str | None = None
+    is_active: bool | None = None
 
 
 class VideoEditionCreateRequest(BaseModel):
@@ -1167,9 +1182,16 @@ def export_readiness_payload() -> dict[str, Any]:
 def project_http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, ProjectNotFoundError):
         return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, TtsUnavailableError):
+        return HTTPException(status_code=503, detail=TTS_UNAVAILABLE_MESSAGE)
     if isinstance(exc, ValueError):
         return HTTPException(status_code=422, detail=str(exc))
-    return HTTPException(status_code=500, detail=str(exc))
+    if str(exc) == TTS_FAILED_MESSAGE:
+        return HTTPException(status_code=502, detail=TTS_FAILED_MESSAGE)
+    log_event("project_api_error", error=repr(exc))
+    return HTTPException(
+        status_code=500, detail="Не удалось выполнить операцию с проектом."
+    )
 
 
 @app.get("/api/health")
@@ -1184,6 +1206,7 @@ def health() -> dict[str, Any]:
         "build_dir": str(BUILD_DIR),
         "database": str(DATABASE_PATH),
         "database_integrity": PROJECT_REPOSITORY.database.integrity_check(),
+        "tts": TTS_SERVICE.dependency_status(),
     }
 
 
@@ -1346,9 +1369,34 @@ def update_project_tts(
     project_uuid: str, data: TtsSettingsRequest
 ) -> dict[str, Any]:
     try:
+        settings = TTS_SERVICE.normalize_settings(data.model_dump())
         return PROJECT_REPOSITORY.update_tts_settings(
-            project_uuid, data.model_dump()
+            project_uuid, settings
         )
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.get("/api/tts/status")
+def tts_status() -> dict[str, Any]:
+    return TTS_SERVICE.dependency_status()
+
+
+@app.get("/api/tts/voices")
+def tts_voices(refresh: bool = Query(False)) -> dict[str, Any]:
+    try:
+        voices = TTS_SERVICE.list_voices(refresh=refresh)
+        return {"voices": voices, "count": len(voices)}
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.post("/api/projects/{project_uuid}/tts-preview")
+def preview_project_voice(
+    project_uuid: str, data: TtsPreviewRequest
+) -> dict[str, Any]:
+    try:
+        return TTS_SERVICE.preview(project_uuid, data.text, data.model_dump())
     except Exception as exc:
         raise project_http_error(exc) from exc
 
@@ -1386,6 +1434,69 @@ def get_project_tts_job(job_uuid: str) -> dict[str, Any]:
         return TTS_SERVICE.get_job(job_uuid)
     except Exception as exc:
         raise project_http_error(exc) from exc
+
+
+@app.patch("/api/projects/{project_uuid}/audio/{asset_id}")
+def update_project_audio_asset(
+    project_uuid: str, asset_id: int, data: AudioAssetUpdateRequest
+) -> dict[str, Any]:
+    try:
+        return PROJECT_REPOSITORY.update_audio_asset(
+            project_uuid,
+            asset_id,
+            title=data.title,
+            is_active=data.is_active,
+        )
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.delete("/api/projects/{project_uuid}/audio/{asset_id}")
+def delete_project_audio_asset(project_uuid: str, asset_id: int) -> dict[str, Any]:
+    try:
+        return PROJECT_REPOSITORY.delete_audio_asset(project_uuid, asset_id)
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.post("/api/projects/{project_uuid}/audio/{asset_id}/open-folder")
+def open_project_audio_folder(project_uuid: str, asset_id: int) -> dict[str, Any]:
+    try:
+        project = PROJECT_REPOSITORY.get_project(project_uuid, include_details=True)
+        asset = next(
+            (item for item in project["audio_assets"] if item["id"] == asset_id),
+            None,
+        )
+        if asset is None or str(asset["file_path"]).startswith("external:"):
+            raise ProjectNotFoundError(f"{project_uuid}/audio/{asset_id}")
+        projects_root = (USER_DATA / "projects").resolve()
+        path = (USER_DATA / asset["file_path"]).resolve()
+        if not is_within(path, projects_root) or not path.is_file():
+            raise ProjectNotFoundError(f"{project_uuid}/audio/{asset_id}")
+        if os.name == "nt":
+            os.startfile(str(path.parent))  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen(["xdg-open", str(path.parent)])
+        return {"opened": True}
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.post("/api/tts/open-log")
+def open_tts_log() -> dict[str, Any]:
+    log_path = (USER_DATA / "logs" / "bookender.log").resolve()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.touch(exist_ok=True)
+    try:
+        if os.name == "nt":
+            os.startfile(str(log_path))  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen(["xdg-open", str(log_path)])
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500, detail="Не удалось открыть технический лог."
+        ) from exc
+    return {"opened": True, "path": str(log_path)}
 
 
 @app.post("/api/projects/{project_uuid}/video-editions")

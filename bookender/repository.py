@@ -213,13 +213,27 @@ class ProjectRepository:
                     (row["id"],),
                 ).fetchone()
                 project["tts_settings"] = dict(tts) if tts else None
-                project["audio_assets"] = [
-                    dict(asset)
-                    for asset in connection.execute(
-                        "SELECT * FROM audio_assets WHERE project_id=? ORDER BY id",
-                        (row["id"],),
-                    ).fetchall()
-                ]
+                chapter_hashes = {
+                    int(chapter["id"]): chapter["content_hash"]
+                    for chapter in project["chapters"]
+                }
+                project["audio_assets"] = []
+                for asset_row in connection.execute(
+                    """
+                    SELECT * FROM audio_assets
+                    WHERE project_id=?
+                    ORDER BY chapter_id, created_at DESC, id DESC
+                    """,
+                    (row["id"],),
+                ).fetchall():
+                    asset = dict(asset_row)
+                    current_hash = chapter_hashes.get(int(asset["chapter_id"] or 0))
+                    asset["is_stale"] = bool(
+                        current_hash
+                        and asset["source_text_hash"]
+                        and asset["source_text_hash"] != current_hash
+                    )
+                    project["audio_assets"].append(asset)
                 project["visual_assets"] = [
                     dict(asset)
                     for asset in connection.execute(
@@ -568,6 +582,103 @@ class ProjectRepository:
             )
             self._touch_project(connection, project["id"], now)
         return self.get_project(project_uuid, include_details=True)["tts_settings"]
+
+    def update_audio_asset(
+        self,
+        project_uuid: str,
+        asset_id: int,
+        *,
+        title: str | None = None,
+        is_active: bool | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.database.transaction() as connection:
+            project = self._project_row(connection, project_uuid)
+            asset = connection.execute(
+                """
+                SELECT * FROM audio_assets
+                WHERE id=? AND project_id=?
+                """,
+                (asset_id, project["id"]),
+            ).fetchone()
+            if asset is None:
+                raise ProjectNotFoundError(f"{project_uuid}/audio/{asset_id}")
+            if is_active:
+                connection.execute(
+                    """
+                    UPDATE audio_assets SET is_active=0, updated_at=?
+                    WHERE project_id=? AND chapter_id IS ?
+                    """,
+                    (now, project["id"], asset["chapter_id"]),
+                )
+            updates = ["updated_at=?"]
+            values: list[Any] = [now]
+            if title is not None:
+                updates.append("title=?")
+                values.append(title.strip() or Path(asset["file_path"]).stem)
+            if is_active is not None:
+                updates.append("is_active=?")
+                values.append(1 if is_active else 0)
+            values.extend((asset_id, project["id"]))
+            connection.execute(
+                f"UPDATE audio_assets SET {', '.join(updates)} WHERE id=? AND project_id=?",
+                values,
+            )
+            updated = connection.execute(
+                "SELECT * FROM audio_assets WHERE id=?", (asset_id,)
+            ).fetchone()
+        return dict(updated)
+
+    def delete_audio_asset(self, project_uuid: str, asset_id: int) -> dict[str, Any]:
+        with self.database.transaction() as connection:
+            project = self._project_row(connection, project_uuid)
+            asset = connection.execute(
+                "SELECT * FROM audio_assets WHERE id=? AND project_id=?",
+                (asset_id, project["id"]),
+            ).fetchone()
+            if asset is None:
+                raise ProjectNotFoundError(f"{project_uuid}/audio/{asset_id}")
+            connection.execute(
+                "DELETE FROM audio_assets WHERE id=? AND project_id=?",
+                (asset_id, project["id"]),
+            )
+            if asset["is_active"] and asset["chapter_id"] is not None:
+                replacement = connection.execute(
+                    """
+                    SELECT id FROM audio_assets
+                    WHERE project_id=? AND chapter_id=?
+                    ORDER BY created_at DESC, id DESC LIMIT 1
+                    """,
+                    (project["id"], asset["chapter_id"]),
+                ).fetchone()
+                if replacement:
+                    connection.execute(
+                        "UPDATE audio_assets SET is_active=1 WHERE id=?",
+                        (replacement["id"],),
+                    )
+        file_path = str(asset["file_path"])
+        removed = False
+        if not file_path.startswith("external:"):
+            projects_root = (USER_DATA / "projects").resolve()
+            path = (USER_DATA / file_path).resolve()
+            try:
+                path.relative_to(projects_root)
+                path.unlink(missing_ok=True)
+                removed = True
+            except (OSError, ValueError):
+                log_event(
+                    "audio_asset_file_delete_failed",
+                    project_uuid=project_uuid,
+                    asset_id=asset_id,
+                    file_path=file_path,
+                )
+        log_event(
+            "audio_asset_deleted",
+            project_uuid=project_uuid,
+            asset_id=asset_id,
+            file_removed=removed,
+        )
+        return {"deleted": True, "file_removed": removed}
 
     def save_video_edition(
         self,
