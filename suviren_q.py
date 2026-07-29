@@ -583,6 +583,17 @@ def ffprobe_duration(path: Path) -> Optional[float]:
         return None
     check_binary("ffprobe", required=True)
 
+    size_bytes = path.stat().st_size
+
+    # For files >1.5 GB, skip ffprobe/ffmpeg parsing (can hang on >2GB MP3 VBR headers)
+    if size_bytes > 1_500_000_000:
+        warn(f"Audio file >1.5 GB ({size_bytes/1024/1024/1024:.1f} GB); ffprobe may hang, skipping to estimation")
+        dur = _estimate_duration_from_bitrate(path)
+        if dur is not None:
+            return dur
+        warn(f"Could not determine duration for {path.name}")
+        return None
+
     # Method 1: ffprobe format=duration (fast, but may fail on huge mp3 >2GB)
     try:
         cmd = [
@@ -598,6 +609,7 @@ def ffprobe_duration(path: Path) -> Optional[float]:
             text=True,
             encoding="utf-8",
             errors="replace",
+            timeout=30,
             **hidden_process_options(),
         )
         value = res.stdout.strip()

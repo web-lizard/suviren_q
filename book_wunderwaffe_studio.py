@@ -15,6 +15,7 @@ Phases implemented:
 - Phase 7: Waveform bars with played highlight
 - Phase 8: Timeline zoom (+/-/fit/1h/10m) with scroll
 - Phase 9: Clean Actions panel with groups and bigger buttons
+- Phase 10: Segmented proxy audio playback via small m4a segments
 """
 
 import json
@@ -60,6 +61,8 @@ CHAPTERS_PATH = BUILD_DIR / "chapters.detected.json"
 WAVEFORM_PATH = BUILD_DIR / "waveform.json"
 WAVEFORM_LOCK = BUILD_DIR / "waveform.lock"
 PROJECT_CONFIG = PROJECT_ROOT / "bookforge.project.json"
+PROXY_AUDIO_DIR = BUILD_DIR / "audio_proxy_segments"
+PROXY_MANIFEST_PATH = PROXY_AUDIO_DIR / "proxy_manifest.json"
 
 CANVAS_W = 1920
 CANVAS_H = 1080
@@ -1437,10 +1440,11 @@ class PropertiesDock(QDockWidget):
 # =========================================================
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, audio_path=None):
         super().__init__()
         self.setWindowTitle("Book Wunderwaffe Studio 1.0")
         self.setGeometry(100, 40, 1600, 1000)
+        self._audio_path = audio_path
 
         # --- State ---
         self._chapters = []
@@ -1469,6 +1473,18 @@ class MainWindow(QMainWindow):
         self._player_simulation = False
         self._simulation_timer = None
         self._simulation_position = 0.0
+
+        # Proxy audio state
+        self._proxy_manifest = None
+        self._proxy_mode = False  # True when using segmented proxy
+        self._proxy_current_segment_index = -1
+        self._proxy_current_local_pos = 0.0  # local position within segment (ms)
+        self._proxy_was_playing_before_seek = False
+        self._proxy_playback_active = False
+        self._proxy_block_position_signal = False
+        self._proxy_pending_seek_position = -1.0  # ms, for pending seeks after segment load
+        self._proxy_generating = False  # True while proxy generation running
+        self._proxy_process = None  # QProcess for proxy generation
 
         self._bg_pixmap = QPixmap()
         self._cover_pixmap = QPixmap()
@@ -1687,10 +1703,258 @@ class MainWindow(QMainWindow):
         self._on_position_changed(int(self._simulation_position * 1000))
         self._update_ui_for_time(self._simulation_position)
 
-    # --- Load audio ---
+    # ============================================================
+    #  Proxy Audio — segmented audio playback
+    # ============================================================
+
+    def _load_proxy_manifest(self):
+        """Load proxy manifest if it exists and is valid. Sets _proxy_mode."""
+        if not PROXY_MANIFEST_PATH.exists():
+            self._proxy_mode = False
+            self._proxy_manifest = None
+            self.log("Proxy manifest не найден. Плеер будет пытаться грузить master audio.")
+            self._update_proxy_status_label()
+            return False
+
+        try:
+            manifest = load_json(PROXY_MANIFEST_PATH)
+            if not manifest or "segments" not in manifest:
+                self._proxy_mode = False
+                self._proxy_manifest = None
+                self.log("Proxy manifest повреждён (нет segments).")
+                self._update_proxy_status_label()
+                return False
+
+            # Validate source audio matches selected audio
+            config = load_json(PROJECT_CONFIG)
+            if config:
+                selected_audio = config.get("audio_file", "")
+                manifest_source = manifest.get("source_audio", "")
+                # Normalize paths for comparison
+                def norm(p):
+                    return Path(p).resolve().as_posix() if p else ""
+                if norm(selected_audio) != norm(manifest_source):
+                    self.log(f"Proxy manifest source mismatch: {manifest_source} vs {selected_audio}")
+
+            # Check all segment files exist
+            segments = manifest["segments"]
+            all_exist = True
+            missing = []
+            for seg in segments:
+                seg_path = Path(seg["path"])
+                if not seg_path.exists() or seg_path.stat().st_size == 0:
+                    all_exist = False
+                    missing.append(seg["path"])
+
+            if not all_exist:
+                self._proxy_mode = False
+                self._proxy_manifest = None
+                self.log(f"Proxy сегменты отсутствуют: {missing[:5]}...")
+                self._update_proxy_status_label()
+                return False
+
+            self._proxy_manifest = manifest
+            self._proxy_mode = True
+            self._proxy_current_segment_index = self._find_segment_index_for_time(0.0)
+            seg_count = len(segments)
+            total_dur = manifest.get("total_duration", 0.0)
+            self._total_duration = total_dur
+            self.log(f"Proxy audio загружен: {seg_count} сегментов, длительность {seconds_to_timestr(total_dur)[:8]}")
+            self._update_proxy_status_label()
+            return True
+
+        except Exception as e:
+            self._proxy_mode = False
+            self._proxy_manifest = None
+            self.log(f"Ошибка загрузки proxy manifest: {e}")
+            self._update_proxy_status_label()
+            return False
+
+    def _find_segment_index_for_time(self, global_seconds):
+        """Find segment index by global time in seconds."""
+        if not self._proxy_manifest or not self._proxy_manifest.get("segments"):
+            return 0
+        segments = self._proxy_manifest["segments"]
+        for i, seg in enumerate(segments):
+            gs = seg.get("global_start", 0.0)
+            ge = seg.get("global_end", 0.0)
+            if gs <= global_seconds < ge:
+                return i
+        return len(segments) - 1
+
+    def _get_segment_for_time(self, global_seconds):
+        """Get segment dict by global time, or None."""
+        if not self._proxy_manifest or not self._proxy_manifest.get("segments"):
+            return None
+        segments = self._proxy_manifest["segments"]
+        idx = self._find_segment_index_for_time(global_seconds)
+        if 0 <= idx < len(segments):
+            return segments[idx]
+        return None
+
+    def _proxy_load_and_seek_to_time(self, global_seconds):
+        """
+        Find the proxy segment for the given global time, load it,
+        and seek to the local position.
+        """
+        if not self._proxy_mode or not self._proxy_manifest:
+            self.log("Proxy mode не активен.")
+            return
+
+        segments = self._proxy_manifest["segments"]
+        idx = self._find_segment_index_for_time(global_seconds)
+        if idx < 0 or idx >= len(segments):
+            self.log(f"Не найден сегмент для времени {global_seconds:.1f} сек.")
+            return
+
+        seg = segments[idx]
+        local_sec = global_seconds - seg.get("global_start", 0.0)
+        self._proxy_current_segment_index = idx
+        self._proxy_current_local_pos = local_sec * 1000.0
+
+        seg_path = PROJECT_ROOT / seg["path"]
+        if not seg_path.exists():
+            self.log(f"Файл сегмента не найден: {seg_path}")
+            return
+
+        self.log(f"Загрузка сегмента {idx:03d}: {seg['title']} (local: {local_sec:.2f}s)")
+        if self._player:
+            self._proxy_block_position_signal = True
+            self._player.setSource(QUrl.fromLocalFile(str(seg_path.resolve())))
+            # We'll seek after media is loaded (in mediaStatusChanged)
+            self._proxy_pending_seek_position = local_sec * 1000.0
+
+        # Update segment label
+        self._update_proxy_segment_label()
+
+    def _proxy_update_player_position(self):
+        """Called when proxy segment finishes loading, to seek to correct position."""
+        if not self._player:
+            return
+        if self._proxy_pending_seek_position >= 0:
+            ms = int(self._proxy_pending_seek_position)
+            self._proxy_block_position_signal = False
+            self._player.setPosition(ms)
+            self._proxy_pending_seek_position = -1.0
+
+    def _proxy_advance_to_next_segment(self):
+        """Advance to next segment when current one ends."""
+        if not self._proxy_mode or not self._proxy_manifest:
+            return
+        segments = self._proxy_manifest["segments"]
+        next_idx = self._proxy_current_segment_index + 1
+        if next_idx >= len(segments):
+            # End of book
+            self.log("Книга завершена.")
+            self._stop_playback()
+            return
+
+        next_seg = segments[next_idx]
+        next_global_start = next_seg.get("global_start", 0.0)
+        self._proxy_load_and_seek_to_time(next_global_start)
+        if self._proxy_playback_active:
+            self._player.play()
+
+    def _update_proxy_status_label(self):
+        """Update the proxy status label in status bar."""
+        if hasattr(self, '_proxy_status_label'):
+            if self._proxy_mode:
+                seg_count = len(self._proxy_manifest.get("segments", [])) if self._proxy_manifest else 0
+                self._proxy_status_label.setText(f"Плеер: proxy segments OK, {seg_count} сегментов")
+                self._proxy_status_label.setStyleSheet(f"color: {ACCENT_GREEN}; font-size: 10px;")
+                # Enable play
+                self._btn_play.setEnabled(True)
+                if hasattr(self, '_btn_create_proxy'):
+                    self._btn_create_proxy.hide()
+            else:
+                self._proxy_status_label.setText("Proxy audio segments не созданы")
+                self._proxy_status_label.setStyleSheet(f"color: #ff5555; font-size: 10px;")
+                self._btn_play.setEnabled(False)
+                if hasattr(self, '_btn_create_proxy'):
+                    self._btn_create_proxy.show()
+
+    def _update_proxy_segment_label(self):
+        """Update current segment index/title label."""
+        if hasattr(self, '_proxy_segment_label') and self._proxy_manifest:
+            seg_count = len(self._proxy_manifest.get("segments", []))
+            current = self._proxy_current_segment_index
+            if 0 <= current < seg_count:
+                seg = self._proxy_manifest["segments"][current]
+                title = seg.get("title", "")
+                self._proxy_segment_label.setText(
+                    f"Сегмент: {current+1:03d} / {seg_count:03d} — {title}")
+            else:
+                self._proxy_segment_label.setText(f"Сегмент: — / {seg_count:03d}")
+
+    def _start_proxy_generation(self):
+        """Start proxy-audio-segments in a QProcess."""
+        self._proxy_generating = True
+        self._btn_create_proxy.setEnabled(False)
+        self._btn_create_proxy.setText("Создание proxy-сегментов...")
+        self._proxy_status_label.setText("Создание proxy-сегментов...")
+        self._proxy_status_label.setStyleSheet(f"color: {ACCENT_CYAN}; font-size: 10px;")
+        self._btn_play.setEnabled(False)
+
+        self._proxy_process = QProcess(self)
+        self._proxy_process.readyReadStandardOutput.connect(self._on_proxy_process_output)
+        self._proxy_process.readyReadStandardError.connect(self._on_proxy_process_error)
+        self._proxy_process.finished.connect(self._on_proxy_process_finished)
+
+        self.log("Запуск: python bookforge.py proxy-audio-segments --overwrite")
+        self._proxy_process.start(
+            sys.executable,
+            ["bookforge.py", "proxy-audio-segments", "--overwrite"],
+            str(PROJECT_ROOT)
+        )
+
+    def _on_proxy_process_output(self):
+        if self._proxy_process:
+            data = self._proxy_process.readAllStandardOutput().data().decode("utf-8", errors="replace")
+            self.log(data.strip())
+            self._proxy_status_label.setText(f"Создание proxy-сегментов...\n{data.strip()[-80:]}")
+
+    def _on_proxy_process_error(self):
+        if self._proxy_process:
+            data = self._proxy_process.readAllStandardError().data().decode("utf-8", errors="replace")
+            self.log(f"[stderr] {data.strip()}")
+
+    def _on_proxy_process_finished(self, exit_code, exit_status):
+        self._proxy_generating = False
+        self._btn_create_proxy.setEnabled(True)
+        self._btn_create_proxy.setText("Создать proxy-сегменты")
+        if exit_code == 0:
+            self.log("Proxy-сегменты созданы успешно.")
+            # Reload manifest
+            self._load_proxy_manifest()
+            self._update_proxy_segment_label()
+            self._proxy_status_label.setText("Proxy-сегменты готовы")
+            self._proxy_status_label.setStyleSheet(f"color: {ACCENT_GREEN}; font-size: 10px;")
+            self._btn_play.setEnabled(True)
+            self._btn_create_proxy.hide()
+        else:
+            self.log(f"Proxy-сегменты завершились с кодом {exit_code}")
+            self._proxy_status_label.setText(f"Ошибка создания proxy-сегментов (код {exit_code})")
+            self._proxy_status_label.setStyleSheet(f"color: #ff5555; font-size: 10px;")
+            self._btn_play.setEnabled(False)
+
+    # --- Load audio (master or proxy) ---
     def _load_player_audio(self):
-        """Load audio file into player."""
-        audio_path = DATA_DIR / "ЗИНА. Книга. final last version.mp3"
+        """
+        Load audio — prefer proxy segments, fall back to master mp3.
+        Master mp3 will NOT be loaded if proxy exists.
+        """
+        # Try proxy first
+        if self._load_proxy_manifest():
+            self.log("Используется segmented proxy audio.")
+            self._player_indicator.setStyleSheet("color: #00ff88; font-size: 14px;")
+            self._status_label_bar.setText("Плеер: proxy segments")
+            return
+
+        # Fallback: master audio (use --file arg or default)
+        if self._audio_path and Path(self._audio_path).exists():
+            audio_path = Path(self._audio_path)
+        else:
+            audio_path = DATA_DIR / "ZINA-FINAL render 1907.mp3"
         if not audio_path.exists():
             self._player_error = "Файл аудио не найден"
             self.log(f"Аудио не найдено: {audio_path}")
@@ -1723,6 +1987,12 @@ class MainWindow(QMainWindow):
 
     # --- Player callbacks ---
     def _on_player_error(self, error, error_string):
+        # In proxy mode, try to log but don't switch to simulation
+        if self._proxy_mode:
+            self.log(f"Proxy segment error: {error_string}")
+            # Try reloading current segment
+            return
+
         self._player_error = f"Ошибка плеера: {error_string}"
         self.log(self._player_error)
         self._status_label_bar.setText(self._player_error)
@@ -1730,8 +2000,8 @@ class MainWindow(QMainWindow):
         self._btn_play.setText("▶")
         self._player_indicator.setStyleSheet("color: #ff5555; font-size: 14px;")
 
-        # Fall back to simulation
-        if not self._player_simulation:
+        # Fall back to simulation only if not in proxy mode
+        if not self._player_simulation and not self._proxy_mode:
             self._player_simulation = True
             self._init_simulation()
             self.log("Переключение в simulation mode.")
@@ -1739,6 +2009,22 @@ class MainWindow(QMainWindow):
     def _on_position_changed(self, pos_ms):
         """Called when player position changes."""
         sec = pos_ms / 1000.0
+
+        # In proxy mode, convert local position to global time
+        if self._proxy_mode and self._proxy_manifest:
+            segments = self._proxy_manifest.get("segments", [])
+            if 0 <= self._proxy_current_segment_index < len(segments):
+                seg = segments[self._proxy_current_segment_index]
+                global_sec = seg.get("global_start", 0.0) + (pos_ms / 1000.0)
+                sec = global_sec
+
+                # Check if we reached end of segment
+                seg_end = seg.get("global_end", 0.0)
+                seg_dur = seg.get("duration", 0.0)
+                local_sec = pos_ms / 1000.0
+                if local_sec >= seg_dur - 0.3 and self._is_playing:
+                    self._proxy_advance_to_next_segment()
+
         self._label_current.setText(seconds_to_timestr(sec)[:8])
 
         # Update slider (avoid feedback loop during seeking)
@@ -1746,11 +2032,14 @@ class MainWindow(QMainWindow):
             self._slider_position.blockSignals(True)
             total_ms = int(self._total_duration * 1000)
             self._slider_position.setRange(0, max(total_ms, 1))
-            self._slider_position.setValue(pos_ms)
+            self._slider_position.setValue(int(sec * 1000))
             self._slider_position.blockSignals(False)
 
+        # Update UI for all visual elements
+        self._update_ui_for_time(sec)
+
     def _on_duration_changed(self, duration_ms):
-        if duration_ms > 0:
+        if duration_ms > 0 and not self._proxy_mode:
             self._total_duration = duration_ms / 1000.0
             self._label_total.setText(seconds_to_timestr(self._total_duration)[:8])
             self._slider_position.setRange(0, duration_ms)
@@ -1768,7 +2057,26 @@ class MainWindow(QMainWindow):
             QMediaPlayer.MediaStatus.StalledMedia: "Ошибка загрузки",
         }
         msg = status_map.get(status, f"Статус: {status}")
-        self.log(msg)
+        self.log(f"Media status: {msg}")
+
+        # In proxy mode, handle segment loading and transition
+        if self._proxy_mode:
+            if status == QMediaPlayer.MediaStatus.LoadedMedia:
+                self._proxy_update_player_position()
+                self._player_indicator.setStyleSheet("color: #00ff88; font-size: 14px;")
+                self._status_label_bar.setText(f"Proxy: сегмент {self._proxy_current_segment_index + 1}")
+                # Start playing if we were playing
+                if self._proxy_playback_active:
+                    self._player.play()
+            elif status == QMediaPlayer.MediaStatus.EndOfMedia:
+                # Segment ended, advance
+                self._proxy_advance_to_next_segment()
+            elif status in (QMediaPlayer.MediaStatus.InvalidMedia, QMediaPlayer.MediaStatus.StalledMedia):
+                self._player_indicator.setStyleSheet("color: #ff5555; font-size: 14px;")
+                self._status_label_bar.setText(f"Ошибка сегмента: {msg}")
+            return
+
+        # Normal mode (master audio)
         if status == QMediaPlayer.MediaStatus.LoadedMedia:
             self._status_label_bar.setText(msg)
             self._player_indicator.setStyleSheet("color: #00ff88; font-size: 14px;")
@@ -1781,11 +2089,22 @@ class MainWindow(QMainWindow):
             self._is_playing = False
             self._btn_play.setText("▶")
             self._player_timer.stop()
+            self._proxy_playback_active = False
             self._status_label_bar.setText("Остановлено")
 
     def _on_player_timer(self):
         """Periodic timer to sync canvas with player position."""
-        if self._player and not self._player_simulation:
+        if self._proxy_mode:
+            if self._player and not self._player_simulation:
+                pos_ms = self._player.position()
+                sec = pos_ms / 1000.0
+                if self._proxy_manifest:
+                    segments = self._proxy_manifest.get("segments", [])
+                    if 0 <= self._proxy_current_segment_index < len(segments):
+                        seg = segments[self._proxy_current_segment_index]
+                        global_sec = seg.get("global_start", 0.0) + sec
+                        self._update_ui_for_time(global_sec)
+        elif self._player and not self._player_simulation:
             pos_ms = self._player.position()
             sec = pos_ms / 1000.0
             self._update_ui_for_time(sec)
@@ -1836,6 +2155,35 @@ class MainWindow(QMainWindow):
         return len(self._chapters) - 1
 
     def _toggle_playback(self):
+        # Proxy mode
+        if self._proxy_mode:
+            if not self._player:
+                self.log("Плеер недоступен.")
+                return
+
+            if self._is_playing:
+                self._player.pause()
+                self._is_playing = False
+                self._proxy_playback_active = False
+                self._btn_play.setText("▶")
+                self._player_timer.stop()
+                self._status_label_bar.setText("Пауза (proxy)")
+            else:
+                # If no current source, load first segment at current time
+                current_global = self._player.position()
+                if current_global <= 0 and self._proxy_current_segment_index < 0:
+                    # Get current position from slider
+                    slider_sec = self._slider_position.value() / 1000.0
+                    self._proxy_load_and_seek_to_time(slider_sec)
+                self._player.play()
+                self._is_playing = True
+                self._proxy_playback_active = True
+                self._btn_play.setText("⏸")
+                self._player_timer.start()
+                self._status_label_bar.setText("Воспроизведение (proxy)")
+            return
+
+        # Simulation mode
         if self._player_simulation:
             if self._is_playing:
                 self._simulation_timer.stop()
@@ -1849,6 +2197,7 @@ class MainWindow(QMainWindow):
                 self._status_label_bar.setText("Воспроизведение (simulation)")
             return
 
+        # Master audio mode
         if not self._player:
             self.log("Плеер недоступен.")
             return
@@ -1874,6 +2223,19 @@ class MainWindow(QMainWindow):
             self._status_label_bar.setText("Воспроизведение")
 
     def _stop_playback(self):
+        if self._proxy_mode:
+            if self._player:
+                self._player.stop()
+            self._is_playing = False
+            self._proxy_playback_active = False
+            self._btn_play.setText("▶")
+            self._player_timer.stop()
+            self._slider_position.setValue(0)
+            self._label_current.setText("00:00:00")
+            self._status_label_bar.setText("Остановлено")
+            self._update_ui_for_time(0)
+            return
+
         if self._player_simulation:
             self._simulation_timer.stop()
             self._simulation_position = 0.0
@@ -1897,6 +2259,13 @@ class MainWindow(QMainWindow):
         self._update_ui_for_time(0)
 
     def _seek_to(self, position_ms):
+        """Seek to global position in milliseconds."""
+        if self._proxy_mode:
+            sec = position_ms / 1000.0
+            self._proxy_was_playing_before_seek = self._is_playing
+            self._proxy_load_and_seek_to_time(sec)
+            return
+
         if self._player_simulation:
             self._simulation_position = position_ms / 1000.0
             self._update_ui_for_time(self._simulation_position)
@@ -1912,7 +2281,13 @@ class MainWindow(QMainWindow):
             return
         ch = self._chapters[idx]
         start_s = timestr_to_seconds(ch.get("start", "0"))
-        self._seek_to(int(start_s * 1000))
+
+        if self._proxy_mode:
+            self._proxy_was_playing_before_seek = self._is_playing
+            self._proxy_load_and_seek_to_time(start_s)
+        else:
+            self._seek_to(int(start_s * 1000))
+
         # Update UI without calling _on_chapter_selected (which would re-enter here)
         self._chapters_index = idx
         self._chapter_combo.blockSignals(True)
@@ -2044,6 +2419,36 @@ class MainWindow(QMainWindow):
         self._chapter_list = ChapterListPanel()
         self._chapter_list.chapterSelected.connect(self._seek_to_chapter)
         layout.addWidget(self._chapter_list, 1)
+
+        # Proxy audio section
+        proxy_group = QGroupBox("Аудио плеер")
+        proxy_group.setStyleSheet(info_group.styleSheet())
+        proxy_layout = QVBoxLayout(proxy_group)
+        proxy_layout.setSpacing(4)
+
+        self._proxy_status_label = QLabel("Proxy audio segments не созданы")
+        self._proxy_status_label.setStyleSheet(f"color: #ff5555; font-size: 11px; padding: 2px 0;")
+        proxy_layout.addWidget(self._proxy_status_label)
+
+        self._proxy_segment_label = QLabel("")
+        self._proxy_segment_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px; padding: 2px 0;")
+        proxy_layout.addWidget(self._proxy_segment_label)
+
+        self._btn_create_proxy = QPushButton("Создать proxy-сегменты")
+        self._btn_create_proxy.clicked.connect(self._start_proxy_generation)
+        self._btn_create_proxy.setMinimumHeight(30)
+        self._btn_create_proxy.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #1a3a1a; color: {ACCENT_GREEN};
+                border: 1px solid {ACCENT_GREEN}; border-radius: 4px;
+                padding: 8px 10px; font-size: 11px;
+            }}
+            QPushButton:hover {{ background-color: #2a4a2a; }}
+            QPushButton:disabled {{ background-color: #1a1a1a; color: #666666; border-color: #444444; }}
+        """)
+        proxy_layout.addWidget(self._btn_create_proxy)
+
+        layout.addWidget(proxy_group)
 
         # Actions group — improved with subgroups and bigger buttons
         btn_group = QGroupBox("Действия")
@@ -2414,6 +2819,9 @@ class MainWindow(QMainWindow):
 
     def _on_seek_end(self):
         self._was_seeking = False
+        if self._proxy_mode:
+            # Seek is handled in _seek_to via the sliderMoved already
+            return
         if self._player and not self._player_simulation:
             pos = self._slider_position.value()
             self._player.setPosition(pos)
@@ -2760,7 +3168,7 @@ class MainWindow(QMainWindow):
 
             # --- 2. Project files ---
             rl("[PROJECT FILES]")
-            audio_path = DATA_DIR / "ЗИНА. Книга. final last version.mp3"
+            audio_path = DATA_DIR / "ZINA-FINAL render 1907.mp3"
             rl(f"Selected audio: {audio_path}")
             if audio_path.exists():
                 sz = audio_path.stat().st_size
@@ -2826,6 +3234,69 @@ class MainWindow(QMainWindow):
             rl(f"HAS_MULTIMEDIA: {HAS_MULTIMEDIA}")
             rl(f"Player simulation: {self._player_simulation}")
             rl(f"Player error: {self._player_error or 'None'}")
+
+            # Segmented proxy diagnostics
+            rl("")
+            rl("[SEGMENTED PROXY AUDIO DIAGNOSTICS]")
+            rl(f"Proxy manifest exists: {PROXY_MANIFEST_PATH.exists()}")
+            rl(f"Proxy mode active: {self._proxy_mode}")
+            if self._proxy_manifest:
+                rl(f"Segment count: {len(self._proxy_manifest.get('segments', []))}")
+                rl(f"Total duration: {self._proxy_manifest.get('total_duration', 0.0):.2f} sec")
+                rl(f"Format: {self._proxy_manifest.get('format', '?')}")
+                rl(f"Bitrate: {self._proxy_manifest.get('bitrate', '?')}")
+                # Check first segment
+                segments = self._proxy_manifest.get("segments", [])
+                if segments:
+                    first = segments[0]
+                    first_path = PROJECT_ROOT / first["path"]
+                    rl(f"First segment: {first.get('title', '?')}")
+                    rl(f"  path: {first['path']}")
+                    rl(f"  exists: {first_path.exists()}")
+                    if first_path.exists():
+                        rl(f"  size: {first_path.stat().st_size} bytes")
+                if len(segments) > 1:
+                    second = segments[1]
+                    second_path = PROJECT_ROOT / second["path"]
+                    rl(f"Second segment: {second.get('title', '?')}")
+                    rl(f"  exists: {second_path.exists()}")
+                    if second_path.exists():
+                        rl(f"  size: {second_path.stat().st_size} bytes")
+                if len(segments) > 1:
+                    last = segments[-1]
+                    last_path = PROJECT_ROOT / last["path"]
+                    rl(f"Last segment: {last.get('title', '?')}")
+                    rl(f"  exists: {last_path.exists()}")
+                    if last_path.exists():
+                        rl(f"  size: {last_path.stat().st_size} bytes")
+
+                # Total proxy size
+                total_size = 0
+                for s in segments:
+                    p = PROJECT_ROOT / s["path"]
+                    if p.exists():
+                        total_size += p.stat().st_size
+                rl(f"Total proxy size: {total_size / (1024*1024):.2f} MB")
+
+                # Check missing
+                missing = [s for s in segments if not (PROJECT_ROOT / s["path"]).exists()]
+                if missing:
+                    rl(f"Missing segments: {len(missing)}")
+                    for m in missing[:5]:
+                        rl(f"  Missing: {m['path']}")
+                else:
+                    rl(f"Missing segments: 0")
+
+                # Determine audio status
+                if self._proxy_mode:
+                    rl("AUDIO_STATUS: OK_SEGMENTED_PROXY")
+                else:
+                    rl("AUDIO_STATUS: PROXY_MISSING")
+            else:
+                rl("AUDIO_STATUS: PROXY_MISSING — proxy manifest not loaded")
+
+            rl("")
+
             if self._player and not self._player_simulation:
                 try:
                     ms = self._player.mediaStatus()
@@ -2846,24 +3317,29 @@ class MainWindow(QMainWindow):
             if self._player_error and "Ошибка" in str(self._player_error):
                 rl("")
                 rl(">>> QMediaPlayer FAILED. Check audio file format/codec/size.")
-                rl(">>> 2.17 GB MP3 may be too large for Qt's built-in player.")
-                rl(">>> Recommended fallback: proxy audio or python-vlc.")
+                if not self._proxy_mode:
+                    rl(">>> Proxy audio segments not found — run: python bookforge.py proxy-audio-segments")
+                else:
+                    rl(">>> Proxy segments are loaded — master audio failure is non-critical.")
             rl("")
 
             # --- 5. Audio fallback recommendation ---
             rl("[FALLBACK RECOMMENDATION]")
-            for vlc_path in [
-                r"C:\Program Files\VideoLAN\VLC\vlc.exe",
-                r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe"
-            ]:
-                rl(f"VLC at '{vlc_path}': {'YES' if os.path.exists(vlc_path) else 'NO'}")
-            ffplay = shutil.which("ffplay")
-            rl(f"ffplay: {ffplay or 'NOT FOUND'}")
-            rl("")
-            rl("Options:")
-            rl("  Option A: use ffplay external preview (for audio check only)")
-            rl("  Option B: install python-vlc (pip install python-vlc)")
-            rl("  Option C: generate low-bitrate proxy MP3 for GUI playback")
+            if self._proxy_mode:
+                rl("Segmented proxy audio active → no fallback needed.")
+            else:
+                for vlc_path in [
+                    r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+                    r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe"
+                ]:
+                    rl(f"VLC at '{vlc_path}': {'YES' if os.path.exists(vlc_path) else 'NO'}")
+                ffplay = shutil.which("ffplay")
+                rl(f"ffplay: {ffplay or 'NOT FOUND'}")
+                rl("")
+                rl("Options:")
+                rl("  Option A: use ffplay external preview (for audio check only)")
+                rl("  Option B: install python-vlc (pip install python-vlc)")
+                rl("  Option C: generate low-bitrate proxy segments: python bookforge.py proxy-audio-segments")
             rl("")
 
             # --- 6. Waveform diagnostics ---
@@ -2929,6 +3405,7 @@ class MainWindow(QMainWindow):
             rl("TimelineWidget: AVAILABLE")
             rl("PropertiesDock: AVAILABLE")
             rl(f"Player simulation mode: {self._player_simulation}")
+            rl(f"Proxy mode: {self._proxy_mode}")
             rl(f"Total chapters: {len(self._chapters)}")
             rl(f"Total duration: {self._total_duration:.2f} sec")
             rl(f"Layout dirty: {self._layout_dirty}")
@@ -2940,8 +3417,9 @@ class MainWindow(QMainWindow):
             rl("  SUMMARY")
             rl("=" * 70)
 
-            audio_ok = audio_path.exists() and not self._player_error
-            if not audio_path.exists():
+            if self._proxy_mode:
+                audio_status = "OK_SEGMENTED_PROXY"
+            elif not audio_path.exists():
                 audio_status = "FILE_MISSING"
             elif self._player_error:
                 audio_status = f"FAILED_QMEDIAPLAYER: {self._player_error[:80]}"
@@ -2973,8 +3451,8 @@ class MainWindow(QMainWindow):
             fixes = []
             if not audio_path.exists():
                 fixes.append("Find/replace missing audio file")
-            if self._player_error:
-                fixes.append("Create proxy audio for QMediaPlayer (ffmpeg -> low-bitrate MP3)")
+            if not self._proxy_mode and self._player_error:
+                fixes.append("Create proxy audio: python bookforge.py proxy-audio-segments")
             if not self._waveform_data:
                 fixes.append("Generate waveform: python bookforge.py waveform")
             if not self._chapters:
@@ -3157,6 +3635,12 @@ class ZoomGraphicsView(QGraphicsView):
 # =========================================================
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Book Wunderwaffe Studio 1.0")
+    parser.add_argument("--file", type=str, default=None,
+                        help="Path to audio file to load")
+    args, _ = parser.parse_known_args()
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
@@ -3173,7 +3657,7 @@ def main():
     palette.setColor(palette.ColorRole.HighlightedText, QColor("#000000"))
     app.setPalette(palette)
 
-    window = MainWindow()
+    window = MainWindow(audio_path=args.file)
     window.show()
     sys.exit(app.exec())
 

@@ -32,6 +32,9 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Optional
 
+# ── Import raw MP3 cutter for >2GB files ────────────────────────
+from _mp3_cutter import extract_segment_raw_mp3, get_duration_ffprobe
+
 # ── Reuse from suviren_q.py ─────────────────────────────────────
 # We import core functions/classes to avoid code duplication.
 # suviren_q.py provides: Chapter, parse_rpp, detect_chapters_from_rpp,
@@ -156,11 +159,6 @@ def _score_by_name(path: Path, keywords: list[str]) -> int:
 def _pick_best_audio(candidates: list[Path]) -> Optional[Path]:
     if not candidates:
         return None
-    # Priority 0: exact match for the known final file
-    EXACT_FINAL = "ЗИНА. Книга. final last version"
-    for p in candidates:
-        if p.stem == EXACT_FINAL:
-            return p  # Absolute priority — exact match wins immediately
     # Priority keywords in order (higher = earlier in list = higher priority)
     PRIORITY_KEYWORDS = [
         "final last",
@@ -170,8 +168,8 @@ def _pick_best_audio(candidates: list[Path]) -> Optional[Path]:
         "complete",
         "version",
     ]
-    # Blacklist: avoid old/legacy files if better alternatives exist
-    BLACKLIST = ["zinaida"]
+    # No automatic blacklist — let scoring handle it naturally
+    BLACKLIST: list[str] = [""]
     scored = []
     for p in candidates:
         name = p.stem.lower()
@@ -2951,6 +2949,251 @@ def cmd_install_shortcut(args: argparse.Namespace) -> None:
     print()
 
 
+# ── Proxy Audio Segments ───────────────────────────────────────────
+
+def _sanitize_segment_name(title: str) -> str:
+    """Convert chapter title to a safe ASCII filename segment."""
+    CYRILLIC_TO_LATIN = {
+        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd',
+        'е': 'e', 'ё': 'yo', 'ж': 'zh', 'з': 'z', 'и': 'i',
+        'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n',
+        'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't',
+        'у': 'u', 'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch',
+        'ш': 'sh', 'щ': 'shch', 'ъ': '', 'ы': 'y', 'ь': '',
+        'э': 'e', 'ю': 'yu', 'я': 'ya',
+    }
+    name = title.lower().strip()
+    # Transliterate cyrillic
+    result = []
+    for ch in name:
+        result.append(CYRILLIC_TO_LATIN.get(ch, ch))
+    name = ''.join(result)
+    # Remove any remaining non-alphanumeric (except whitespace and hyphen)
+    name = re.sub(r'[^a-z0-9\s-]', '', name)
+    name = re.sub(r'\s+', '_', name).strip('_')
+    # Keep it short
+    if len(name) > 40:
+        name = name[:40].rstrip('_')
+    return name or "segment"
+
+
+def cmd_proxy_audio_segments(args: argparse.Namespace) -> None:
+    """Create proxy audio segments by chapter for QMediaPlayer."""
+    overwrite = getattr(args, 'overwrite', False)
+    bitrate = getattr(args, 'bitrate', "64k")
+    config_path = Path(args.config)
+    build_path = Path(args.build_dir) if args.build_dir else build_dir()
+    proxy_dir = build_path / "audio_proxy_segments"
+    manifest_path = proxy_dir / "proxy_manifest.json"
+
+    # 1. Read config for selected audio
+    config = load_project_config(config_path)
+    audio_rel = config.get("audio", "")
+    if not audio_rel:
+        fail("No audio file in project config. Run 'scan' first.")
+    audio_path = (config_path.parent / audio_rel).resolve()
+    if not audio_path.exists():
+        fail(f"Audio file not found: {audio_path}")
+
+    # 2. Read chapters
+    chapters_path_text = config.get("chapters", "")
+    if not chapters_path_text:
+        fail("No chapters file in config. Run 'chapters' first.")
+    chapters_path = (config_path.parent / chapters_path_text).resolve()
+    if not chapters_path.exists():
+        fail(f"Chapters file not found: {chapters_path}. Run 'chapters' first.")
+    chapters = json.loads(chapters_path.read_text(encoding="utf-8"))
+    if not chapters:
+        fail("Empty chapters list.")
+
+    # 3. Create proxy directory
+    ensure_dir(proxy_dir)
+
+    # 4. Source audio mtime for freshness check
+    source_mtime = str(audio_path.stat().st_mtime)
+
+    created = 0
+    skipped = 0
+    total_proxy_size = 0
+    segment_entries = []
+
+    for idx, ch in enumerate(chapters):
+        title = ch.get("title", f"Chapter_{idx:03d}")
+        start_s = float(ch.get("start_seconds", 0))
+        end_s = float(ch.get("end_seconds", 0))
+        duration = end_s - start_s
+        if duration <= 0:
+            warn(f"Segment {idx} ({title}) has zero/negative duration, skipping")
+            skipped += 1
+            continue
+
+        # Build segment filename: 000_intro.m4a, 001_glava_0.m4a, etc.
+        safe_name = _sanitize_segment_name(title)
+        seg_filename = f"{idx:03d}_{safe_name}.m4a"
+        out_path = proxy_dir / seg_filename
+
+        # Check if segment exists and is fresh
+        if not overwrite and out_path.exists():
+            seg_mtime = str(out_path.stat().st_mtime)
+            if seg_mtime >= source_mtime and out_path.stat().st_size > 0:
+                # Segment seems valid, skip
+                total_proxy_size += out_path.stat().st_size
+                skipped += 1
+                segment_entries.append({
+                    "index": idx,
+                    "title": title,
+                    "global_start": round(start_s, 3),
+                    "global_end": round(end_s, 3),
+                    "duration": round(duration, 3),
+                    "path": str(out_path.relative_to(build_path.parent).as_posix()) if build_path.parent else str(out_path),
+                })
+                info(f"  [{idx:03d}] {title} — skipped (exists)")
+                continue
+
+        # Create segment via raw MP3 pipe (avoids ffmpeg parser overflow on >2GB files)
+        log(f"  [{idx:03d}] {title} — extracting raw MP3 & encoding ({duration:.1f}s @ {bitrate})")
+        try:
+            success = extract_segment_raw_mp3(
+                str(audio_path),
+                start_s,
+                duration,
+                str(out_path),
+                bitrate,
+            )
+            if not success:
+                warn(f"Segment {idx} extraction failed, skipping")
+                skipped += 1
+                continue
+        except Exception as e:
+            fail(f"Segment creation failed for {idx} ({title}): {e}")
+
+        # Verify
+        if not out_path.exists():
+            fail(f"Output file not created: {out_path}")
+        file_size = out_path.stat().st_size
+        if file_size == 0:
+            warn(f"Segment {idx} has zero size, but continuing")
+        # Also verify via ffprobe
+        try:
+            actual_dur = get_duration_ffprobe(str(out_path))
+            if actual_dur < 0.5:
+                warn(f"Segment {idx} ffprobe duration too short: {actual_dur:.2f}s")
+        except Exception:
+            pass
+
+        total_proxy_size += file_size
+        created += 1
+
+        segment_entries.append({
+            "index": idx,
+            "title": title,
+            "global_start": round(start_s, 3),
+            "global_end": round(end_s, 3),
+            "duration": round(duration, 3),
+            "path": str(out_path.relative_to(build_path.parent).as_posix()) if build_path.parent else str(out_path),
+        })
+
+    # 5. Write manifest
+    total_duration = sum(s["duration"] for s in segment_entries)
+    manifest_data = {
+        "version": 1,
+        "source_audio": str(audio_path.relative_to(build_path.parent).as_posix()) if build_path.parent else str(audio_path),
+        "source_mtime": source_mtime,
+        "format": "m4a",
+        "codec": "aac",
+        "bitrate": bitrate,
+        "segment_count": len(segment_entries),
+        "total_duration": round(total_duration, 3),
+        "segments": segment_entries,
+    }
+    manifest_path.write_text(json.dumps(manifest_data, indent=2, ensure_ascii=False), encoding="utf-8")
+    log(f"Manifest written: {manifest_path}")
+
+    # 6. Summary
+    mb_size = total_proxy_size / (1024 * 1024)
+    print()
+    ok(f"Proxy audio segments created: {created}, skipped: {skipped}")
+    info(f"  Total proxy size: {mb_size:.2f} MB")
+    info(f"  Manifest: {manifest_path}")
+    if created > 0 and skipped == 0:
+        ok("All segments fresh.")
+    elif created > 0:
+        ok(f"Created {created} new, reused {skipped} existing.")
+
+
+def cmd_proxy_audio_status(args: argparse.Namespace) -> None:
+    """Check proxy audio segments status."""
+    build_path = Path(args.build_dir) if args.build_dir else build_dir()
+    proxy_dir = build_path / "audio_proxy_segments"
+    manifest_path = proxy_dir / "proxy_manifest.json"
+    config_path = Path(args.config)
+
+    if not manifest_path.exists():
+        warn("PROXY_AUDIO_STATUS: MISSING")
+        info("  Proxy manifest not found.")
+        info("  Run: python bookforge.py proxy-audio-segments")
+        return
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        warn(f"PROXY_AUDIO_STATUS: INCOMPLETE (manifest parse error: {e})")
+        return
+
+    # Check source audio consistency
+    config = load_project_config(config_path)
+    audio_rel = config.get("audio", "")
+    manifest_source = manifest.get("source_audio", "")
+    if audio_rel and manifest_source:
+        # Compare normalized paths
+        norm_manifest = manifest_source.replace("\\", "/")
+        norm_config = audio_rel.replace("\\", "/")
+        if norm_manifest != norm_config and not norm_manifest.endswith(norm_config) and not norm_config.endswith(norm_manifest):
+            warn(f"PROXY_AUDIO_STATUS: STALE (source audio mismatch)")
+            info(f"  Manifest source: {manifest_source}")
+            info(f"  Config audio:    {audio_rel}")
+            # Don't return — still check files
+
+    seg_count = manifest.get("segment_count", 0)
+    segments = manifest.get("segments", [])
+
+    if seg_count == 0 or not segments:
+        warn("PROXY_AUDIO_STATUS: INCOMPLETE (no segments in manifest)")
+        return
+
+    missing = []
+    total_size = 0
+    for seg in segments:
+        seg_path_str = seg.get("path", "")
+        seg_path = (build_path.parent / seg_path_str).resolve() if build_path.parent else Path(seg_path_str)
+        if not seg_path.exists():
+            missing.append(seg)
+
+    if missing:
+        warn(f"PROXY_AUDIO_STATUS: INCOMPLETE ({len(missing)} segments missing)")
+        for m in missing:
+            info(f"  Missing: {m.get('path', '?')} ({m.get('title', '?')})")
+        return
+
+    # Calculate total size
+    for seg in segments:
+        seg_path_str = seg.get("path", "")
+        seg_path = (build_path.parent / seg_path_str).resolve() if build_path.parent else Path(seg_path_str)
+        if seg_path.exists():
+            total_size += seg_path.stat().st_size
+
+    first = segments[0]
+    last = segments[-1]
+    mb_size = total_size / (1024 * 1024)
+
+    ok("PROXY_AUDIO_STATUS: OK")
+    info(f"  Segment count: {seg_count}")
+    info(f"  Total size: {mb_size:.2f} MB")
+    info(f"  First: [{first.get('index', 0):03d}] {first.get('title', '?')} — {first.get('duration', 0):.1f}s -> {first.get('path', '?')}")
+    info(f"  Last:  [{last.get('index', 0):03d}] {last.get('title', '?')} — {last.get('duration', 0):.1f}s -> {last.get('path', '?')}")
+    info(f"  Source: {manifest.get('source_audio', '?')}")
+
+
 # ── Main CLI ───────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3033,6 +3276,16 @@ def build_parser() -> argparse.ArgumentParser:
     # clean-temp
     p_ct = sub.add_parser("clean-temp", help="Remove temporary files and render lock")
     p_ct.set_defaults(func=cmd_clean_temp)
+
+    # proxy-audio-segments
+    p_pas = sub.add_parser("proxy-audio-segments", help="Create proxy audio segments by chapter (small AAC/m4a files)")
+    p_pas.add_argument("--overwrite", action="store_true", help="Overwrite existing segment files")
+    p_pas.add_argument("--bitrate", default="64k", choices=["32k", "64k", "96k", "128k"], help="AAC audio bitrate (default: 64k)")
+    p_pas.set_defaults(func=cmd_proxy_audio_segments)
+
+    # proxy-audio-status
+    p_pst = sub.add_parser("proxy-audio-status", help="Check proxy audio segments status")
+    p_pst.set_defaults(func=cmd_proxy_audio_status)
 
     return parser
 
