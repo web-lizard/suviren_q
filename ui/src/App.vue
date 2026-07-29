@@ -306,18 +306,49 @@
               </label>
             </div>
 
-            <div class="inspector-section music-mixer">
+            <button type="button" class="music-summary-card" :class="{ ready: musicAsset }" @click="select('music')">
+              <span aria-hidden="true">♫</span>
+              <span>
+                <b>{{ musicAsset ? 'Музыка проекта' : 'Добавить музыку' }}</b>
+                <small>{{ musicAsset ? `${musicAsset.name} · громкость ${Math.round(project.music.volume * 100)}%` : 'Громкость и эквалайзер' }}</small>
+              </span>
+              <i>Настроить →</i>
+            </button>
+
+            <div class="project-readiness">
+              <span class="section-title">Готовность</span>
+              <div><i :class="{ done: !!audioAsset }"></i><span>Аудио</span><b>{{ audioAsset ? 'готово' : 'нужно' }}</b></div>
+              <div><i :class="{ done: !!coverAsset }"></i><span>Обложка</span><b>{{ coverAsset ? 'готово' : 'нужно' }}</b></div>
+              <div><i :class="{ done: project.chapters.length > 0 }"></i><span>Главы</span><b>{{ project.chapters.length || 'нужно' }}</b></div>
+            </div>
+          </template>
+
+          <template v-else-if="selection.type === 'music'">
+            <div class="music-mixer music-mixer-dedicated">
               <div class="mixer-heading">
-                <span class="section-title">Музыка</span>
-                <button type="button" @click="musicInput?.click()">＋ Добавить</button>
+                <span class="section-title">Музыкальная дорожка</span>
+                <button type="button" @click="musicInput?.click()">＋ Добавить файл</button>
               </div>
-              <label class="field-label">Музыкальная дорожка
+              <label class="field-label">Файл музыки
                 <select v-model="project.musicAssetId" @change="onMusicSelectionChanged">
                   <option :value="null">Без музыки</option>
                   <option v-for="asset in musicCandidates" :key="asset.id" :value="asset.id">{{ asset.name }}</option>
                 </select>
               </label>
               <template v-if="musicAsset">
+                <div class="music-volume-card">
+                  <div>
+                    <span>Громкость музыки</span>
+                    <output>{{ Math.round(project.music.volume * 100) }}%</output>
+                  </div>
+                  <input v-model.number="project.music.volume" type="range" min="0" max="1" step="0.01"
+                         aria-label="Громкость музыки" @input="applyMusicMix" />
+                  <div class="music-volume-presets">
+                    <button type="button" @click="setMusicVolume(0.08)">Тихо · 8%</button>
+                    <button type="button" @click="setMusicVolume(0.16)">Фон · 16%</button>
+                    <button type="button" @click="setMusicVolume(0.3)">Громче · 30%</button>
+                  </div>
+                </div>
                 <label class="switch-row">
                   <span><b>Музыка включена</b><small>Смешивать с озвучкой в MP4</small></span>
                   <input v-model="project.music.enabled" type="checkbox" @change="applyMusicMix" /><i></i>
@@ -326,27 +357,21 @@
                   <span><b>Повторять по кругу</b><small>На всю длину книги</small></span>
                   <input v-model="project.music.loop" type="checkbox" /><i></i>
                 </label>
-                <label class="mixer-slider">
-                  <span><b>Громкость</b><output>{{ Math.round(project.music.volume * 100) }}%</output></span>
-                  <input v-model.number="project.music.volume" type="range" min="0" max="1" step="0.01" @input="applyMusicMix" />
-                </label>
                 <div class="simple-eq">
-                  <span class="section-title">Простой эквалайзер</span>
+                  <span class="section-title">Эквалайзер</span>
                   <label v-for="band in MUSIC_EQ_BANDS" :key="band.key">
                     <span><b>{{ band.label }}</b><output>{{ formatDb(project.music[band.key]) }}</output></span>
                     <input v-model.number="project.music[band.key]" type="range" min="-12" max="12" step="1" @input="applyMusicMix" />
                   </label>
                 </div>
-                <button type="button" class="jump-button" @click="resetMusicMix">Сбросить звук музыки</button>
+                <button type="button" class="jump-button" @click="resetMusicMix">Сбросить громкость и EQ</button>
               </template>
-              <p v-else class="mixer-empty">Добавьте MP3, WAV, M4A, FLAC, OGG или OPUS. Музыка появится отдельной дорожкой на таймлайне.</p>
-            </div>
-
-            <div class="project-readiness">
-              <span class="section-title">Готовность</span>
-              <div><i :class="{ done: !!audioAsset }"></i><span>Аудио</span><b>{{ audioAsset ? 'готово' : 'нужно' }}</b></div>
-              <div><i :class="{ done: !!coverAsset }"></i><span>Обложка</span><b>{{ coverAsset ? 'готово' : 'нужно' }}</b></div>
-              <div><i :class="{ done: project.chapters.length > 0 }"></i><span>Главы</span><b>{{ project.chapters.length || 'нужно' }}</b></div>
+              <div v-else class="music-empty-state">
+                <span aria-hidden="true">♫</span>
+                <b>Музыка ещё не добавлена</b>
+                <p>Выберите MP3, WAV, M4A, FLAC, OGG или OPUS. Файл появится на отдельной зелёной дорожке.</p>
+                <button type="button" @click="musicInput?.click()">Выбрать музыку</button>
+              </div>
             </div>
           </template>
 
@@ -367,6 +392,9 @@
               <button type="button" :class="{ active: project.audioAssetId === selectedAsset.id }" @click="assignAsset('audio', selectedAsset.id)">Основная озвучка</button>
               <button type="button" :class="{ active: project.musicAssetId === selectedAsset.id }" @click="assignAsset('music', selectedAsset.id)">Музыка</button>
             </div>
+            <button v-if="project.musicAssetId === selectedAsset.id" type="button" class="open-music-mixer" @click="select('music')">
+              ♫ Настроить громкость и эквалайзер
+            </button>
             <div class="role-actions" v-else-if="selectedAsset.type === 'video'">
               <button type="button" class="wide" :class="{ active: project.videoAssetId === selectedAsset.id }" @click="assignAsset('video', selectedAsset.id)">Видео сцены</button>
             </div>
@@ -717,6 +745,11 @@
           <span>{{ formatTime(duration, true) }}</span>
         </div>
         <div class="timeline-actions">
+          <button type="button" class="music-mixer-shortcut"
+                  :class="{ active: selection.type === 'music', empty: !musicAsset }"
+                  @click="select('music')">
+            <span>♫</span>{{ musicAsset ? `Музыка · ${Math.round(project.music.volume * 100)}%` : 'Добавить музыку' }}
+          </button>
           <button type="button" @click="addChapterAtCursor"><span>＋</span> Глава</button>
           <button type="button" @click="addSceneAtCursor"><span>＋</span> Сцена</button>
           <label class="zoom-control" title="Масштаб таймлайна"><span>−</span><input v-model.number="timelineZoom" type="range" min="1" max="6" step="0.25" /><span>＋</span></label>
@@ -730,7 +763,10 @@
           <div><span class="track-icon scene"></span>Сцены</div>
           <div><span class="track-icon visual"></span>Видео / фон</div>
           <div><span class="track-icon audio"></span>Аудио</div>
-          <div><span class="track-icon music"></span>Музыка</div>
+          <button type="button" class="timeline-track-button" @click="select('music')">
+            <span class="track-icon music"></span>
+            <span>Музыка<small>{{ musicAsset ? `${Math.round(project.music.volume * 100)}%` : 'добавить' }}</small></span>
+          </button>
         </div>
         <div class="timeline-content" :style="{ width: `${timelineZoom * 100}%` }">
           <div class="timeline-ruler">
@@ -784,7 +820,7 @@
             <button v-if="musicAsset" type="button" class="music-clip"
                     :class="{ muted: !project.music.enabled }"
                     :style="clipStyle(0, duration, 100)"
-                    @click.stop="select('asset', musicAsset.id)">
+                    @click.stop="select('music')">
               <span aria-hidden="true">♫</span>
               <b>{{ musicAsset.name }}</b>
               <small>{{ project.music.enabled ? `${Math.round(project.music.volume * 100)}% · EQ ${musicEqSummary}` : 'выключена' }}</small>
@@ -1399,7 +1435,7 @@ const selectedChapter = computed(() => selection.type === 'chapter' ? project.ch
 const selectedScene = computed(() => selection.type === 'scene' ? project.scenes.find((item) => item.id === selection.id) || null : null)
 const selectedLayer = computed(() => selection.type === 'layer' ? project.layers[selection.id] || null : null)
 const inspectorTitle = computed(() => ({
-  project: 'Проект', asset: 'Материал', chapter: 'Глава', scene: 'Сцена', layer: layerLabel(selection.id),
+  project: 'Проект', music: 'Музыка', asset: 'Материал', chapter: 'Глава', scene: 'Сцена', layer: layerLabel(selection.id),
 })[selection.type] || 'Свойства')
 
 const timelineBars = computed(() => {
@@ -3072,6 +3108,7 @@ function assignAsset(role, id) {
     const asset = assetById(id)
     if (asset) asset.role = 'music'
     project.music.enabled = true
+    select('music')
   }
   dirty.value = true
   nextTick(() => {
@@ -3451,6 +3488,11 @@ function onMusicSelectionChanged() {
 
 function resetMusicMix() {
   Object.assign(project.music, clone(DEFAULT_MUSIC_MIX))
+  applyMusicMix()
+}
+
+function setMusicVolume(level) {
+  project.music.volume = Math.max(0, Math.min(1, Number(level) || 0))
   applyMusicMix()
 }
 

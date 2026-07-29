@@ -36,6 +36,16 @@ test('video projects support a separate music bed with volume and three-band EQ'
   assert.match(source, /createBiquadFilter/)
 })
 
+test('music volume is directly reachable from the timeline and has quick presets', () => {
+  assert.match(source, /class="music-mixer-shortcut"/)
+  assert.match(source, /class="timeline-track-button"/)
+  assert.match(source, /selection\.type === 'music'/)
+  assert.match(source, /setMusicVolume\(0\.08\)/)
+  assert.match(source, /setMusicVolume\(0\.16\)/)
+  assert.match(source, /setMusicVolume\(0\.3\)/)
+  assert.match(source, /Громкость музыки/)
+})
+
 test('opening video rebuilds narrated chapters and exposes chapter audio clips', () => {
   assert.match(source, /workspace === 'video' && activeProjectRecord\.value\?\.book/)
   assert.match(source, /await openBookInVideo\(\)/)
