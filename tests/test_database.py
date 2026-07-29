@@ -18,7 +18,7 @@ class MigrationTests(unittest.TestCase):
             database = BookenderDatabase(
                 Path(temp) / "bookender.db", ROOT / "bookender" / "migrations"
             )
-            self.assertEqual(database.migrate(), [1, 2])
+            self.assertEqual(database.migrate(), [1, 2, 3])
             self.assertEqual(database.migrate(), [])
             self.assertEqual(database.integrity_check(), "ok")
             with database.connect() as connection:
@@ -28,7 +28,7 @@ class MigrationTests(unittest.TestCase):
                         "SELECT version FROM schema_migrations ORDER BY version"
                     )
                 ]
-                self.assertEqual(versions, [1, 2])
+                self.assertEqual(versions, [1, 2, 3])
 
     def test_failed_migration_rolls_back_its_ddl(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
