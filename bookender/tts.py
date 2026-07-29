@@ -1,9 +1,15 @@
-"""Non-blocking chapter narration jobs."""
+"""Project-aware Edge TTS voices, previews, and versioned narration jobs."""
 
 from __future__ import annotations
 
 import asyncio
+import importlib.util
+import json
+import re
+import shutil
+import subprocess
 import threading
+import time
 import uuid as uuidlib
 from pathlib import Path
 from typing import Any
@@ -13,15 +19,213 @@ from .paths import USER_DATA
 from .repository import ProjectNotFoundError, ProjectRepository, utc_now
 
 
+DEFAULT_VOICE = "ru-RU-SvetlanaNeural"
+RATE_PATTERN = re.compile(r"^[+-](?:100|[0-9]{1,2})%$")
+PITCH_PATTERN = re.compile(r"^[+-](?:[0-9]{1,3})Hz$")
+VOLUME_PATTERN = re.compile(r"^[+-](?:100|[0-9]{1,2})%$")
+RATE_VALUES = {"-25%", "-10%", "+0%", "+15%", "+30%"}
+PITCH_VALUES = {"-40Hz", "-25Hz", "-10Hz", "+0Hz", "+10Hz", "+25Hz", "+40Hz"}
+TTS_UNAVAILABLE_MESSAGE = (
+    "Модуль озвучки не запущен. Проверьте установку компонентов TTS."
+)
+TTS_FAILED_MESSAGE = (
+    "Не удалось создать озвучку. Проверьте подключение к интернету и повторите."
+)
+FALLBACK_VOICES = [
+    {
+        "id": "ru-RU-DmitryNeural",
+        "name": "Дмитрий",
+        "friendly_name": "Microsoft Dmitry Online (Natural) - Russian (Russia)",
+        "language": "ru",
+        "locale": "ru-RU",
+        "region": "RU",
+        "gender": "Male",
+        "suggested": True,
+    },
+    {
+        "id": "ru-RU-SvetlanaNeural",
+        "name": "Светлана",
+        "friendly_name": "Microsoft Svetlana Online (Natural) - Russian (Russia)",
+        "language": "ru",
+        "locale": "ru-RU",
+        "region": "RU",
+        "gender": "Female",
+        "suggested": True,
+    },
+]
+
+
+class TtsUnavailableError(RuntimeError):
+    """Raised when the configured TTS runtime cannot be imported."""
+
+
 class TtsService:
     def __init__(self, repository: ProjectRepository) -> None:
         self.repository = repository
         self._threads: dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
+        self._voice_cache: tuple[float, list[dict[str, Any]]] | None = None
+        self._recover_interrupted_jobs()
+
+    def _recover_interrupted_jobs(self) -> None:
+        try:
+            with self.repository.database.transaction() as connection:
+                result = connection.execute(
+                    """
+                    UPDATE tts_jobs
+                    SET status='failed', progress=0, finished_at=?,
+                        error='TTS worker stopped before completion',
+                        user_error='Предыдущая задача озвучки была прервана. Запустите её повторно.'
+                    WHERE status IN ('queued', 'running')
+                    """,
+                    (utc_now(),),
+                )
+            if result.rowcount:
+                log_event("tts_interrupted_jobs_recovered", count=result.rowcount)
+        except Exception as exc:
+            log_event("tts_job_recovery_failed", error=repr(exc))
+
+    def dependency_status(self) -> dict[str, Any]:
+        spec = importlib.util.find_spec("edge_tts")
+        if spec is None:
+            return {
+                "available": False,
+                "provider": "edge-tts",
+                "message": TTS_UNAVAILABLE_MESSAGE,
+            }
+        try:
+            import edge_tts
+
+            version = getattr(edge_tts, "__version__", "")
+        except Exception as exc:
+            log_event("tts_startup_check_failed", error=repr(exc))
+            return {
+                "available": False,
+                "provider": "edge-tts",
+                "message": TTS_UNAVAILABLE_MESSAGE,
+            }
+        return {
+            "available": True,
+            "provider": "edge-tts",
+            "version": version,
+            "message": "Компонент озвучки готов.",
+        }
+
+    def require_available(self) -> None:
+        status = self.dependency_status()
+        if not status["available"]:
+            log_event("tts_runtime_unavailable", status=status)
+            raise TtsUnavailableError(TTS_UNAVAILABLE_MESSAGE)
+
+    def normalize_settings(self, settings: dict[str, Any]) -> dict[str, str]:
+        return self._normalized_settings(settings)
+
+    def list_voices(self, *, refresh: bool = False) -> list[dict[str, Any]]:
+        self.require_available()
+        now = time.monotonic()
+        if not refresh and self._voice_cache and now - self._voice_cache[0] < 21_600:
+            return self._voice_cache[1]
+        try:
+            import edge_tts
+
+            raw_voices = asyncio.run(edge_tts.list_voices())
+            voices = []
+            for raw in raw_voices:
+                short_name = str(raw.get("ShortName") or "").strip()
+                locale = str(raw.get("Locale") or "").strip()
+                if not short_name:
+                    continue
+                language, _, region = locale.partition("-")
+                technical_name = short_name.split("-", 2)[-1]
+                for suffix in ("MultilingualNeural", "Neural"):
+                    if technical_name.endswith(suffix):
+                        technical_name = technical_name[: -len(suffix)]
+                        break
+                localized_names = {
+                    "ru-RU-DmitryNeural": "Дмитрий",
+                    "ru-RU-SvetlanaNeural": "Светлана",
+                }
+                display_name = localized_names.get(short_name, technical_name)
+                voices.append(
+                    {
+                        "id": short_name,
+                        "name": str(display_name),
+                        "friendly_name": str(raw.get("FriendlyName") or ""),
+                        "language": language,
+                        "locale": locale,
+                        "region": region,
+                        "gender": str(raw.get("Gender") or ""),
+                        "suggested": locale.casefold().startswith("ru-"),
+                    }
+                )
+            voices.sort(
+                key=lambda voice: (
+                    not voice["suggested"],
+                    voice["language"].casefold(),
+                    voice["name"].casefold(),
+                )
+            )
+            self._voice_cache = (now, voices)
+            log_event("tts_voices_loaded", count=len(voices))
+            return voices
+        except Exception as exc:
+            log_event("tts_voice_list_failed", error=repr(exc))
+            voices = [dict(voice) for voice in FALLBACK_VOICES]
+            self._voice_cache = (now, voices)
+            return voices
+
+    def preview(
+        self, project_uuid: str, text: str, settings: dict[str, Any]
+    ) -> dict[str, Any]:
+        self.require_available()
+        project = self.repository.get_project(project_uuid, include_details=True)
+        clean_text = " ".join(str(text or "").split())[:500]
+        if not clean_text:
+            clean_text = (
+                "Это короткая проба голоса Bookender Studio. "
+                "Вы можете изменить скорость и высоту тона."
+            )
+        normalized = self._normalized_settings(settings)
+        relative_output = (
+            Path(project["project_folder"])
+            / "temp"
+            / f"voice-preview-{uuidlib.uuid4().hex}.mp3"
+        ).as_posix()
+        output = self._absolute_project_path(project, relative_output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._synthesize(clean_text, output, normalized)
+        except Exception as exc:
+            output.unlink(missing_ok=True)
+            log_event(
+                "tts_preview_failed",
+                project_uuid=project_uuid,
+                voice=normalized["voice"],
+                error=repr(exc),
+            )
+            raise RuntimeError(TTS_FAILED_MESSAGE) from exc
+        result = {
+            "file_path": relative_output,
+            "voice": normalized["voice"],
+            "rate": normalized["rate"],
+            "pitch": normalized["pitch"],
+            "volume": normalized["volume"],
+            "duration": self._audio_duration(output),
+            "file_size": output.stat().st_size,
+            "temporary": True,
+        }
+        log_event(
+            "tts_preview_ready",
+            project_uuid=project_uuid,
+            voice=normalized["voice"],
+            file_size=result["file_size"],
+        )
+        return result
 
     def queue_chapter(
         self, project_uuid: str, chapter_id: int, *, start: bool = True
     ) -> dict[str, Any]:
+        self.require_available()
         project = self.repository.get_project(project_uuid, include_details=True)
         chapter = next(
             (item for item in project["chapters"] if item["id"] == chapter_id),
@@ -29,13 +233,28 @@ class TtsService:
         )
         if chapter is None:
             raise ProjectNotFoundError(f"{project_uuid}/chapter/{chapter_id}")
-        settings = project.get("tts_settings") or {}
-        voice = str(settings.get("voice") or "ru-RU-SvetlanaNeural")
+        if not chapter["content"].strip():
+            raise ValueError("Пустую главу нельзя озвучить.")
+        settings = self._normalized_settings(project.get("tts_settings") or {})
         job_uuid = str(uuidlib.uuid4())
+        with self.repository.database.connect() as connection:
+            version_number = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(MAX(version_number), 0) + 1
+                    FROM audio_assets
+                    WHERE project_id=? AND chapter_id=?
+                    """,
+                    (project["id"], chapter_id),
+                ).fetchone()[0]
+            )
         relative_output = (
             Path(project["project_folder"])
             / "audio"
-            / f"chapter-{chapter_id}-{chapter['content_hash'][:12]}.mp3"
+            / (
+                f"chapter-{chapter_id}-v{version_number:03d}-"
+                f"{chapter['content_hash'][:8]}-{job_uuid[:8]}.mp3"
+            )
         ).as_posix()
         now = utc_now()
         with self.repository.database.transaction() as connection:
@@ -43,15 +262,15 @@ class TtsService:
                 """
                 INSERT INTO tts_jobs(
                     uuid, project_id, chapter_id, status, provider, voice,
-                    source_text_hash, output_path, created_at
-                ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+                    source_text_hash, output_path, created_at, job_kind, progress
+                ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, 'chapter', 0)
                 """,
                 (
                     job_uuid,
                     project["id"],
                     chapter_id,
-                    str(settings.get("provider") or "edge-tts"),
-                    voice,
+                    settings["provider"],
+                    settings["voice"],
                     chapter["content_hash"],
                     relative_output,
                     now,
@@ -60,7 +279,14 @@ class TtsService:
         if start:
             thread = threading.Thread(
                 target=self._run,
-                args=(job_uuid, project_uuid, chapter, settings, relative_output),
+                args=(
+                    job_uuid,
+                    project_uuid,
+                    chapter,
+                    settings,
+                    relative_output,
+                    version_number,
+                ),
                 name=f"bookender-tts-{job_uuid[:8]}",
                 daemon=True,
             )
@@ -73,10 +299,12 @@ class TtsService:
             project_uuid=project_uuid,
             chapter_id=chapter_id,
             source_text_hash=chapter["content_hash"],
+            version_number=version_number,
         )
         return self.get_job(job_uuid)
 
     def queue_book(self, project_uuid: str) -> list[dict[str, Any]]:
+        self.require_available()
         project = self.repository.get_project(project_uuid, include_details=True)
         jobs = [
             self.queue_chapter(project_uuid, chapter["id"], start=False)
@@ -138,25 +366,25 @@ class TtsService:
         chapter: dict[str, Any],
         settings: dict[str, Any],
         relative_output: str,
+        version_number: int,
     ) -> None:
-        output = USER_DATA / relative_output
+        project_record = self.repository.get_project(
+            project_uuid, include_details=False
+        )
+        output = self._absolute_project_path(project_record, relative_output)
         output.parent.mkdir(parents=True, exist_ok=True)
         with self.repository.database.transaction() as connection:
             connection.execute(
-                "UPDATE tts_jobs SET status='running', started_at=? WHERE uuid=?",
+                """
+                UPDATE tts_jobs
+                SET status='running', progress=0.1, started_at=?
+                WHERE uuid=?
+                """,
                 (utc_now(), job_uuid),
             )
         try:
-            import edge_tts
-
-            communicate = edge_tts.Communicate(
-                chapter["content"],
-                str(settings.get("voice") or "ru-RU-SvetlanaNeural"),
-                rate=str(settings.get("rate") or "+0%"),
-                volume=str(settings.get("volume") or "+0%"),
-                pitch=str(settings.get("pitch") or "+0Hz"),
-            )
-            asyncio.run(communicate.save(str(output)))
+            self._synthesize(chapter["content"], output, settings)
+            duration = self._audio_duration(output)
             now = utc_now()
             with self.repository.database.transaction() as connection:
                 project = connection.execute(
@@ -164,29 +392,43 @@ class TtsService:
                 ).fetchone()
                 connection.execute(
                     """
+                    UPDATE audio_assets SET is_active=0
+                    WHERE project_id=? AND chapter_id=?
+                    """,
+                    (project["id"], chapter["id"]),
+                )
+                connection.execute(
+                    """
                     INSERT INTO audio_assets(
                         project_id, chapter_id, file_path, generation_status,
-                        voice, source_text_hash, created_at, updated_at
-                    ) VALUES (?, ?, ?, 'ready', ?, ?, ?, ?)
-                    ON CONFLICT(project_id, file_path) DO UPDATE SET
-                        generation_status='ready',
-                        source_text_hash=excluded.source_text_hash,
-                        updated_at=excluded.updated_at
+                        voice, source_text_hash, created_at, updated_at,
+                        title, rate, pitch, volume, version_number, is_active,
+                        duration, file_size, metadata_json
+                    ) VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                     """,
                     (
                         project["id"],
                         chapter["id"],
                         relative_output,
-                        str(settings.get("voice") or "ru-RU-SvetlanaNeural"),
+                        settings["voice"],
                         chapter["content_hash"],
                         now,
                         now,
+                        f"{chapter['title']} · версия {version_number}",
+                        settings["rate"],
+                        settings["pitch"],
+                        settings["volume"],
+                        version_number,
+                        duration,
+                        output.stat().st_size,
+                        json.dumps({"provider": settings["provider"]}),
                     ),
                 )
                 connection.execute(
                     """
                     UPDATE tts_jobs
-                    SET status='done', finished_at=?, error=''
+                    SET status='done', progress=1, finished_at=?,
+                        error='', user_error=''
                     WHERE uuid=?
                     """,
                     (now, job_uuid),
@@ -196,23 +438,36 @@ class TtsService:
                 job_uuid=job_uuid,
                 project_uuid=project_uuid,
                 chapter_id=chapter["id"],
+                output_path=relative_output,
+                file_size=output.stat().st_size,
+                duration=duration,
             )
         except Exception as exc:
+            try:
+                output.unlink(missing_ok=True)
+            except OSError:
+                pass
+            user_error = (
+                TTS_UNAVAILABLE_MESSAGE
+                if isinstance(exc, (ImportError, ModuleNotFoundError, TtsUnavailableError))
+                else TTS_FAILED_MESSAGE
+            )
             with self.repository.database.transaction() as connection:
                 connection.execute(
                     """
                     UPDATE tts_jobs
-                    SET status='failed', finished_at=?, error=?
+                    SET status='failed', progress=0, finished_at=?,
+                        error=?, user_error=?
                     WHERE uuid=?
                     """,
-                    (utc_now(), str(exc), job_uuid),
+                    (utc_now(), repr(exc), user_error, job_uuid),
                 )
             log_event(
                 "tts_job_failed",
                 job_uuid=job_uuid,
                 project_uuid=project_uuid,
                 chapter_id=chapter["id"],
-                error=str(exc),
+                error=repr(exc),
             )
         finally:
             with self._lock:
@@ -234,10 +489,106 @@ class TtsService:
         chapter = next(
             item for item in project["chapters"] if item["id"] == job["chapter_id"]
         )
+        version_number = int(
+            Path(job["output_path"]).stem.split("-v", 1)[1].split("-", 1)[0]
+        )
         self._run(
             job_uuid,
             job["project_uuid"],
             chapter,
-            project.get("tts_settings") or {},
+            self._normalized_settings(project.get("tts_settings") or {}),
             job["output_path"],
+            version_number,
         )
+
+    @staticmethod
+    def _normalized_settings(settings: dict[str, Any]) -> dict[str, str]:
+        values = {
+            "voice": str(settings.get("voice") or DEFAULT_VOICE).strip(),
+            "rate": str(settings.get("rate") or "+0%").strip(),
+            "pitch": str(settings.get("pitch") or "+0Hz").strip(),
+            "volume": str(settings.get("volume") or "+0%").strip(),
+            "provider": str(settings.get("provider") or "edge-tts").strip(),
+        }
+        if not RATE_PATTERN.fullmatch(values["rate"]) or values["rate"] not in RATE_VALUES:
+            raise ValueError("Выбрано некорректное значение скорости речи.")
+        if not PITCH_PATTERN.fullmatch(values["pitch"]) or values["pitch"] not in PITCH_VALUES:
+            raise ValueError("Выбрано некорректное значение высоты тона.")
+        if not VOLUME_PATTERN.fullmatch(values["volume"]):
+            raise ValueError("Выбрано некорректное значение громкости.")
+        if values["provider"] != "edge-tts":
+            raise ValueError("Выбран неподдерживаемый TTS-провайдер.")
+        return values
+
+    @staticmethod
+    def _synthesize(text: str, output: Path, settings: dict[str, str]) -> None:
+        import edge_tts
+
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                communicate = edge_tts.Communicate(
+                    text,
+                    settings["voice"],
+                    rate=settings["rate"],
+                    volume=settings["volume"],
+                    pitch=settings["pitch"],
+                )
+                asyncio.run(communicate.save(str(output)))
+                if output.is_file() and output.stat().st_size > 0:
+                    return
+                raise RuntimeError("TTS provider did not create an audio file")
+            except Exception as exc:
+                last_error = exc
+                output.unlink(missing_ok=True)
+                transient = type(exc).__name__ in {
+                    "NoAudioReceived",
+                    "ConnectionTimeoutError",
+                    "WSServerHandshakeError",
+                    "ClientConnectionError",
+                }
+                if not transient or attempt == 2:
+                    raise
+                time.sleep(attempt + 1)
+        if last_error:
+            raise last_error
+
+    @staticmethod
+    def _audio_duration(path: Path) -> float | None:
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            return None
+        try:
+            result = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+            )
+            value = float(result.stdout.strip()) if result.returncode == 0 else 0
+            return round(value, 3) if value > 0 else None
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return None
+
+    @staticmethod
+    def _absolute_project_path(project: dict[str, Any], relative_path: str) -> Path:
+        projects_root = (USER_DATA / "projects").resolve()
+        project_root = (USER_DATA / project["project_folder"]).resolve()
+        output = (USER_DATA / relative_path).resolve()
+        try:
+            project_root.relative_to(projects_root)
+            output.relative_to(project_root)
+        except ValueError as exc:
+            raise ValueError("Некорректный путь файла озвучки.") from exc
+        return output
