@@ -46,6 +46,16 @@ test('music volume is directly reachable from the timeline and has quick presets
   assert.match(source, /Громкость музыки/)
 })
 
+test('music preview applies native volume and reports whether live EQ is active', () => {
+  assert.match(source, /element\.volume = level/)
+  assert.match(source, /setAudioValue\(musicGain\?\.gain, 1\)/)
+  assert.match(source, /parameter\.cancelScheduledValues\(now\)/)
+  assert.match(source, /async function onMusicControlInput/)
+  assert.match(source, /async function toggleMusicPreview/)
+  assert.match(source, /musicEqState\.active/)
+  assert.match(source, /EQ активен/)
+})
+
 test('opening video rebuilds narrated chapters and exposes chapter audio clips', () => {
   assert.match(source, /workspace === 'video' && activeProjectRecord\.value\?\.book/)
   assert.match(source, /await openBookInVideo\(\)/)

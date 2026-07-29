@@ -261,6 +261,7 @@
                  @ended="onMediaEnded('audio')" @error="onMediaError('audio')"></audio>
           <audio ref="musicEl" :src="musicSource" crossorigin="anonymous" preload="metadata"
                  :loop="project.music.loop" @loadedmetadata="onMusicMetadata"
+                 @play="musicPreviewPlaying = true" @pause="musicPreviewPlaying = false"
                  @error="onMusicError"></audio>
         </div>
       </section>
@@ -342,12 +343,15 @@
                     <output>{{ Math.round(project.music.volume * 100) }}%</output>
                   </div>
                   <input v-model.number="project.music.volume" type="range" min="0" max="1" step="0.01"
-                         aria-label="Громкость музыки" @input="applyMusicMix" />
+                         aria-label="Громкость музыки" @input="onMusicControlInput(false)" />
                   <div class="music-volume-presets">
                     <button type="button" @click="setMusicVolume(0.08)">Тихо · 8%</button>
                     <button type="button" @click="setMusicVolume(0.16)">Фон · 16%</button>
                     <button type="button" @click="setMusicVolume(0.3)">Громче · 30%</button>
                   </div>
+                  <button type="button" class="music-preview-button" @click="toggleMusicPreview">
+                    {{ musicPreviewPlaying ? '■ Остановить пробу' : '▶ Проверить музыку' }}
+                  </button>
                 </div>
                 <label class="switch-row">
                   <span><b>Музыка включена</b><small>Смешивать с озвучкой в MP4</small></span>
@@ -359,10 +363,15 @@
                 </label>
                 <div class="simple-eq">
                   <span class="section-title">Эквалайзер</span>
+                  <div class="music-eq-status" :class="{ active: musicEqState.active, error: musicEqState.error }">
+                    <i></i><span>{{ musicEqState.message }}</span>
+                  </div>
                   <label v-for="band in MUSIC_EQ_BANDS" :key="band.key">
                     <span><b>{{ band.label }}</b><output>{{ formatDb(project.music[band.key]) }}</output></span>
-                    <input v-model.number="project.music[band.key]" type="range" min="-12" max="12" step="1" @input="applyMusicMix" />
+                    <input v-model.number="project.music[band.key]" type="range" min="-12" max="12" step="1"
+                           @input="onMusicControlInput(true)" />
                   </label>
+                  <small class="music-export-note">В экспортируемом MP4 эквалайзер применяется движком FFmpeg независимо от предпросмотра.</small>
                 </div>
                 <button type="button" class="jump-button" @click="resetMusicMix">Сбросить громкость и EQ</button>
               </template>
@@ -1145,6 +1154,12 @@ const audioDuration = ref(0)
 const videoDuration = ref(0)
 const playing = ref(false)
 const volume = ref(0.86)
+const musicPreviewPlaying = ref(false)
+const musicEqState = reactive({
+  active: false,
+  error: false,
+  message: 'Запустите пробу музыки — EQ включится в реальном времени',
+})
 const waveformSamples = ref([])
 const timelineZoom = ref(1)
 
@@ -3406,7 +3421,12 @@ function musicTimeAt(absoluteTime) {
 async function ensureMusicGraph() {
   const element = musicEl.value
   const AudioContextClass = globalThis.AudioContext || globalThis.webkitAudioContext
-  if (!element || !AudioContextClass) return false
+  if (!element || !AudioContextClass) {
+    musicEqState.active = false
+    musicEqState.error = true
+    musicEqState.message = 'EQ предпросмотра недоступен; в MP4 он всё равно будет применён'
+    return false
+  }
   try {
     if (!musicAudioContext || musicAudioContext.state === 'closed') {
       musicAudioContext = new AudioContextClass()
@@ -3432,8 +3452,16 @@ async function ensureMusicGraph() {
         .connect(musicAudioContext.destination)
     }
     if (musicAudioContext.state === 'suspended') await musicAudioContext.resume()
+    musicEqState.active = musicAudioContext.state === 'running'
+    musicEqState.error = !musicEqState.active
+    musicEqState.message = musicEqState.active
+      ? 'EQ активен — изменения слышны сразу'
+      : 'Аудиодвижок приостановлен; нажмите «Проверить музыку»'
     return true
-  } catch {
+  } catch (error) {
+    musicEqState.active = false
+    musicEqState.error = true
+    musicEqState.message = `EQ предпросмотра не запустился: ${error?.message || 'ошибка аудиодвижка'}`
     return false
   }
 }
@@ -3443,14 +3471,31 @@ function applyMusicMix() {
   const enabled = !!project.music.enabled && !!musicSource.value
   const level = enabled ? Math.max(0, Math.min(1, Number(project.music.volume) || 0)) : 0
   const now = musicAudioContext?.currentTime || 0
-  if (musicLowFilter) musicLowFilter.gain.setTargetAtTime(Math.max(-12, Math.min(12, Number(project.music.bass) || 0)), now, 0.015)
-  if (musicMidFilter) musicMidFilter.gain.setTargetAtTime(Math.max(-12, Math.min(12, Number(project.music.mid) || 0)), now, 0.015)
-  if (musicHighFilter) musicHighFilter.gain.setTargetAtTime(Math.max(-12, Math.min(12, Number(project.music.treble) || 0)), now, 0.015)
-  if (musicGain) musicGain.gain.setTargetAtTime(level, now, 0.015)
+
+  function setAudioValue(parameter, value) {
+    if (!parameter) return
+    parameter.cancelScheduledValues(now)
+    parameter.setValueAtTime(value, now)
+  }
+
+  setAudioValue(musicLowFilter?.gain, Math.max(-12, Math.min(12, Number(project.music.bass) || 0)))
+  setAudioValue(musicMidFilter?.gain, Math.max(-12, Math.min(12, Number(project.music.mid) || 0)))
+  setAudioValue(musicHighFilter?.gain, Math.max(-12, Math.min(12, Number(project.music.treble) || 0)))
+  setAudioValue(musicGain?.gain, 1)
   if (element) {
-    element.volume = musicGain ? 1 : level
+    // Native media volume is reliable in Qt WebEngine even when Web Audio is
+    // unavailable. Keep EQ in the graph, but never route volume through it.
+    element.volume = level
     element.loop = !!project.music.loop
     if (!enabled) element.pause()
+  }
+}
+
+async function onMusicControlInput(activateEq = false) {
+  applyMusicMix()
+  if (activateEq || musicPreviewPlaying.value || playing.value) {
+    await ensureMusicGraph()
+    applyMusicMix()
   }
 }
 
@@ -3466,6 +3511,34 @@ async function startMusicPreview(absoluteTime) {
   await element.play()
 }
 
+async function toggleMusicPreview() {
+  const element = musicEl.value
+  if (!element || !musicSource.value) {
+    setNotice('Сначала выберите музыкальный файл', 'warning')
+    return
+  }
+  if (!element.paused) {
+    element.pause()
+    return
+  }
+  audioEl.value?.pause()
+  videoEl.value?.pause()
+  playing.value = false
+  cancelAnimationFrame(playbackFrame)
+  try {
+    project.music.enabled = true
+    await ensureMusicGraph()
+    applyMusicMix()
+    const target = musicTimeAt(currentTime.value)
+    if (Math.abs((element.currentTime || 0) - target) > 0.08) element.currentTime = target
+    await element.play()
+  } catch (error) {
+    musicEqState.active = false
+    musicEqState.error = true
+    musicEqState.message = `Не удалось запустить пробу: ${error.message}`
+  }
+}
+
 function onMusicMetadata() {
   const element = musicEl.value
   if (element) {
@@ -3475,6 +3548,9 @@ function onMusicMetadata() {
 }
 
 function onMusicError() {
+  musicEqState.active = false
+  musicEqState.error = true
+  musicEqState.message = 'Музыкальный файл не удалось открыть'
   if (musicSource.value) setNotice('Музыкальный файл недоступен или не поддерживается браузером.', 'error', 6500)
 }
 
@@ -3493,7 +3569,7 @@ function resetMusicMix() {
 
 function setMusicVolume(level) {
   project.music.volume = Math.max(0, Math.min(1, Number(level) || 0))
-  applyMusicMix()
+  void onMusicControlInput(false)
 }
 
 function releaseLiveVisualizer() {

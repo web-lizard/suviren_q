@@ -1767,6 +1767,73 @@ input[type="range"] {
   color: #b7dec4;
 }
 
+.music-preview-button {
+  width: 100%;
+  min-height: 32px;
+  margin-top: 9px;
+  border: 1px solid rgba(99, 196, 132, .45);
+  border-radius: 5px;
+  background: rgba(67, 151, 96, .14);
+  color: #b2dcc0;
+  font-size: 9px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.music-preview-button:hover {
+  border-color: rgba(117, 218, 151, .72);
+  background: rgba(67, 151, 96, .22);
+}
+
+.music-eq-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 0 10px;
+  padding: 7px 8px;
+  border: 1px solid #303039;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, .018);
+  color: #85848a;
+  font-size: 7.5px;
+  line-height: 1.35;
+}
+
+.music-eq-status i {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #66656c;
+}
+
+.music-eq-status.active {
+  border-color: rgba(86, 178, 117, .34);
+  color: #8db79b;
+}
+
+.music-eq-status.active i {
+  background: #66c386;
+  box-shadow: 0 0 7px rgba(102, 195, 134, .45);
+}
+
+.music-eq-status.error {
+  border-color: rgba(208, 103, 109, .34);
+  color: #c18488;
+}
+
+.music-eq-status.error i {
+  background: #d0676d;
+}
+
+.music-export-note {
+  display: block;
+  margin-top: 9px;
+  color: #67666d;
+  font-size: 7px;
+  line-height: 1.45;
+}
+
 .music-empty-state {
   display: grid;
   justify-items: center;
