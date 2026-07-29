@@ -83,3 +83,26 @@ test('book toolbar is compact and narration exposes real progress', () => {
   assert.match(source, /progress_total/)
   assert.match(source, /Прошло/)
 })
+
+test('timeline playhead supports pointer scrubbing and keyboard seeking', () => {
+  assert.match(source, /ref="timelineContent"/)
+  assert.match(source, /@pointerdown\.stop="startTimelineScrub"/)
+  assert.match(source, /window\.addEventListener\('pointermove', timelinePointerMove\)/)
+  assert.match(source, /window\.addEventListener\('pointerup', timelinePointerUp\)/)
+  assert.match(source, /function onTimelinePlayheadKeydown/)
+  assert.match(source, /event\.key === 'ArrowLeft'/)
+  assert.match(source, /event\.key === 'ArrowRight'/)
+})
+
+test('text navigator maps words to the timeline and plays selected excerpts', () => {
+  assert.match(source, /Текст книги/)
+  assert.match(source, /id="text-navigator-title"/)
+  assert.match(source, /function chapterTimelineWords/)
+  assert.match(source, /event\.shiftKey/)
+  assert.match(source, /seekTo\(word\.start\)/)
+  assert.match(source, /scrollTimelineToTime\(word\.start\)/)
+  assert.match(source, /async function playSelectedExcerpt/)
+  assert.match(source, /function stopAtExcerptEnd/)
+  assert.match(source, /class="timeline-excerpt-range"/)
+  assert.match(source, /Привязка слов расчётная/)
+})

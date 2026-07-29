@@ -754,6 +754,9 @@
           <span>{{ formatTime(duration, true) }}</span>
         </div>
         <div class="timeline-actions">
+          <button type="button" class="text-navigator-shortcut" @click="openTextNavigator">
+            <span>¶</span> Текст книги
+          </button>
           <button type="button" class="music-mixer-shortcut"
                   :class="{ active: selection.type === 'music', empty: !musicAsset }"
                   @click="select('music')">
@@ -777,12 +780,13 @@
             <span>Музыка<small>{{ musicAsset ? `${Math.round(project.music.volume * 100)}%` : 'добавить' }}</small></span>
           </button>
         </div>
-        <div class="timeline-content" :style="{ width: `${timelineZoom * 100}%` }">
-          <div class="timeline-ruler">
+        <div ref="timelineContent" class="timeline-content" :class="{ scrubbing: timelineScrubbing }"
+             :style="{ width: `${timelineZoom * 100}%` }">
+          <div class="timeline-ruler" @pointerdown="startTimelineScrub">
             <span v-for="mark in rulerMarks" :key="mark.p" :style="{ left: `${mark.p}%` }"><i></i>{{ mark.label }}</span>
           </div>
 
-          <div class="timeline-lane chapter-lane" @pointerdown.self="seekFromTimeline">
+          <div class="timeline-lane chapter-lane" @pointerdown.self="startTimelineScrub">
             <button v-for="chapter in timelineChapters" :key="chapter.id" type="button" class="chapter-clip"
                     :class="{ active: currentChapter?.id === chapter.id, selected: selection.type === 'chapter' && selection.id === chapter.id }"
                     :style="clipStyle(chapter.start_seconds, chapter.end_seconds, 0.35)"
@@ -791,7 +795,7 @@
             </button>
           </div>
 
-          <div class="timeline-lane scene-lane" @pointerdown.self="seekFromTimeline">
+          <div class="timeline-lane scene-lane" @pointerdown.self="startTimelineScrub">
             <button v-for="scene in project.scenes" :key="scene.id" type="button" class="scene-clip"
                     :class="{ active: currentScene?.id === scene.id, selected: selection.type === 'scene' && selection.id === scene.id }"
                     :style="clipStyle(scene.start, scene.end, 0.8)" @click.stop="selectScene(scene)">
@@ -799,7 +803,7 @@
             </button>
           </div>
 
-          <div class="timeline-lane visual-lane" @pointerdown.self="seekFromTimeline">
+          <div class="timeline-lane visual-lane" @pointerdown.self="startTimelineScrub">
             <button v-if="videoAsset || backgroundAsset" type="button" class="visual-clip"
                     :style="clipStyle(0, duration, 100)" @click.stop="select('asset', (videoAsset || backgroundAsset).id)">
               <span class="clip-thumb" :style="backgroundThumbnailStyle"></span>
@@ -807,7 +811,7 @@
             </button>
           </div>
 
-          <div class="timeline-lane audio-lane" @pointerdown.self="seekFromTimeline">
+          <div class="timeline-lane audio-lane" @pointerdown.self="startTimelineScrub">
             <button v-if="audioAsset" type="button" class="audio-clip master-audio-clip"
                     :style="clipStyle(0, duration, 100)" @click.stop="select('asset', audioAsset.id)">
               <span class="timeline-waveform" aria-hidden="true">
@@ -825,7 +829,7 @@
             </button>
           </div>
 
-          <div class="timeline-lane music-lane" @pointerdown.self="seekFromTimeline">
+          <div class="timeline-lane music-lane" @pointerdown.self="startTimelineScrub">
             <button v-if="musicAsset" type="button" class="music-clip"
                     :class="{ muted: !project.music.enabled }"
                     :style="clipStyle(0, duration, 100)"
@@ -836,7 +840,16 @@
             </button>
           </div>
 
-          <div class="timeline-playhead" :style="{ left: `${progressPercent}%` }"><i></i><span></span></div>
+          <div v-if="selectedExcerpt" class="timeline-excerpt-range"
+               :style="clipStyle(selectedExcerpt.start, selectedExcerpt.end, 0.2)"
+               :title="`Выбранный текст · ${formatTime(selectedExcerpt.start)}–${formatTime(selectedExcerpt.end)}`"></div>
+          <div class="timeline-playhead" :class="{ dragging: timelineScrubbing }"
+               :style="{ left: `${progressPercent}%` }" role="slider" tabindex="0"
+               aria-label="Курсор таймлайна" aria-valuemin="0" :aria-valuemax="duration"
+               :aria-valuenow="currentTime" :aria-valuetext="formatTime(currentTime, true)"
+               @pointerdown.stop="startTimelineScrub" @keydown="onTimelinePlayheadKeydown">
+            <i></i><span></span><em>{{ formatTime(currentTime, true) }}</em>
+          </div>
         </div>
       </div>
     </section>
@@ -940,6 +953,85 @@
           <span>Файлы сохраняются также в папке <b>exports</b> текущего проекта.</span>
           <i v-if="bookExportBusy">Собираю экспорт…</i>
         </footer>
+      </section>
+    </div>
+
+    <div v-if="showTextNavigator" class="modal-backdrop text-navigator-backdrop"
+         @mousedown.self="showTextNavigator = false">
+      <section class="text-navigator-modal" role="dialog" aria-modal="true"
+               aria-labelledby="text-navigator-title">
+        <header>
+          <div>
+            <span class="eyebrow">Навигация по озвучке</span>
+            <h2 id="text-navigator-title">Текст на таймлайне</h2>
+            <p>Клик по слову перемещает курсор. Shift + клик выделяет отрывок.</p>
+          </div>
+          <button type="button" aria-label="Закрыть" @click="showTextNavigator = false">×</button>
+        </header>
+
+        <div class="text-navigator-layout">
+          <aside>
+            <label class="text-navigator-search">
+              <span>⌕</span>
+              <input v-model.trim="textNavigatorSearch" type="search" placeholder="Глава или фраза" />
+            </label>
+            <div class="text-navigator-chapters">
+              <button v-for="chapter in filteredNavigatorChapters" :key="chapter.id" type="button"
+                      :class="{ active: navigatorChapter?.id === chapter.id }"
+                      @click="chooseNavigatorChapter(chapter)">
+                <span>{{ chapter.index + 1 }}</span>
+                <b>{{ chapter.title }}</b>
+                <small>{{ formatTime(chapter.start_seconds) }}–{{ formatTime(chapter.end_seconds) }}</small>
+              </button>
+              <p v-if="!filteredNavigatorChapters.length">Ничего не найдено.</p>
+            </div>
+          </aside>
+
+          <main>
+            <div v-if="navigatorChapter" class="text-navigator-toolbar">
+              <div>
+                <span>Глава {{ navigatorChapter.index + 1 }}</span>
+                <strong>{{ navigatorChapter.title }}</strong>
+                <small>{{ formatTime(navigatorChapter.start_seconds, true) }}–{{ formatTime(navigatorChapter.end_seconds, true) }}</small>
+              </div>
+              <div class="text-selection-actions">
+                <span v-if="selectedExcerpt">
+                  {{ selectedExcerpt.wordCount }} сл. · {{ formatTime(selectedExcerpt.start, true) }}–{{ formatTime(selectedExcerpt.end, true) }}
+                </span>
+                <button type="button" :disabled="!selectedExcerpt || !masterKind"
+                        @click="playSelectedExcerpt">
+                  {{ excerptPlaybackEnd !== null ? '■ Остановить' : '▶ Слушать отрывок' }}
+                </button>
+                <button type="button" :disabled="!selectedExcerpt" @click="clearTextSelection">Сбросить</button>
+              </div>
+            </div>
+
+            <div v-if="navigatorChapter" ref="textNavigatorScroll" class="text-navigator-copy">
+              <p v-for="(paragraph, paragraphIndex) in navigatorParagraphs" :key="paragraphIndex">
+                <button v-for="word in paragraph" :key="word.index" type="button"
+                        :data-word-index="word.index"
+                        :class="{
+                          selected: isNavigatorWordSelected(word),
+                          current: currentNavigatorWord?.index === word.index,
+                        }"
+                        :title="`${formatTime(word.start, true)} · перейти на таймлайн`"
+                        @click="selectNavigatorWord(word, $event)">{{ word.text }}</button>
+              </p>
+              <p v-if="!navigatorWords.length" class="text-navigator-empty">В этой главе пока нет текста.</p>
+            </div>
+
+            <div v-else class="text-navigator-empty-state">
+              <span>¶</span><b>В видеопроекте нет текста глав</b>
+              <small>Откройте книгу в видеоредакторе после создания или импорта глав.</small>
+            </div>
+
+            <footer v-if="navigatorChapter">
+              <span><i></i> Текущее слово</span>
+              <span><i></i> Выбранный отрывок</span>
+              <b>Привязка слов расчётная; границы глав совпадают с озвучкой.</b>
+            </footer>
+          </main>
+        </div>
       </section>
     </div>
 
@@ -1146,6 +1238,8 @@ const videoEl = ref(null)
 const sceneEl = ref(null)
 const visualizerCanvas = ref(null)
 const timelineScroll = ref(null)
+const timelineContent = ref(null)
+const textNavigatorScroll = ref(null)
 const titleLayerEl = ref(null)
 const titleStackEl = ref(null)
 
@@ -1162,9 +1256,15 @@ const musicEqState = reactive({
 })
 const waveformSamples = ref([])
 const timelineZoom = ref(1)
+const timelineScrubbing = ref(false)
 
 const showExport = ref(false)
 const showBookExport = ref(false)
+const showTextNavigator = ref(false)
+const textNavigatorSearch = ref('')
+const textNavigatorChapterId = ref('')
+const textSelection = reactive({ chapterId: '', anchor: -1, focus: -1 })
+const excerptPlaybackEnd = ref(null)
 const bookExportBusy = ref(false)
 const bookExportIncludeMedia = ref(true)
 const exportTest = ref(true)
@@ -1193,6 +1293,9 @@ let musicLowFilter = null
 let musicMidFilter = null
 let musicHighFilter = null
 let musicGain = null
+let timelinePointerMove = null
+let timelinePointerUp = null
+let resumeAfterTimelineScrub = false
 const visualizerLevels = new Float32Array(72)
 const visualizerPeaks = new Float32Array(72)
 const objectUrls = new Set()
@@ -1392,6 +1495,67 @@ const timelineChapters = computed(() => {
   })
 })
 
+const filteredNavigatorChapters = computed(() => {
+  const query = textNavigatorSearch.value.toLocaleLowerCase('ru-RU')
+  if (!query) return timelineChapters.value
+  return timelineChapters.value.filter((chapter) => (
+    chapter.title.toLocaleLowerCase('ru-RU').includes(query)
+    || String(chapter.text || '').toLocaleLowerCase('ru-RU').includes(query)
+  ))
+})
+const navigatorChapter = computed(() => (
+  timelineChapters.value.find((chapter) => chapter.id === textNavigatorChapterId.value)
+  || currentChapter.value
+  || timelineChapters.value[0]
+  || null
+))
+const navigatorWords = computed(() => chapterTimelineWords(navigatorChapter.value))
+const navigatorParagraphs = computed(() => {
+  const paragraphs = []
+  for (const word of navigatorWords.value) {
+    if (!paragraphs[word.paragraph]) paragraphs[word.paragraph] = []
+    paragraphs[word.paragraph].push(word)
+  }
+  return paragraphs.filter(Boolean)
+})
+const selectedExcerpt = computed(() => {
+  const chapter = timelineChapters.value.find((item) => item.id === textSelection.chapterId)
+  if (!chapter || textSelection.anchor < 0 || textSelection.focus < 0) return null
+  const words = chapterTimelineWords(chapter)
+  const firstIndex = Math.min(textSelection.anchor, textSelection.focus)
+  const lastIndex = Math.max(textSelection.anchor, textSelection.focus)
+  const selected = words.slice(firstIndex, lastIndex + 1)
+  if (!selected.length) return null
+  return {
+    chapterId: chapter.id,
+    start: selected[0].start,
+    end: selected[selected.length - 1].end,
+    text: selected.map((word) => word.text).join(' '),
+    wordCount: selected.length,
+    firstIndex,
+    lastIndex,
+  }
+})
+const currentNavigatorWord = computed(() => {
+  const words = navigatorWords.value
+  const chapter = navigatorChapter.value
+  if (!words.length || !chapter) return null
+  if (currentTime.value < chapter.start_seconds || currentTime.value > chapter.end_seconds) return null
+  let low = 0
+  let high = words.length - 1
+  let result = words[0]
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2)
+    if (words[middle].start <= currentTime.value) {
+      result = words[middle]
+      low = middle + 1
+    } else {
+      high = middle - 1
+    }
+  }
+  return result
+})
+
 const currentChapterIndex = computed(() => {
   const chapters = timelineChapters.value
   if (!chapters.length) return -1
@@ -1584,6 +1748,49 @@ function readingCaptionChunks(text, wordsPerCard = 14) {
     chunks.push(words.slice(index, index + size).join(' '))
   }
   return chunks
+}
+
+function chapterTimelineWords(chapter) {
+  if (!chapter?.text) return []
+  const text = String(chapter.text)
+  const matches = [...text.matchAll(/\S+/gu)]
+  if (!matches.length) return []
+  const start = Number(chapter.start_seconds) || 0
+  const end = Math.max(start + 0.1, Number(chapter.end_seconds) || start + 0.1)
+  const weighted = matches.map((match, index) => {
+    const value = match[0]
+    const letters = value.replace(/[^\p{L}\p{N}]/gu, '').length
+    const pause = /[.!?…]["»”’)]*$/u.test(value)
+      ? 5
+      : /[,;:]["»”’)]*$/u.test(value)
+        ? 2
+        : 0
+    return {
+      index,
+      text: value,
+      sourceIndex: match.index,
+      sourceEnd: match.index + value.length,
+      weight: Math.max(1.8, letters + pause),
+    }
+  })
+  const totalWeight = weighted.reduce((sum, word) => sum + word.weight, 0)
+  let elapsedWeight = 0
+  let paragraph = 0
+  let previousEnd = 0
+  return weighted.map((word) => {
+    const gap = text.slice(previousEnd, word.sourceIndex)
+    if (word.index > 0 && /\n\s*\n/u.test(gap)) paragraph += 1
+    const wordStart = start + elapsedWeight / totalWeight * (end - start)
+    elapsedWeight += word.weight
+    const wordEnd = start + elapsedWeight / totalWeight * (end - start)
+    previousEnd = word.sourceEnd
+    return {
+      ...word,
+      paragraph,
+      start: wordStart,
+      end: Math.max(wordStart + 0.02, wordEnd),
+    }
+  })
 }
 
 function normalizeChapter(item, index) {
@@ -3361,6 +3568,94 @@ function selectVideoChapterAudio(chapter) {
   if (chapter.audioAssetId) select('asset', chapter.audioAssetId)
 }
 
+function openTextNavigator() {
+  const chapter = currentChapter.value || timelineChapters.value[0]
+  if (chapter) textNavigatorChapterId.value = chapter.id
+  showTextNavigator.value = true
+  nextTick(scrollCurrentNavigatorWordIntoView)
+}
+
+function chooseNavigatorChapter(chapter) {
+  textNavigatorChapterId.value = chapter.id
+  clearTextSelection()
+  seekTo(chapter.start_seconds)
+  scrollTimelineToTime(chapter.start_seconds)
+}
+
+function selectNavigatorWord(word, event) {
+  const chapter = navigatorChapter.value
+  if (!chapter) return
+  excerptPlaybackEnd.value = null
+  if (event.shiftKey && textSelection.chapterId === chapter.id && textSelection.anchor >= 0) {
+    textSelection.focus = word.index
+  } else {
+    textSelection.chapterId = chapter.id
+    textSelection.anchor = word.index
+    textSelection.focus = word.index
+  }
+  seekTo(word.start)
+  scrollTimelineToTime(word.start)
+}
+
+function isNavigatorWordSelected(word) {
+  if (!navigatorChapter.value || textSelection.chapterId !== navigatorChapter.value.id) return false
+  const first = Math.min(textSelection.anchor, textSelection.focus)
+  const last = Math.max(textSelection.anchor, textSelection.focus)
+  return word.index >= first && word.index <= last
+}
+
+function clearTextSelection() {
+  if (excerptPlaybackEnd.value !== null) pauseAll()
+  textSelection.chapterId = ''
+  textSelection.anchor = -1
+  textSelection.focus = -1
+  excerptPlaybackEnd.value = null
+}
+
+async function playSelectedExcerpt() {
+  const excerpt = selectedExcerpt.value
+  if (!excerpt) return
+  if (excerptPlaybackEnd.value !== null) {
+    pauseAll()
+    return
+  }
+  if (!masterElement()) {
+    setNotice('У этой видеоверсии пока нет собранной озвучки.', 'warning', 6000)
+    return
+  }
+  pauseAll()
+  seekTo(excerpt.start)
+  excerptPlaybackEnd.value = Math.max(excerpt.start + 0.02, excerpt.end)
+  await togglePlay()
+}
+
+function stopAtExcerptEnd() {
+  const end = Number(excerptPlaybackEnd.value)
+  if (!Number.isFinite(end) || currentTime.value < end - 0.015) return false
+  pauseAll()
+  seekTo(end)
+  return true
+}
+
+function scrollTimelineToTime(time, behavior = 'smooth') {
+  const scroller = timelineScroll.value
+  const content = timelineContent.value
+  if (!scroller || !content || !duration.value) return
+  const point = content.offsetLeft + Math.max(0, Math.min(1, Number(time) / duration.value)) * content.offsetWidth
+  const target = Math.max(0, point - scroller.clientWidth * 0.52)
+  scroller.scrollTo({ left: target, behavior })
+}
+
+function scrollCurrentNavigatorWordIntoView() {
+  const container = textNavigatorScroll.value
+  const index = currentNavigatorWord.value?.index
+  if (!container || index === undefined) return
+  container.querySelector(`[data-word-index="${index}"]`)?.scrollIntoView({
+    block: 'nearest',
+    inline: 'nearest',
+  })
+}
+
 function ensureSceneBounds() {
   if (!project.scenes.length) project.scenes.push({ id: uid('scene'), name: 'Основная сцена', start: 0, end: Math.max(duration.value, 60), backgroundAssetId: null })
   if (project.scenes.length === 1 && project.scenes[0].start === 0 && project.scenes[0].end <= 60) {
@@ -3711,6 +4006,7 @@ function pauseAll() {
   videoEl.value?.pause()
   musicEl.value?.pause()
   playing.value = false
+  excerptPlaybackEnd.value = null
   cancelAnimationFrame(playbackFrame)
 }
 
@@ -3754,6 +4050,7 @@ function onMediaTime(kind) {
   const master = masterElement()
   if (!master) return
   currentTime.value = master.currentTime || 0
+  if (stopAtExcerptEnd()) return
   const secondary = secondaryElement()
   const secondaryTarget = secondaryTimeAt(master.currentTime)
   if (secondary && Math.abs(secondary.currentTime - secondaryTarget) > 0.22) secondary.currentTime = secondaryTarget
@@ -3793,6 +4090,7 @@ function tickPlayback() {
   if (!playing.value) return
   const master = masterElement()
   if (master) currentTime.value = master.currentTime || currentTime.value
+  if (stopAtExcerptEnd()) return
   playbackFrame = requestAnimationFrame(tickPlayback)
 }
 
@@ -3816,9 +4114,61 @@ function clipStyle(start, end, minWidth = 0.4) {
   return { left: `${left}%`, width: `${width}%` }
 }
 
-function seekFromTimeline(event) {
-  const rect = event.currentTarget.getBoundingClientRect()
-  seekTo((event.clientX - rect.left) / rect.width * duration.value)
+function timelineTimeFromPointer(event) {
+  const rect = timelineContent.value?.getBoundingClientRect()
+  if (!rect?.width) return currentTime.value
+  const fraction = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width))
+  return fraction * duration.value
+}
+
+function removeTimelinePointerListeners() {
+  if (timelinePointerMove) window.removeEventListener('pointermove', timelinePointerMove)
+  if (timelinePointerUp) {
+    window.removeEventListener('pointerup', timelinePointerUp)
+    window.removeEventListener('pointercancel', timelinePointerUp)
+  }
+  timelinePointerMove = null
+  timelinePointerUp = null
+}
+
+function startTimelineScrub(event) {
+  if (event.button !== undefined && event.button !== 0) return
+  event.preventDefault()
+  removeTimelinePointerListeners()
+  resumeAfterTimelineScrub = playing.value
+  pauseAll()
+  timelineScrubbing.value = true
+  seekTo(timelineTimeFromPointer(event))
+  timelinePointerMove = (moveEvent) => {
+    moveEvent.preventDefault()
+    seekTo(timelineTimeFromPointer(moveEvent))
+  }
+  timelinePointerUp = (upEvent) => {
+    seekTo(timelineTimeFromPointer(upEvent))
+    removeTimelinePointerListeners()
+    timelineScrubbing.value = false
+    scrollTimelineToTime(currentTime.value, 'auto')
+    const shouldResume = resumeAfterTimelineScrub
+    resumeAfterTimelineScrub = false
+    if (shouldResume) void togglePlay()
+  }
+  window.addEventListener('pointermove', timelinePointerMove)
+  window.addEventListener('pointerup', timelinePointerUp)
+  window.addEventListener('pointercancel', timelinePointerUp)
+}
+
+function onTimelinePlayheadKeydown(event) {
+  const step = event.shiftKey ? 10 : 1
+  let target = null
+  if (event.key === 'ArrowLeft') target = currentTime.value - step
+  if (event.key === 'ArrowRight') target = currentTime.value + step
+  if (event.key === 'Home') target = 0
+  if (event.key === 'End') target = duration.value
+  if (target === null) return
+  event.preventDefault()
+  excerptPlaybackEnd.value = null
+  seekTo(target)
+  scrollTimelineToTime(target)
 }
 
 function visualizerValues(now) {
@@ -4126,11 +4476,17 @@ function releaseObjectUrls() {
 function handleKeydown(event) {
   const target = event.target
   const editing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement
+  if (event.key === 'Escape' && showTextNavigator.value) {
+    event.preventDefault()
+    showTextNavigator.value = false
+    return
+  }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
     event.preventDefault()
     if (activeWorkspace.value === 'book') saveCurrentChapter()
     else saveProject()
-  } else if (activeWorkspace.value === 'video' && event.code === 'Space' && !editing && !showExport.value) {
+  } else if (activeWorkspace.value === 'video' && event.code === 'Space' && !editing
+             && !showExport.value && !showTextNavigator.value) {
     event.preventDefault()
     togglePlay()
   }
@@ -4160,6 +4516,16 @@ watch(() => musicSource.value, () => {
     musicEl.value?.load()
     applyMusicMix()
   })
+})
+
+watch(() => currentChapter.value?.id, (chapterId) => {
+  if (!showTextNavigator.value || !chapterId || !playing.value) return
+  textNavigatorChapterId.value = chapterId
+  nextTick(scrollCurrentNavigatorWordIntoView)
+})
+
+watch(() => currentNavigatorWord.value?.index, () => {
+  if (showTextNavigator.value && playing.value) nextTick(scrollCurrentNavigatorWordIntoView)
 })
 
 watch(() => bookPlayerUrl.value, () => {
@@ -4209,6 +4575,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeydown)
   window.removeEventListener('beforeunload', handleBeforeUnload)
+  removeTimelinePointerListeners()
   stopBookPlayer()
   pauseAll()
   cancelAnimationFrame(visualFrame)
