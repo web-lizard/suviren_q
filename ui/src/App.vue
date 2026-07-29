@@ -15,7 +15,9 @@
                   :class="{ active: activeWorkspace === 'book' }" @click="setWorkspace('book')">Книга</button>
           <button type="button" role="tab" :aria-selected="activeWorkspace === 'video'"
                   :class="{ active: activeWorkspace === 'video' }" @click="setWorkspace('video')"
-                  @dragover.prevent @drop.prevent="dropBookAudioOnVideoTab">Видео</button>
+                  @dragover.prevent @drop.prevent="dropBookAudioOnVideoTab">
+            {{ videoPreparing ? 'Собираю видео…' : 'Видео' }}
+          </button>
         </div>
         <label class="global-project-picker">
           <span>Проект</span>
@@ -148,6 +150,16 @@
           <div class="chapter-context" v-if="currentChapter">
             <p><b>{{ currentChapter.title }}</b></p>
           </div>
+          <div class="stage-quick-actions">
+            <span class="video-sync-count" :class="{ ready: videoReadyChapterCount > 0 }">
+              Озвучено {{ videoReadyChapterCount }}/{{ videoBookChapterCount }}
+            </span>
+            <label class="caption-quick-toggle" :class="{ active: project.captions?.enabled }">
+              <input v-model="project.captions.enabled" type="checkbox" />
+              <span aria-hidden="true">Аа</span>
+              <b>Текст на экране</b>
+            </label>
+          </div>
         </div>
 
         <div ref="sceneEl" class="scene-frame" :class="{ 'glitch-enabled': project.glitch }"
@@ -187,6 +199,15 @@
           <div v-if="project.captions?.enabled && currentReadingCaption"
                class="reading-caption" aria-live="off">
             {{ currentReadingCaption }}
+          </div>
+
+          <div v-if="videoPreparing" class="video-prepare-overlay">
+            <i></i><b>Собираю озвученные главы</b><span>Создаю мастер-аудио и таймлайн…</span>
+          </div>
+          <div v-else-if="!audioAsset && activeProjectRecord?.book" class="video-empty-audio">
+            <b>В книге пока нет готовой озвучки</b>
+            <span>Озвучьте хотя бы одну главу — она автоматически появится здесь.</span>
+            <button type="button" @click="setWorkspace('book')">Перейти к озвучке</button>
           </div>
 
           <a class="telegram-qr" :href="TELEGRAM_URL" target="_blank" rel="noopener noreferrer"
@@ -678,12 +699,20 @@
           </div>
 
           <div class="timeline-lane audio-lane" @pointerdown.self="seekFromTimeline">
-            <button v-if="audioAsset" type="button" class="audio-clip" :style="clipStyle(0, duration, 100)" @click.stop="select('asset', audioAsset.id)">
+            <button v-if="audioAsset" type="button" class="audio-clip master-audio-clip"
+                    :style="clipStyle(0, duration, 100)" @click.stop="select('asset', audioAsset.id)">
               <span class="timeline-waveform" aria-hidden="true">
                 <i v-for="(bar, index) in timelineBars" :key="index" :style="{ height: `${bar * 100}%` }"
                    :class="{ played: index / timelineBars.length <= progressPercent / 100 }"></i>
               </span>
               <b>{{ audioAsset.name }}</b>
+            </button>
+            <button v-for="chapter in videoAudioChapters" :key="`audio-${chapter.id}`"
+                    type="button" class="chapter-audio-clip"
+                    :class="{ active: currentChapter?.id === chapter.id }"
+                    :style="clipStyle(chapter.start_seconds, chapter.end_seconds, 0.35)"
+                    @click.stop="selectVideoChapterAudio(chapter)">
+              <i></i><b>{{ chapter.title }}</b>
             </button>
           </div>
 
@@ -966,6 +995,7 @@ const loading = ref(true)
 const loadingMessage = ref('Подключаю медиадвижок…')
 const dirty = ref(false)
 const saving = ref(false)
+const videoPreparing = ref(false)
 const hydrating = ref(true)
 const assetInput = ref(null)
 const projectInput = ref(null)
@@ -1022,6 +1052,11 @@ const videoAsset = computed(() => assetById(project.videoAssetId))
 const coverAsset = computed(() => assetById(project.coverAssetId))
 const backgroundAsset = computed(() => assetById(project.backgroundAssetId))
 const imageAssets = computed(() => project.materials.filter((item) => item.type === 'image'))
+const videoAudioChapters = computed(() => (
+  project.chapters.filter((chapter) => chapter.audioAssetId && assetById(chapter.audioAssetId))
+))
+const videoReadyChapterCount = computed(() => videoAudioChapters.value.length)
+const videoBookChapterCount = computed(() => activeProjectRecord.value?.chapters?.length || project.chapters.length)
 const currentBookChapter = computed(() => (
   activeProjectRecord.value?.chapters?.find((item) => item.id === currentBookChapterId.value) || null
 ))
@@ -1334,6 +1369,10 @@ function materialRole(asset) {
   if (project.videoAssetId === asset.id) roles.push('Видео сцены')
   if (project.coverAssetId === asset.id) roles.push('Обложка')
   if (project.backgroundAssetId === asset.id) roles.push('Фон')
+  if (asset.role === 'chapter-audio') roles.push('Озвучка главы')
+  if (asset.role === 'chapter-image') roles.push('Изображение главы')
+  if (asset.role === 'book-master') roles.push('Мастер-аудио')
+  if (asset.role === 'default-cover') roles.push('Обложка по умолчанию')
   return roles.join(' · ')
 }
 
@@ -1355,6 +1394,9 @@ function formatBytes(bytes) {
 function mediaUrl(path) {
   if (!path) return ''
   const normalized = String(path).replaceAll('\\', '/').replace(/^\/+/, '')
+  if (normalized === 'assets/bookender-studio-icon.png') {
+    return '/bookender-studio-icon.png'
+  }
   if (normalized.startsWith('projects/')) {
     return `${API}/project-media/${normalized.split('/').map(encodeURIComponent).join('/')}`
   }
@@ -1643,28 +1685,56 @@ function addBookAudioToVideo(record) {
   for (const audio of record?.audio_assets || []) {
     const key = audio.chapter_id ?? `book-${audio.id}`
     const current = grouped.get(key)
-    if (!current || audio.is_active || (!current.is_active && Number(audio.version_number || audio.id) > Number(current.version_number || current.id))) {
+    const rank = [
+      Number(Boolean(audio.is_active)),
+      Number(audio.version_number || 0),
+      Number(audio.id || 0),
+    ]
+    const currentRank = [
+      Number(Boolean(current?.is_active)),
+      Number(current?.version_number || 0),
+      Number(current?.id || 0),
+    ]
+    if (!current || rank.some((value, index) => (
+      value > currentRank[index] && rank.slice(0, index).every((part, partIndex) => part === currentRank[partIndex])
+    ))) {
       grouped.set(key, audio)
     }
   }
+  const livePaths = new Set(
+    [...grouped.values()]
+      .map((audio) => audio.file_path)
+      .filter((path) => path && !path.startsWith('external:')),
+  )
+  const retainedMaterials = project.materials.filter((item) => (
+    item.role !== 'chapter-audio' || livePaths.has(item.serverPath)
+  ))
+  project.materials.splice(0, project.materials.length, ...retainedMaterials)
+  const materialByChapter = new Map()
   for (const audio of grouped.values()) {
     if (!audio.file_path || audio.file_path.startsWith('external:')) continue
     const serverPath = audio.file_path
-    if (project.materials.some((item) => item.serverPath === serverPath)) continue
     const chapter = record.chapters?.find((item) => item.id === audio.chapter_id)
-    project.materials.push({
-      id: `chapter-audio-${audio.id}`,
-      type: 'audio',
-      name: `${chapter?.title || 'Озвучка'}.mp3`,
-      size: 0,
-      serverPath,
-      src: mediaUrl(serverPath),
-      status: 'ready',
-      progress: 1,
-      chapterId: audio.chapter_id,
-      sourceTextHash: audio.source_text_hash,
-    })
+    let material = project.materials.find((item) => item.serverPath === serverPath)
+    if (!material) {
+      material = {
+        id: `chapter-audio-${audio.id}`,
+        type: 'audio',
+        name: `${chapter?.title || 'Озвучка'}.mp3`,
+        size: Number(audio.file_size || 0),
+        serverPath,
+        src: mediaUrl(serverPath),
+        status: 'ready',
+        progress: 1,
+      }
+      project.materials.push(material)
+    }
+    material.chapterId = audio.chapter_id
+    material.sourceTextHash = audio.source_text_hash
+    material.role = 'chapter-audio'
+    materialByChapter.set(audio.chapter_id, material)
   }
+  return materialByChapter
 }
 
 function addBookVisualsToVideo(record) {
@@ -1706,16 +1776,42 @@ function addBookVisualsToVideo(record) {
   return materialByChapter
 }
 
+function ensureDefaultVideoCover() {
+  let material = project.materials.find((item) => item.role === 'default-cover')
+  if (!material) {
+    material = {
+      id: 'book-wunderwaffe-default-cover',
+      type: 'image',
+      name: 'Book Wunderwaffe · обложка по умолчанию',
+      size: 0,
+      serverPath: 'assets/bookender-studio-icon.png',
+      src: '/bookender-studio-icon.png',
+      status: 'ready',
+      progress: 1,
+      role: 'default-cover',
+    }
+    project.materials.push(material)
+  }
+  project.coverAssetId = material.id
+  return material
+}
+
 function syncBookChaptersToVideo(record, master = null) {
-  addBookAudioToVideo(record)
+  const audioMaterials = addBookAudioToVideo(record)
   const images = addBookVisualsToVideo(record)
-  if (!project.coverAssetId && images.size) {
+  const selectedCover = assetById(project.coverAssetId)
+  if (images.size && (!selectedCover || selectedCover.role === 'default-cover')) {
     project.coverAssetId = images.values().next().value.id
+  } else if (!selectedCover) {
+    ensureDefaultVideoCover()
   }
   const timings = new Map((master?.chapters || []).map((item) => [item.chapter_id, item]))
   const existing = new Map(project.chapters.map((item) => [item.chapterId, item]))
+  const sourceChapters = master?.chapters?.length
+    ? (record?.chapters || []).filter((chapter) => timings.has(chapter.id))
+    : (record?.chapters || [])
   let cursor = 0
-  project.chapters = (record?.chapters || []).map((chapter, index) => {
+  project.chapters = sourceChapters.map((chapter, index) => {
     const timing = timings.get(chapter.id)
     const previous = existing.get(chapter.id) || {}
     const start = timing ? Number(timing.start_seconds) : Math.max(cursor, Number(previous.start_seconds) || index)
@@ -1730,6 +1826,7 @@ function syncBookChaptersToVideo(record, master = null) {
       start_seconds: start,
       end_seconds: end,
       imageAssetId: images.get(chapter.id)?.id || null,
+      audioAssetId: audioMaterials.get(chapter.id)?.id || null,
     }
   })
   if (master?.file_path) {
@@ -1754,7 +1851,19 @@ function syncBookChaptersToVideo(record, master = null) {
     }
     project.audioAssetId = material.id
     const total = Number(master.duration) || cursor
-    for (const scene of project.scenes) scene.end = Math.max(scene.start + 0.1, total)
+    project.scenes = project.scenes
+      .filter((scene) => Number(scene.start) < total)
+      .map((scene) => ({
+        ...scene,
+        start: Math.max(0, Number(scene.start) || 0),
+        end: Math.min(total, Math.max((Number(scene.start) || 0) + 0.1, Number(scene.end) || total)),
+      }))
+    if (!project.scenes.length) {
+      project.scenes = [{ id: uid('scene'), name: 'Основная сцена', start: 0, end: total, backgroundAssetId: null }]
+    } else if (project.scenes.length === 1) {
+      project.scenes[0].start = 0
+      project.scenes[0].end = total
+    }
   }
 }
 
@@ -1854,11 +1963,11 @@ async function switchProject(projectUuid, { initial = false } = {}) {
 
 async function setWorkspace(workspace) {
   if (workspace === activeWorkspace.value) return
-  if (!(await flushActiveWorkspace())) return
-  if (workspace === 'video' && activeProjectRecord.value && !activeVideoEditionId.value) {
-    const shouldCreate = window.confirm('У проекта ещё нет видеоверсии. Создать её сейчас?')
-    if (shouldCreate) await createVideoEditionForActiveBook()
+  if (workspace === 'video' && activeProjectRecord.value?.book) {
+    await openBookInVideo()
+    return
   }
+  if (!(await flushActiveWorkspace())) return
   activeWorkspace.value = workspace
 }
 
@@ -2113,6 +2222,9 @@ function pollTtsBook() {
         const record = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}`)
         activeProjectRecord.value = record
         hydrateBookState(record)
+        if (activeVideoEditionId.value) {
+          try { await rebuildBookVideo(record) } catch { /* video can be rebuilt on next open */ }
+        }
         const failed = visibleTtsJobs.value.filter((job) => job.status === 'failed').length
         setNotice(
           failed ? `Очередь завершена, ошибок: ${failed}. Готовые файлы сохранены.` : 'Озвучивание книги завершено',
@@ -2140,6 +2252,9 @@ function pollTtsJob(jobUuid) {
         activeProjectRecord.value = record
         hydrateBookState(record)
         if (job.status === 'done') {
+          if (activeVideoEditionId.value) {
+            try { await rebuildBookVideo(record) } catch { /* video can be rebuilt on next open */ }
+          }
           const ready = record.audio_assets?.find((asset) => asset.file_path === job.output_path)
           if (ready) selectBookAudio(ready, true)
           setNotice('Озвучка главы готова', 'success')
@@ -2401,7 +2516,7 @@ function chapterTitleForAudio(asset) {
   return activeProjectRecord.value?.chapters?.find((item) => item.id === asset.chapter_id)?.title || 'Аудиокнига'
 }
 
-async function createVideoEditionForActiveBook() {
+async function createVideoEditionForActiveBook({ prepare = true } = {}) {
   if (!activeProjectUuid.value) return
   try {
     const edition = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/video-editions`, {
@@ -2411,37 +2526,32 @@ async function createVideoEditionForActiveBook() {
     })
     activeVideoEditionId.value = edition.id
     replaceProject(edition.settings)
-    await prepareBookVideoProject(activeProjectRecord.value)
-    await publishVideoCompatibility(activeProjectUuid.value, edition.id, serializeProject())
+    if (prepare) {
+      await prepareBookVideoProject(activeProjectRecord.value)
+      await publishVideoCompatibility(activeProjectUuid.value, edition.id, serializeProject())
+      dirty.value = false
+    }
     const refreshed = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}`)
     activeProjectRecord.value = refreshed
     await loadProjectCatalog()
-    setNotice('Видеоверсия создана', 'success')
+    return edition
   } catch (error) {
     setNotice(`Не удалось создать видеоверсию: ${error.message}`, 'error')
+    return null
   }
 }
 
-async function openBookInVideo() {
-  if (!(await saveCurrentChapter({ silent: true }))) return
-  if (!activeVideoEditionId.value) {
-    const shouldCreate = window.confirm('У книги ещё нет видеоверсии. Создать её сейчас?')
-    if (!shouldCreate) return
-    await createVideoEditionForActiveBook()
-    if (!activeVideoEditionId.value) return
-  }
+async function rebuildBookVideo(record, { announce = false } = {}) {
+  let master = null
+  let warning = ''
   try {
-    const master = await prepareBookVideoProject(activeProjectRecord.value)
+    master = await prepareBookVideoProject(record)
     if (master?.missing_chapter_ids?.length) {
-      setNotice(
-        `В видео переданы готовые озвучки. Без аудио пока глав: ${master.missing_chapter_ids.length}.`,
-        'warning',
-        7000,
-      )
+      warning = `Без озвучки пока глав: ${master.missing_chapter_ids.length}.`
     }
   } catch (error) {
-    syncBookChaptersToVideo(activeProjectRecord.value)
-    setNotice(`Книга открыта без мастер-аудио: ${error.message}`, 'warning', 7000)
+    syncBookChaptersToVideo(record)
+    warning = error.message
   }
   if (activeVideoEditionId.value) {
     await publishVideoCompatibility(
@@ -2449,8 +2559,48 @@ async function openBookInVideo() {
       activeVideoEditionId.value,
       serializeProject(),
     )
+    dirty.value = false
   }
+  await nextTick()
+  audioEl.value?.load()
+  await refreshWaveform()
+  if (announce) {
+    if (master) {
+      setNotice(
+        warning
+          ? `Озвученные главы разложены на таймлайне. ${warning}`
+          : `Видео готово: на таймлайне глав ${master.chapters.length}.`,
+        warning ? 'warning' : 'success',
+        7000,
+      )
+    } else {
+      setNotice(
+        `Видео открыто без мастер-аудио: ${warning || 'нет готовых озвучек'}`,
+        'warning',
+        7000,
+      )
+    }
+  }
+  return master
+}
+
+async function openBookInVideo() {
+  if (videoPreparing.value) return
+  if (!(await saveCurrentChapter({ silent: true }))) return
+  videoPreparing.value = true
   activeWorkspace.value = 'video'
+  pauseAll()
+  try {
+    if (!activeVideoEditionId.value) {
+      await createVideoEditionForActiveBook({ prepare: false })
+      if (!activeVideoEditionId.value) return
+    }
+    await rebuildBookVideo(activeProjectRecord.value, { announce: true })
+  } catch (error) {
+    setNotice(`Не удалось подготовить видео: ${error.message}`, 'error', 8000)
+  } finally {
+    videoPreparing.value = false
+  }
 }
 
 async function backupActiveProject() {
@@ -2993,6 +3143,11 @@ function removeChapter(id) {
 function selectChapter(chapter) {
   seekTo(chapter.start_seconds)
   select('chapter', chapter.id)
+}
+
+function selectVideoChapterAudio(chapter) {
+  seekTo(chapter.start_seconds)
+  if (chapter.audioAssetId) select('asset', chapter.audioAssetId)
 }
 
 function ensureSceneBounds() {

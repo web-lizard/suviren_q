@@ -18,6 +18,17 @@ test('chapter images and optional reading captions reach the video workspace', (
   assert.match(source, /currentReadingCaption/)
 })
 
+test('opening video rebuilds narrated chapters and exposes chapter audio clips', () => {
+  assert.match(source, /workspace === 'video' && activeProjectRecord\.value\?\.book/)
+  assert.match(source, /await openBookInVideo\(\)/)
+  assert.match(source, /await rebuildBookVideo\(activeProjectRecord\.value/)
+  assert.match(source, /audioAssetId: audioMaterials\.get\(chapter\.id\)/)
+  assert.match(source, /v-for="chapter in videoAudioChapters"/)
+  assert.match(source, /filter\(\(chapter\) => timings\.has\(chapter\.id\)\)/)
+  assert.match(source, /ensureDefaultVideoCover/)
+  assert.match(source, />Текст на экране</)
+})
+
 test('book export is visible and supports whole, current, and chapter bundle modes', () => {
   assert.match(source, />Экспорт книги</)
   assert.match(source, /downloadBookExport\('complete'\)/)
