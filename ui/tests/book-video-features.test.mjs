@@ -25,3 +25,12 @@ test('book export is visible and supports whole, current, and chapter bundle mod
   assert.match(source, /downloadBookExport\('chapters'\)/)
   assert.match(source, /bookExportIncludeMedia/)
 })
+
+test('book toolbar is compact and narration exposes real progress', () => {
+  assert.match(source, /class="book-icon-action"/)
+  assert.match(source, /aria-label="Новая книга"/)
+  assert.match(source, /aria-label="Резервная копия"/)
+  assert.match(source, /ttsProgressState\.percent/)
+  assert.match(source, /progress_total/)
+  assert.match(source, /Прошло/)
+})

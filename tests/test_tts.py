@@ -49,7 +49,14 @@ class TtsServiceTests(unittest.TestCase):
         self.temp.cleanup()
 
     @staticmethod
-    def fake_synthesize(text: str, output: Path, settings: dict[str, str]) -> None:
+    def fake_synthesize(
+        text: str,
+        output: Path,
+        settings: dict[str, str],
+        progress_callback=None,
+    ) -> None:
+        if progress_callback:
+            progress_callback(1, 1, 1.0)
         output.write_bytes(b"ID3" + text.encode("utf-8"))
 
     def wait_for_job(self, job_uuid: str) -> dict:
@@ -91,6 +98,51 @@ class TtsServiceTests(unittest.TestCase):
         self.assertGreater(len(chunks), 1)
         self.assertTrue(all(0 < len(chunk) <= 240 for chunk in chunks))
         self.assertEqual(" ".join(chunks).split(), text.split())
+
+    def test_synthesis_reports_monotonic_chunk_progress(self) -> None:
+        text = ("Нейтральное длинное предложение для индикатора. " * 130).strip()
+        updates: list[tuple[int, int, float]] = []
+
+        def fake_chunk(
+            chunk: str,
+            output: Path,
+            settings: dict[str, str],
+            progress_callback=None,
+        ) -> None:
+            if progress_callback:
+                progress_callback(0.35)
+                progress_callback(1.0)
+            output.write_bytes(b"ID3" + chunk.encode("utf-8"))
+
+        def fake_concat(parts: list[Path], output: Path, **_: object) -> None:
+            output.write_bytes(b"".join(path.read_bytes() for path in parts))
+
+        output = self.user_data / "progress.mp3"
+        with (
+            patch.object(TtsService, "_synthesize_chunk", side_effect=fake_chunk),
+            patch.object(TtsService, "_concat_mp3_files", side_effect=fake_concat),
+            patch("bookender.tts.shutil.which", return_value="ffmpeg"),
+        ):
+            self.service._synthesize(
+                text,
+                output,
+                {
+                    "voice": "ru-RU-DmitryNeural",
+                    "rate": "+0%",
+                    "pitch": "+0Hz",
+                    "volume": "+0%",
+                    "provider": "edge-tts",
+                },
+                progress_callback=lambda done, total, fraction: updates.append(
+                    (done, total, fraction)
+                ),
+            )
+        fractions = [item[2] for item in updates]
+        self.assertGreater(len(updates), 4)
+        self.assertEqual(fractions, sorted(fractions))
+        self.assertEqual(updates[-1][0], updates[-1][1])
+        self.assertEqual(updates[-1][2], 1.0)
+        self.assertTrue(output.is_file())
 
     def test_chapter_versions_remain_isolated_and_become_stale(self) -> None:
         with (

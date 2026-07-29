@@ -48,14 +48,27 @@
         </button>
       </nav>
       <nav v-else class="project-actions book-actions" aria-label="Действия с книгой">
-        <button class="action-button" type="button" @click="createBookProject">
-          <span aria-hidden="true">＋</span><b>Новая книга</b>
+        <button class="book-icon-action" type="button" title="Новая книга"
+                aria-label="Новая книга" @click="createBookProject">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 5.5c2.8-.7 5.4-.2 8 1.5v12c-2.6-1.7-5.2-2.2-8-1.5zM20 5.5c-2.8-.7-5.4-.2-8 1.5M17 9v6M14 12h6" />
+          </svg>
         </button>
-        <button class="action-button" type="button" :disabled="bookSaveState === 'saving'" @click="saveCurrentChapter()">
-          <span aria-hidden="true">◇</span><b>{{ bookSaveState === 'saving' ? 'Сохраняю' : 'Сохранить' }}</b>
+        <button class="book-icon-action" :class="{ saving: bookSaveState === 'saving' }"
+                type="button" :disabled="bookSaveState === 'saving'"
+                :title="bookSaveState === 'saving' ? 'Сохраняю…' : 'Сохранить'"
+                :aria-label="bookSaveState === 'saving' ? 'Сохраняю' : 'Сохранить'"
+                @click="saveCurrentChapter()">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M5 3.5h11l3 3V20.5H5zM8 3.5v6h8v-6M8 20.5v-7h8v7" />
+          </svg>
         </button>
-        <button class="action-button" type="button" :disabled="!activeProjectUuid" @click="backupActiveProject">
-          <span aria-hidden="true">◫</span><b>Резервная копия</b>
+        <button class="book-icon-action" type="button" :disabled="!activeProjectUuid"
+                title="Резервная копия" aria-label="Резервная копия"
+                @click="backupActiveProject">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 7.5h16v13H4zM3 3.5h18v4H3zM9 11.5h6M12 11.5v5M9.5 14l2.5 2.5 2.5-2.5" />
+          </svg>
         </button>
         <button class="book-export-button" type="button" :disabled="!activeProjectRecord?.book"
                 @click="openBookExport">
@@ -536,7 +549,18 @@
                     Озвучить всю книгу
                   </button>
                 </div>
-                <p v-if="latestTtsJob" class="book-job-state" :class="latestTtsJob.status">
+                <div v-if="ttsProgressState.active" class="tts-progress-card">
+                  <div class="tts-progress-heading">
+                    <span><i></i><b>Озвучивание</b></span>
+                    <strong>{{ ttsProgressState.percent }}%</strong>
+                  </div>
+                  <div class="tts-progress-track">
+                    <i :style="{ width: `${ttsProgressState.percent}%` }"></i>
+                  </div>
+                  <p>{{ ttsProgressState.detail }}</p>
+                  <small>Прошло {{ formatTime(ttsProgressState.elapsed, true) }}</small>
+                </div>
+                <p v-else-if="latestTtsJob" class="book-job-state" :class="latestTtsJob.status">
                   {{ ttsJobLabel(latestTtsJob) }}
                   <button v-if="latestTtsJob.status === 'failed'" type="button" @click="narrateCurrentChapter">Повторить</button>
                   <button v-if="latestTtsJob.status === 'failed'" type="button" @click="openTtsLog">Технический лог</button>
@@ -919,6 +943,8 @@ const bookTts = reactive({
   provider: 'edge-tts',
 })
 const ttsJobs = ref([])
+const narrationJobIds = ref([])
+const ttsNow = ref(Date.now())
 const ttsSessionStartedAt = Date.now()
 const ttsRuntime = reactive({ available: false, message: '', provider: 'edge-tts', version: '' })
 const ttsVoices = ref([])
@@ -1087,6 +1113,49 @@ const visibleTtsJobs = computed(() => ttsJobs.value.filter((job) => (
 )))
 const latestTtsJob = computed(() => visibleTtsJobs.value[0] || null)
 const activeTtsJobRunning = computed(() => ttsJobs.value.some((job) => ['queued', 'running'].includes(job.status)))
+const narrationJobs = computed(() => {
+  const selected = new Set(narrationJobIds.value)
+  if (selected.size) return ttsJobs.value.filter((job) => selected.has(job.uuid))
+  return ttsJobs.value.filter((job) => ['queued', 'running'].includes(job.status))
+})
+const ttsProgressState = computed(() => {
+  const jobs = narrationJobs.value
+  const active = jobs.some((job) => ['queued', 'running'].includes(job.status))
+  if (!active || !jobs.length) {
+    return { active: false, percent: 0, detail: '', elapsed: 0 }
+  }
+  const progress = jobs.reduce((total, job) => {
+    if (['done', 'failed', 'cancelled', 'skipped'].includes(job.status)) return total + 1
+    return total + Math.max(0, Math.min(1, Number(job.progress) || 0))
+  }, 0) / jobs.length
+  const running = jobs.find((job) => job.status === 'running')
+    || jobs.find((job) => job.status === 'queued')
+  const finished = jobs.filter((job) => (
+    ['done', 'failed', 'cancelled', 'skipped'].includes(job.status)
+  )).length
+  const totalChunks = Math.max(1, Number(running?.progress_total) || 1)
+  const completedChunks = Math.max(0, Number(running?.progress_done) || 0)
+  const currentChunk = Math.min(totalChunks, completedChunks + 1)
+  let detail = ''
+  if (jobs.length > 1) {
+    detail = `Готово глав: ${finished} из ${jobs.length}`
+    if (running) detail += ` · сейчас «${chapterTitleForJob(running)}»`
+  } else if (totalChunks > 1) {
+    detail = `Фрагмент ${currentChunk} из ${totalChunks} · ${chapterTitleForJob(running)}`
+  } else {
+    detail = `Получаю аудио · ${chapterTitleForJob(running)}`
+  }
+  const timestamps = jobs
+    .map((job) => new Date(job.started_at || job.created_at).getTime())
+    .filter(Number.isFinite)
+  const startedAt = timestamps.length ? Math.min(...timestamps) : ttsNow.value
+  return {
+    active: true,
+    percent: Math.max(1, Math.min(99, Math.round(progress * 100))),
+    detail,
+    elapsed: Math.max(0, (ttsNow.value - startedAt) / 1000),
+  }
+})
 const audioSource = computed(() => assetUrl(audioAsset.value))
 const videoSource = computed(() => assetUrl(videoAsset.value))
 const coverSource = computed(() => assetUrl(coverAsset.value))
@@ -1742,10 +1811,15 @@ async function switchProject(projectUuid, { initial = false } = {}) {
     activeProjectRecord.value = record
     hydrateBookState(record)
     ttsJobs.value = []
+    narrationJobIds.value = []
     if (record.book) {
       try {
         const jobs = await apiRequest(`/projects/${encodeURIComponent(projectUuid)}/tts-jobs`)
         ttsJobs.value = jobs.jobs || []
+        narrationJobIds.value = ttsJobs.value
+          .filter((job) => ['queued', 'running'].includes(job.status))
+          .map((job) => job.uuid)
+        ttsNow.value = Date.now()
       } catch { /* TTS history is optional */ }
     }
     const edition = record.video_editions?.[0] || null
@@ -2003,6 +2077,8 @@ async function narrateCurrentChapter() {
       { method: 'POST' },
     )
     ttsJobs.value.unshift(job)
+    narrationJobIds.value = [job.uuid]
+    ttsNow.value = Date.now()
     pollTtsJob(job.uuid)
   } catch (error) {
     setNotice(`Не удалось запустить озвучивание: ${error.message}`, 'error')
@@ -2016,6 +2092,8 @@ async function narrateWholeBook() {
   try {
     const result = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/tts`, { method: 'POST' })
     ttsJobs.value = [...(result.jobs || []), ...ttsJobs.value]
+    narrationJobIds.value = (result.jobs || []).map((job) => job.uuid)
+    ttsNow.value = Date.now()
     if (result.jobs?.length) pollTtsBook()
     setNotice(`В очередь добавлено глав: ${result.queued}`, 'success')
   } catch (error) {
@@ -2027,6 +2105,7 @@ function pollTtsBook() {
   clearInterval(ttsPollTimer)
   ttsPollTimer = setInterval(async () => {
     try {
+      ttsNow.value = Date.now()
       const result = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/tts-jobs`)
       ttsJobs.value = result.jobs || []
       if (!ttsJobs.value.some((job) => ['queued', 'running'].includes(job.status))) {
@@ -2051,6 +2130,7 @@ function pollTtsJob(jobUuid) {
   clearInterval(ttsPollTimer)
   ttsPollTimer = setInterval(async () => {
     try {
+      ttsNow.value = Date.now()
       const job = await apiRequest(`/tts-jobs/${encodeURIComponent(jobUuid)}`)
       const index = ttsJobs.value.findIndex((item) => item.uuid === jobUuid)
       if (index >= 0) ttsJobs.value[index] = job

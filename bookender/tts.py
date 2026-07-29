@@ -12,7 +12,7 @@ import threading
 import time
 import uuid as uuidlib
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .logging import log_event
 from .paths import USER_DATA
@@ -263,8 +263,9 @@ class TtsService:
                 """
                 INSERT INTO tts_jobs(
                     uuid, project_id, chapter_id, status, provider, voice,
-                    source_text_hash, output_path, created_at, job_kind, progress
-                ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, 'chapter', 0)
+                    source_text_hash, output_path, created_at, job_kind, progress,
+                    progress_done, progress_total
+                ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, 'chapter', 0, 0, ?)
                 """,
                 (
                     job_uuid,
@@ -275,6 +276,7 @@ class TtsService:
                     chapter["content_hash"],
                     relative_output,
                     now,
+                    len(self._split_text_chunks(chapter["content"])),
                 ),
             )
         if start:
@@ -470,13 +472,44 @@ class TtsService:
             connection.execute(
                 """
                 UPDATE tts_jobs
-                SET status='running', progress=0.1, started_at=?
+                SET status='running', progress=0.02, progress_done=0, started_at=?
                 WHERE uuid=?
                 """,
                 (utc_now(), job_uuid),
             )
         try:
-            self._synthesize(chapter["content"], output, settings)
+            last_saved_progress = 0.0
+            chapter_chunk_count = len(self._split_text_chunks(chapter["content"]))
+
+            def save_progress(
+                completed: int, total: int, fraction: float
+            ) -> None:
+                nonlocal last_saved_progress
+                progress = min(0.94, max(0.02, 0.02 + fraction * 0.92))
+                if progress < 0.94 and progress - last_saved_progress < 0.015:
+                    return
+                last_saved_progress = progress
+                with self.repository.database.transaction() as connection:
+                    connection.execute(
+                        """
+                        UPDATE tts_jobs
+                        SET progress=?, progress_done=?, progress_total=?
+                        WHERE uuid=? AND status='running'
+                        """,
+                        (progress, completed, max(1, total), job_uuid),
+                    )
+
+            self._synthesize(
+                chapter["content"],
+                output,
+                settings,
+                progress_callback=save_progress,
+            )
+            save_progress(
+                chapter_chunk_count,
+                chapter_chunk_count,
+                1.0,
+            )
             duration = self._audio_duration(output)
             now = utc_now()
             with self.repository.database.transaction() as connection:
@@ -520,7 +553,8 @@ class TtsService:
                 connection.execute(
                     """
                     UPDATE tts_jobs
-                    SET status='done', progress=1, finished_at=?,
+                    SET status='done', progress=1,
+                        progress_done=progress_total, finished_at=?,
                         error='', user_error=''
                     WHERE uuid=?
                     """,
@@ -614,10 +648,31 @@ class TtsService:
         return values
 
     @classmethod
-    def _synthesize(cls, text: str, output: Path, settings: dict[str, str]) -> None:
+    def _synthesize(
+        cls,
+        text: str,
+        output: Path,
+        settings: dict[str, str],
+        progress_callback: Callable[[int, int, float], None] | None = None,
+    ) -> None:
         chunks = cls._split_text_chunks(text)
+        total = len(chunks)
+
+        def report(completed: int, local_fraction: float = 0.0) -> None:
+            if progress_callback is None:
+                return
+            overall = min(1.0, max(0.0, (completed + local_fraction) / total))
+            progress_callback(completed, total, overall)
+
+        report(0)
         if len(chunks) == 1:
-            cls._synthesize_chunk(chunks[0], output, settings)
+            cls._synthesize_chunk(
+                chunks[0],
+                output,
+                settings,
+                progress_callback=lambda fraction: report(0, fraction),
+            )
+            report(1)
             return
 
         ffmpeg = shutil.which("ffmpeg")
@@ -630,8 +685,16 @@ class TtsService:
         ]
         concat_file = output.with_name(f".{output.stem}-{token}-concat.txt")
         try:
-            for chunk, part in zip(chunks, parts):
-                cls._synthesize_chunk(chunk, part, settings)
+            for index, (chunk, part) in enumerate(zip(chunks, parts)):
+                cls._synthesize_chunk(
+                    chunk,
+                    part,
+                    settings,
+                    progress_callback=lambda fraction, done=index: report(
+                        done, fraction
+                    ),
+                )
+                report(index + 1)
             cls._concat_mp3_files(parts, output, concat_file=concat_file)
         finally:
             concat_file.unlink(missing_ok=True)
@@ -717,8 +780,27 @@ class TtsService:
         return chunks or [""]
 
     @staticmethod
-    def _synthesize_chunk(text: str, output: Path, settings: dict[str, str]) -> None:
+    def _synthesize_chunk(
+        text: str,
+        output: Path,
+        settings: dict[str, str],
+        progress_callback: Callable[[float], None] | None = None,
+    ) -> None:
         import edge_tts
+
+        async def stream_to_file(communicate: Any) -> None:
+            spoken_characters = 0
+            with output.open("wb") as audio:
+                async for message in communicate.stream():
+                    if message["type"] == "audio":
+                        audio.write(message["data"])
+                    elif message["type"] in {"WordBoundary", "SentenceBoundary"}:
+                        spoken_characters += len(str(message.get("text") or "")) + 1
+                        if progress_callback:
+                            progress_callback(
+                                min(0.97, spoken_characters / max(1, len(text)))
+                            )
+                audio.flush()
 
         last_error: Exception | None = None
         for attempt in range(3):
@@ -729,9 +811,12 @@ class TtsService:
                     rate=settings["rate"],
                     volume=settings["volume"],
                     pitch=settings["pitch"],
+                    boundary="SentenceBoundary",
                 )
-                asyncio.run(communicate.save(str(output)))
+                asyncio.run(stream_to_file(communicate))
                 if output.is_file() and output.stat().st_size > 0:
+                    if progress_callback:
+                        progress_callback(1.0)
                     return
                 raise RuntimeError("TTS provider did not create an audio file")
             except Exception as exc:
