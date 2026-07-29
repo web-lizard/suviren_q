@@ -1,7 +1,7 @@
 {
-  "name": "book-wunderwaffe-studio",
-  "version": "1.1.0",
-  "description": "Local-first audiobook production suite for Windows",
+  "name": "bookender-studio",
+  "version": "2.0.0",
+  "description": "Local-first multi-project book, narration and video ecosystem",
   "license": "UNLICENSED",
   "private": true,
   "type": "module",

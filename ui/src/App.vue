@@ -1,15 +1,35 @@
 <template>
-  <div class="studio" :class="[`theme-${project.theme}`, { 'is-loading': loading }]">
+  <div class="studio" :class="[`theme-${project.theme}`, `workspace-${activeWorkspace}`, { 'is-loading': loading }]">
     <header class="topbar">
-      <div class="brand" aria-label="BOOK WUNDERWAFFE Studio">
+      <div class="brand" aria-label="Bookender Studio">
         <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
         <span class="brand-copy">
-          <strong>BOOK WUNDERWAFFE STUDIO</strong>
-          <small>AUDIOBOOK SUITE · v{{ backend.version || '1.1.0' }}</small>
+          <strong>BOOKENDER STUDIO</strong>
+          <small>BOOK · VOICE · VIDEO · v{{ backend.version || '2.0.0' }}</small>
         </span>
       </div>
 
-      <nav class="project-actions" aria-label="Действия с проектом">
+      <div class="ecosystem-nav">
+        <div class="workspace-tabs" role="tablist" aria-label="Рабочий режим">
+          <button type="button" role="tab" :aria-selected="activeWorkspace === 'book'"
+                  :class="{ active: activeWorkspace === 'book' }" @click="setWorkspace('book')">Книга</button>
+          <button type="button" role="tab" :aria-selected="activeWorkspace === 'video'"
+                  :class="{ active: activeWorkspace === 'video' }" @click="setWorkspace('video')">Видео</button>
+        </div>
+        <label class="global-project-picker">
+          <span>Проект</span>
+          <select :value="activeProjectUuid || ''" :disabled="switchingProject" @change="switchProject($event.target.value)">
+            <option value="" disabled>{{ projectCatalog.length ? 'Выберите проект' : 'Проекты не найдены' }}</option>
+            <option v-for="item in projectCatalog" :key="item.uuid" :value="item.uuid">
+              {{ item.title }} · {{ projectKindLabel(item.project_kind) }}
+            </option>
+          </select>
+        </label>
+        <button class="ecosystem-new" type="button" @click="createEcosystemProject">＋ Новый проект</button>
+        <button class="ecosystem-manage" type="button" title="Управление проектами" @click="openProjectManager">•••</button>
+      </div>
+
+      <nav v-if="activeWorkspace === 'video'" class="project-actions" aria-label="Действия с видеопроектом">
         <button class="action-button" type="button" @click="newProject" title="Новый проект">
           <span aria-hidden="true">＋</span><b>Новый</b>
         </button>
@@ -26,12 +46,26 @@
           <span aria-hidden="true">↗</span><b>Экспорт</b>
         </button>
       </nav>
+      <nav v-else class="project-actions book-actions" aria-label="Действия с книгой">
+        <button class="action-button" type="button" @click="createBookProject">
+          <span aria-hidden="true">＋</span><b>Новая книга</b>
+        </button>
+        <button class="action-button" type="button" :disabled="bookSaveState === 'saving'" @click="saveCurrentChapter()">
+          <span aria-hidden="true">◇</span><b>{{ bookSaveState === 'saving' ? 'Сохраняю' : 'Сохранить' }}</b>
+        </button>
+        <button class="action-button" type="button" :disabled="!activeProjectUuid" @click="backupActiveProject">
+          <span aria-hidden="true">◫</span><b>Резервная копия</b>
+        </button>
+        <button class="export-button" type="button" :disabled="!activeProjectRecord?.book" @click="setWorkspace('video')">
+          <span aria-hidden="true">→</span><b>В видеокнигу</b>
+        </button>
+      </nav>
 
       <div class="topbar-status">
         <span class="status-light" :class="backend.online ? 'online' : 'offline'"></span>
         <span class="status-copy">
           <b>{{ backend.online ? 'Движок в сети' : 'Автономный режим' }}</b>
-          <small>{{ dirty ? 'Есть изменения' : 'Проект сохранён' }}</small>
+          <small>{{ activeWorkspace === 'book' ? bookSaveLabel : (dirty ? 'Есть изменения' : 'Проект сохранён') }}</small>
         </span>
       </div>
 
@@ -40,7 +74,7 @@
       <input ref="projectInput" class="visually-hidden" type="file" accept="application/json,.json" @change="onProjectInput" />
     </header>
 
-    <main class="workspace">
+    <main v-if="activeWorkspace === 'video'" class="workspace">
       <aside class="materials-panel panel-shell">
         <div class="panel-heading">
           <div>
@@ -305,7 +339,116 @@
       </aside>
     </main>
 
-    <section class="timeline-panel">
+    <main v-else class="book-workspace">
+      <aside v-if="activeProjectRecord?.book" class="book-chapters panel-shell">
+        <div class="panel-heading">
+          <div><span class="eyebrow">Структура</span><h2>Главы</h2></div>
+          <span class="count-badge">{{ filteredBookChapters.length }}</span>
+        </div>
+        <label class="book-search">
+          <span>⌕</span>
+          <input v-model.trim="bookSearch" type="search" placeholder="Поиск по книге" />
+        </label>
+        <div class="chapter-book-list">
+          <button v-for="chapter in filteredBookChapters" :key="chapter.id" type="button"
+                  :class="{ active: currentBookChapter?.id === chapter.id }"
+                  @click="selectBookChapter(chapter.id)">
+            <span>{{ chapter.position + 1 }}</span>
+            <b>{{ chapter.title }}</b>
+            <small>{{ chapter.content.length.toLocaleString('ru-RU') }} зн.</small>
+          </button>
+        </div>
+        <div class="chapter-list-actions">
+          <button type="button" @click="createBookChapter">＋ Глава</button>
+          <button type="button" :disabled="!currentBookChapter" @click="moveBookChapter(-1)">↑</button>
+          <button type="button" :disabled="!currentBookChapter" @click="moveBookChapter(1)">↓</button>
+          <button class="danger" type="button" :disabled="!currentBookChapter" @click="archiveBookChapter">Удалить</button>
+        </div>
+      </aside>
+
+      <section v-if="activeProjectRecord?.book" class="book-editor-column">
+        <header class="book-editor-header">
+          <div>
+            <span class="eyebrow">{{ activeProjectRecord.book.author || activeProjectRecord.author || 'Без автора' }}</span>
+            <h1>{{ activeProjectRecord.book.title }}</h1>
+          </div>
+          <span class="book-save-indicator" :class="bookSaveState"><i></i>{{ bookSaveLabel }}</span>
+        </header>
+        <template v-if="currentBookChapter">
+          <input v-model="bookChapterTitle" class="book-chapter-title" type="text"
+                 aria-label="Название главы" @input="markBookDirty" />
+          <textarea v-model="bookChapterContent" class="book-text-editor"
+                    spellcheck="true" aria-label="Текст главы"
+                    placeholder="Начните писать…" @input="markBookDirty"></textarea>
+          <footer class="book-editor-footer">
+            <span>{{ bookWordCount.toLocaleString('ru-RU') }} слов</span>
+            <span>{{ bookChapterContent.length.toLocaleString('ru-RU') }} символов</span>
+            <span v-if="currentChapterAudio" :class="{ stale: currentChapterAudio.source_text_hash !== currentBookChapter.content_hash }">
+              {{ currentChapterAudio.source_text_hash === currentBookChapter.content_hash ? 'Озвучка актуальна' : 'Текст изменён после озвучки' }}
+            </span>
+          </footer>
+        </template>
+        <div v-else class="book-empty-chapter">
+          <span>✦</span><h2>У книги пока нет глав</h2>
+          <p>Создайте первую главу и сразу начинайте писать.</p>
+          <button type="button" @click="createBookChapter">Создать главу</button>
+        </div>
+      </section>
+
+      <aside v-if="activeProjectRecord?.book" class="book-inspector panel-shell">
+        <div class="panel-heading"><div><span class="eyebrow">Книга</span><h2>Настройки</h2></div></div>
+        <label class="field-label">Название книги
+          <input v-model="bookMetadata.title" type="text" @change="saveBookMetadata" />
+        </label>
+        <label class="field-label">Автор
+          <input v-model="bookMetadata.author" type="text" @change="saveBookMetadata" />
+        </label>
+        <label class="field-label">Описание
+          <textarea v-model="bookMetadata.description" rows="4" @change="saveBookMetadata"></textarea>
+        </label>
+        <div class="book-tts-panel">
+          <span class="section-title">Озвучка</span>
+          <label class="field-label">Голос
+            <select v-model="bookTts.voice" @change="saveBookTtsSettings">
+              <option value="ru-RU-SvetlanaNeural">Светлана</option>
+              <option value="ru-RU-DmitryNeural">Дмитрий</option>
+            </select>
+          </label>
+          <div class="field-grid">
+            <label class="field-label">Скорость<input v-model="bookTts.rate" type="text" @change="saveBookTtsSettings" /></label>
+            <label class="field-label">Тон<input v-model="bookTts.pitch" type="text" @change="saveBookTtsSettings" /></label>
+          </div>
+          <button class="book-primary" type="button" :disabled="!currentBookChapter || activeTtsJobRunning" @click="narrateCurrentChapter">
+            {{ activeTtsJobRunning ? 'Озвучивание идёт в фоне…' : 'Озвучить текущую главу' }}
+          </button>
+          <button class="book-secondary" type="button" :disabled="activeTtsJobRunning" @click="narrateWholeBook">
+            Озвучить всю книгу
+          </button>
+          <p v-if="latestTtsJob" class="book-job-state" :class="latestTtsJob.status">
+            {{ ttsJobLabel(latestTtsJob) }}
+          </p>
+        </div>
+        <div class="book-audio-list">
+          <span class="section-title">Аудиофайлы · {{ activeProjectRecord.audio_assets?.length || 0 }}</span>
+          <div v-for="asset in activeProjectRecord.audio_assets || []" :key="asset.id">
+            <b>{{ chapterTitleForAudio(asset) }}</b>
+            <small>{{ asset.generation_status }}</small>
+            <audio v-if="!asset.file_path.startsWith('external:')" controls preload="none"
+                   :src="`${API}/project-media/${encodeURI(asset.file_path)}`"></audio>
+          </div>
+        </div>
+      </aside>
+
+      <section v-else class="book-missing">
+        <span class="loading-mark"><i></i><i></i><i></i></span>
+        <h1>{{ activeProjectRecord ? 'У этого видеопроекта нет текстовой книги' : 'Выберите проект' }}</h1>
+        <p v-if="activeProjectRecord">Текстовую часть можно добавить, не затрагивая существующий таймлайн и медиа.</p>
+        <button v-if="activeProjectRecord" type="button" @click="createBookPart">Создать текстовую часть</button>
+        <button v-else type="button" @click="createBookProject">Новая книга</button>
+      </section>
+    </main>
+
+    <section v-if="activeWorkspace === 'video'" class="timeline-panel">
       <div class="timeline-toolbar">
         <div class="timeline-title">
           <span class="eyebrow">Монтаж</span>
@@ -430,9 +573,41 @@
       </section>
     </div>
 
+    <div v-if="showProjectManager" class="modal-backdrop" @mousedown.self="showProjectManager = false">
+      <section class="project-manager-modal" role="dialog" aria-modal="true" aria-labelledby="project-manager-title">
+        <header>
+          <div><span class="eyebrow">Локальная библиотека</span><h2 id="project-manager-title">Проекты Bookender</h2></div>
+          <button type="button" @click="showProjectManager = false" aria-label="Закрыть">×</button>
+        </header>
+        <label class="project-manager-search">
+          <span>⌕</span><input v-model.trim="projectManagerSearch" type="search" placeholder="Название или автор" />
+        </label>
+        <div class="project-manager-list">
+          <article v-for="item in managedProjects" :key="item.uuid" :class="{ archived: !!item.archived_at }">
+            <button class="project-manager-open" type="button" @click="openManagedProject(item.uuid)">
+              <span>{{ projectKindLabel(item.project_kind) }}</span>
+              <b>{{ item.title }}</b>
+              <small>{{ item.author || 'Без автора' }} · {{ item.chapter_count }} глав · {{ formatProjectDate(item.updated_at) }}</small>
+            </button>
+            <div>
+              <button type="button" title="Переименовать" @click="renameManagedProject(item)">✎</button>
+              <button type="button" title="Дублировать" @click="duplicateManagedProject(item)">⧉</button>
+              <button type="button" title="Резервная копия" @click="backupManagedProject(item)">◫</button>
+              <button type="button" :title="item.archived_at ? 'Вернуть из архива' : 'Архивировать'"
+                      @click="toggleManagedArchive(item)">{{ item.archived_at ? '↥' : '⌄' }}</button>
+            </div>
+          </article>
+        </div>
+        <footer>
+          <span>Физическое удаление отключено: проекты безопасно архивируются.</span>
+          <button type="button" @click="createEcosystemProject">＋ Новый проект</button>
+        </footer>
+      </section>
+    </div>
+
     <div v-if="loading" class="loading-screen">
       <span class="loading-mark"><i></i><i></i><i></i></span>
-      <strong>BOOK WUNDERWAFFE STUDIO</strong>
+      <strong>BOOKENDER STUDIO</strong>
       <small>{{ loadingMessage }}</small>
     </div>
   </div>
@@ -502,6 +677,31 @@ const project = reactive(freshProject())
 const backend = reactive({ online: false, checking: true, version: '' })
 const selection = reactive({ type: 'project', id: null })
 const notice = reactive({ text: '', kind: 'info' })
+const activeWorkspace = ref('book')
+const projectCatalog = ref([])
+const managerProjectCatalog = ref([])
+const activeProjectUuid = ref('')
+const activeProjectRecord = ref(null)
+const switchingProject = ref(false)
+const activeVideoEditionId = ref(null)
+const showProjectManager = ref(false)
+const projectManagerSearch = ref('')
+const bookSearch = ref('')
+const currentBookChapterId = ref(null)
+const bookChapterTitle = ref('')
+const bookChapterContent = ref('')
+const bookSaveState = ref('saved')
+const bookMetadata = reactive({ title: '', author: '', description: '' })
+const bookTts = reactive({
+  voice: 'ru-RU-SvetlanaNeural',
+  rate: '+0%',
+  pitch: '+0Hz',
+  volume: '+0%',
+  provider: 'edge-tts',
+})
+const ttsJobs = ref([])
+let bookAutosaveTimer = null
+let ttsPollTimer = null
 
 const loading = ref(true)
 const loadingMessage = ref('Подключаю медиадвижок…')
@@ -557,6 +757,40 @@ const videoAsset = computed(() => assetById(project.videoAssetId))
 const coverAsset = computed(() => assetById(project.coverAssetId))
 const backgroundAsset = computed(() => assetById(project.backgroundAssetId))
 const imageAssets = computed(() => project.materials.filter((item) => item.type === 'image'))
+const currentBookChapter = computed(() => (
+  activeProjectRecord.value?.chapters?.find((item) => item.id === currentBookChapterId.value) || null
+))
+const filteredBookChapters = computed(() => {
+  const chapters = activeProjectRecord.value?.chapters || []
+  const query = bookSearch.value.toLocaleLowerCase('ru-RU')
+  if (!query) return chapters
+  return chapters.filter((item) => (
+    item.title.toLocaleLowerCase('ru-RU').includes(query)
+    || item.content.toLocaleLowerCase('ru-RU').includes(query)
+  ))
+})
+const managedProjects = computed(() => {
+  const query = projectManagerSearch.value.toLocaleLowerCase('ru-RU')
+  if (!query) return managerProjectCatalog.value
+  return managerProjectCatalog.value.filter((item) => (
+    item.title.toLocaleLowerCase('ru-RU').includes(query)
+    || String(item.author || '').toLocaleLowerCase('ru-RU').includes(query)
+  ))
+})
+const bookWordCount = computed(() => (
+  (bookChapterContent.value.trim().match(/[\p{L}\p{N}]+(?:[-’'][\p{L}\p{N}]+)*/gu) || []).length
+))
+const bookSaveLabel = computed(() => ({
+  modified: 'Есть изменения',
+  saving: 'Сохраняется…',
+  saved: 'Сохранено',
+  error: 'Ошибка сохранения',
+}[bookSaveState.value] || 'Сохранено'))
+const currentChapterAudio = computed(() => (
+  activeProjectRecord.value?.audio_assets?.find((asset) => asset.chapter_id === currentBookChapterId.value) || null
+))
+const latestTtsJob = computed(() => ttsJobs.value[0] || null)
+const activeTtsJobRunning = computed(() => ['queued', 'running'].includes(latestTtsJob.value?.status))
 const audioSource = computed(() => assetUrl(audioAsset.value))
 const videoSource = computed(() => assetUrl(videoAsset.value))
 const coverSource = computed(() => assetUrl(coverAsset.value))
@@ -740,6 +974,9 @@ function formatBytes(bytes) {
 function mediaUrl(path) {
   if (!path) return ''
   const normalized = String(path).replaceAll('\\', '/').replace(/^\/+/, '')
+  if (normalized.startsWith('projects/')) {
+    return `${API}/project-media/${normalized.split('/').map(encodeURIComponent).join('/')}`
+  }
   return `${API}/media/${normalized.split('/').map(encodeURIComponent).join('/')}`
 }
 
@@ -841,6 +1078,508 @@ async function apiRequest(path, options = {}) {
   return data
 }
 
+function projectKindLabel(kind) {
+  return ({ book: 'книга', video: 'видео', hybrid: 'книга + видео' }[kind] || kind)
+}
+
+async function loadProjectCatalog(includeArchived = false) {
+  const response = await apiRequest(`/projects?include_archived=${includeArchived ? 'true' : 'false'}`)
+  projectCatalog.value = response.projects || []
+  return response.active_project_uuid || projectCatalog.value[0]?.uuid || ''
+}
+
+async function loadManagerCatalog() {
+  const response = await apiRequest('/projects?include_archived=true')
+  managerProjectCatalog.value = response.projects || []
+}
+
+async function openProjectManager() {
+  try {
+    await loadManagerCatalog()
+    showProjectManager.value = true
+  } catch (error) {
+    setNotice(`Не удалось открыть библиотеку: ${error.message}`, 'error')
+  }
+}
+
+async function openManagedProject(projectUuid) {
+  showProjectManager.value = false
+  await switchProject(projectUuid)
+}
+
+async function renameManagedProject(item) {
+  const title = window.prompt('Новое название проекта', item.title)
+  if (!title || title === item.title) return
+  try {
+    await apiRequest(`/projects/${encodeURIComponent(item.uuid)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    })
+    await Promise.all([loadProjectCatalog(), loadManagerCatalog()])
+    if (item.uuid === activeProjectUuid.value) {
+      activeProjectRecord.value = await apiRequest(`/projects/${encodeURIComponent(item.uuid)}`)
+      hydrateBookState(activeProjectRecord.value)
+    }
+  } catch (error) {
+    setNotice(`Не удалось переименовать проект: ${error.message}`, 'error')
+  }
+}
+
+async function duplicateManagedProject(item) {
+  try {
+    const duplicate = await apiRequest(`/projects/${encodeURIComponent(item.uuid)}/duplicate`, { method: 'POST' })
+    await Promise.all([loadProjectCatalog(), loadManagerCatalog()])
+    showProjectManager.value = false
+    await switchProject(duplicate.uuid)
+  } catch (error) {
+    setNotice(`Не удалось дублировать проект: ${error.message}`, 'error')
+  }
+}
+
+async function backupManagedProject(item) {
+  try {
+    const result = await apiRequest(`/projects/${encodeURIComponent(item.uuid)}/backup`, { method: 'POST' })
+    setNotice(`Резервная копия создана: ${result.path}`, 'success', 7000)
+  } catch (error) {
+    setNotice(`Не удалось создать резервную копию: ${error.message}`, 'error')
+  }
+}
+
+async function toggleManagedArchive(item) {
+  const archived = !item.archived_at
+  if (archived && !window.confirm(`Архивировать проект «${item.title}»?`)) return
+  try {
+    await apiRequest(`/projects/${encodeURIComponent(item.uuid)}/archive`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ archived }),
+    })
+    await Promise.all([loadProjectCatalog(), loadManagerCatalog()])
+  } catch (error) {
+    setNotice(`Не удалось изменить архив: ${error.message}`, 'error')
+  }
+}
+
+function formatProjectDate(value) {
+  if (!value) return 'дата неизвестна'
+  return new Intl.DateTimeFormat('ru-RU', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(value))
+}
+
+function hydrateBookState(record) {
+  const book = record?.book
+  bookMetadata.title = book?.title || record?.title || ''
+  bookMetadata.author = book?.author || record?.author || ''
+  bookMetadata.description = book?.description || record?.description || ''
+  Object.assign(bookTts, {
+    voice: record?.tts_settings?.voice || 'ru-RU-SvetlanaNeural',
+    rate: record?.tts_settings?.rate || '+0%',
+    pitch: record?.tts_settings?.pitch || '+0Hz',
+    volume: record?.tts_settings?.volume || '+0%',
+    provider: record?.tts_settings?.provider || 'edge-tts',
+  })
+  const chapters = record?.chapters || []
+  const preferred = chapters.find((item) => item.id === currentBookChapterId.value) || chapters[0] || null
+  currentBookChapterId.value = preferred?.id || null
+  bookChapterTitle.value = preferred?.title || ''
+  bookChapterContent.value = preferred?.content || ''
+  bookSaveState.value = 'saved'
+}
+
+function addBookAudioToVideo(record) {
+  for (const audio of record?.audio_assets || []) {
+    if (!audio.file_path || audio.file_path.startsWith('external:')) continue
+    const serverPath = audio.file_path
+    if (project.materials.some((item) => item.serverPath === serverPath)) continue
+    const chapter = record.chapters?.find((item) => item.id === audio.chapter_id)
+    project.materials.push({
+      id: `chapter-audio-${audio.id}`,
+      type: 'audio',
+      name: `${chapter?.title || 'Озвучка'}.mp3`,
+      size: 0,
+      serverPath,
+      src: mediaUrl(serverPath),
+      status: 'ready',
+      progress: 1,
+      chapterId: audio.chapter_id,
+      sourceTextHash: audio.source_text_hash,
+    })
+  }
+}
+
+async function publishVideoCompatibility(projectUuid, editionId, payload) {
+  if (!backend.online || !projectUuid || !editionId) return
+  await apiRequest(
+    `/editor-project?project_uuid=${encodeURIComponent(projectUuid)}&edition_id=${encodeURIComponent(editionId)}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+  )
+}
+
+async function flushActiveWorkspace() {
+  clearTimeout(bookAutosaveTimer)
+  if (bookSaveState.value === 'modified' || bookSaveState.value === 'error') {
+    const saved = await saveCurrentChapter({ silent: true })
+    if (!saved) return false
+  }
+  if (dirty.value && activeVideoEditionId.value) {
+    const saved = await saveProject({ silent: true })
+    if (!saved) return false
+  }
+  return true
+}
+
+async function switchProject(projectUuid, { initial = false } = {}) {
+  if (!projectUuid || switchingProject.value) return
+  if (!initial && projectUuid === activeProjectUuid.value) return
+  switchingProject.value = true
+  try {
+    if (!initial && !(await flushActiveWorkspace())) {
+      setNotice('Переключение отменено: текущие изменения не сохранены', 'error')
+      return
+    }
+    pauseAll()
+    const record = await apiRequest(`/projects/${encodeURIComponent(projectUuid)}/open`, { method: 'POST' })
+    activeProjectUuid.value = projectUuid
+    activeProjectRecord.value = record
+    hydrateBookState(record)
+    ttsJobs.value = []
+    if (record.book) {
+      try {
+        const jobs = await apiRequest(`/projects/${encodeURIComponent(projectUuid)}/tts-jobs`)
+        ttsJobs.value = jobs.jobs || []
+      } catch { /* TTS history is optional */ }
+    }
+    const edition = record.video_editions?.[0] || null
+    activeVideoEditionId.value = edition?.id || null
+    if (edition) {
+      replaceProject(edition.settings)
+      addBookAudioToVideo(record)
+      await publishVideoCompatibility(projectUuid, edition.id, serializeProject())
+    } else {
+      const emptyVideo = freshProject()
+      emptyVideo.title = record.title
+      emptyVideo.author = record.author
+      emptyVideo.chapters = (record.chapters || []).map((chapter) => ({
+        id: `book-chapter-${chapter.id}`,
+        chapterId: chapter.id,
+        title: chapter.title,
+        start_seconds: 0,
+        end_seconds: 0,
+      }))
+      replaceProject(emptyVideo)
+    }
+    if (initial) activeWorkspace.value = record.book ? 'book' : 'video'
+    dirty.value = false
+    await loadProjectCatalog()
+    setNotice(`Открыт проект «${record.title}»`, 'success', 2200)
+  } catch (error) {
+    setNotice(`Не удалось открыть проект: ${error.message}`, 'error', 7000)
+  } finally {
+    switchingProject.value = false
+  }
+}
+
+async function setWorkspace(workspace) {
+  if (workspace === activeWorkspace.value) return
+  if (!(await flushActiveWorkspace())) return
+  if (workspace === 'video' && activeProjectRecord.value && !activeVideoEditionId.value) {
+    const shouldCreate = window.confirm('У проекта ещё нет видеоверсии. Создать её сейчас?')
+    if (shouldCreate) await createVideoEditionForActiveBook()
+  }
+  activeWorkspace.value = workspace
+}
+
+async function createEcosystemProject() {
+  if (activeWorkspace.value === 'video') {
+    const title = window.prompt('Название нового видеопроекта', 'Новая видеокнига')
+    if (!title) return
+    await createProjectRequest({ title, project_kind: 'video' })
+  } else {
+    await createBookProject()
+  }
+}
+
+async function createBookProject() {
+  const title = window.prompt('Название новой книги', 'Новая книга')
+  if (!title) return
+  const author = window.prompt('Автор', '') ?? ''
+  await createProjectRequest({
+    title,
+    author,
+    project_kind: 'book',
+    create_first_chapter: true,
+    voice: bookTts.voice,
+  })
+}
+
+async function createProjectRequest(payload) {
+  if (!(await flushActiveWorkspace())) return
+  try {
+    const created = await apiRequest('/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    await loadProjectCatalog()
+    await switchProject(created.uuid, { initial: true })
+  } catch (error) {
+    setNotice(`Не удалось создать проект: ${error.message}`, 'error')
+  }
+}
+
+async function createBookPart() {
+  if (!activeProjectUuid.value) return
+  try {
+    const record = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/book`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: activeProjectRecord.value?.title, language: 'ru' }),
+    })
+    activeProjectRecord.value = record
+    hydrateBookState(record)
+    await createBookChapter()
+  } catch (error) {
+    setNotice(`Не удалось создать книгу: ${error.message}`, 'error')
+  }
+}
+
+async function selectBookChapter(chapterId) {
+  if (chapterId === currentBookChapterId.value) return
+  clearTimeout(bookAutosaveTimer)
+  if (!(await saveCurrentChapter({ silent: true }))) return
+  const chapter = activeProjectRecord.value?.chapters?.find((item) => item.id === chapterId)
+  if (!chapter) return
+  currentBookChapterId.value = chapterId
+  bookChapterTitle.value = chapter.title
+  bookChapterContent.value = chapter.content
+  bookSaveState.value = 'saved'
+}
+
+function markBookDirty() {
+  bookSaveState.value = 'modified'
+  clearTimeout(bookAutosaveTimer)
+  bookAutosaveTimer = setTimeout(() => { void saveCurrentChapter({ silent: true }) }, 900)
+}
+
+async function saveCurrentChapter({ silent = false } = {}) {
+  const chapter = currentBookChapter.value
+  if (!chapter || bookSaveState.value === 'saved') return true
+  if (bookSaveState.value === 'saving') return false
+  bookSaveState.value = 'saving'
+  try {
+    const saved = await apiRequest(
+      `/projects/${encodeURIComponent(activeProjectUuid.value)}/chapters/${chapter.id}`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: bookChapterTitle.value, content: bookChapterContent.value }),
+      },
+    )
+    const index = activeProjectRecord.value.chapters.findIndex((item) => item.id === saved.id)
+    if (index >= 0) activeProjectRecord.value.chapters[index] = saved
+    bookSaveState.value = 'saved'
+    if (!silent) setNotice('Глава сохранена', 'success', 1800)
+    return true
+  } catch (error) {
+    bookSaveState.value = 'error'
+    if (!silent) setNotice(`Не удалось сохранить главу: ${error.message}`, 'error')
+    return false
+  }
+}
+
+async function createBookChapter() {
+  if (!activeProjectUuid.value) return
+  if (!(await saveCurrentChapter({ silent: true }))) return
+  try {
+    const chapter = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/chapters`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: '', content: '' }),
+    })
+    activeProjectRecord.value.chapters.push(chapter)
+    await selectBookChapter(chapter.id)
+  } catch (error) {
+    setNotice(`Не удалось создать главу: ${error.message}`, 'error')
+  }
+}
+
+async function moveBookChapter(direction) {
+  const chapters = activeProjectRecord.value?.chapters || []
+  const index = chapters.findIndex((item) => item.id === currentBookChapterId.value)
+  const nextIndex = index + direction
+  if (index < 0 || nextIndex < 0 || nextIndex >= chapters.length) return
+  const reordered = [...chapters]
+  const [item] = reordered.splice(index, 1)
+  reordered.splice(nextIndex, 0, item)
+  try {
+    await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/chapters/reorder`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chapter_ids: reordered.map((chapter) => chapter.id) }),
+    })
+    reordered.forEach((chapter, position) => { chapter.position = position })
+    activeProjectRecord.value.chapters = reordered
+  } catch (error) {
+    setNotice(`Не удалось изменить порядок: ${error.message}`, 'error')
+  }
+}
+
+async function archiveBookChapter() {
+  const chapter = currentBookChapter.value
+  if (!chapter || !window.confirm(`Удалить главу «${chapter.title}»? Она будет архивирована.`)) return
+  try {
+    await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/chapters/${chapter.id}`, { method: 'DELETE' })
+    activeProjectRecord.value.chapters = activeProjectRecord.value.chapters.filter((item) => item.id !== chapter.id)
+    currentBookChapterId.value = null
+    hydrateBookState(activeProjectRecord.value)
+  } catch (error) {
+    setNotice(`Не удалось удалить главу: ${error.message}`, 'error')
+  }
+}
+
+async function saveBookMetadata() {
+  try {
+    const record = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(bookMetadata),
+    })
+    activeProjectRecord.value = record
+    hydrateBookState(record)
+    await loadProjectCatalog()
+  } catch (error) {
+    setNotice(`Не удалось сохранить метаданные: ${error.message}`, 'error')
+  }
+}
+
+async function saveBookTtsSettings() {
+  try {
+    const settings = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/tts-settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(bookTts),
+    })
+    activeProjectRecord.value.tts_settings = settings
+  } catch (error) {
+    setNotice(`Не удалось сохранить настройки TTS: ${error.message}`, 'error')
+  }
+}
+
+async function narrateCurrentChapter() {
+  if (!currentBookChapter.value || !(await saveCurrentChapter({ silent: true }))) return
+  try {
+    const job = await apiRequest(
+      `/projects/${encodeURIComponent(activeProjectUuid.value)}/chapters/${currentBookChapter.value.id}/tts`,
+      { method: 'POST' },
+    )
+    ttsJobs.value.unshift(job)
+    pollTtsJob(job.uuid)
+  } catch (error) {
+    setNotice(`Не удалось запустить озвучивание: ${error.message}`, 'error')
+  }
+}
+
+async function narrateWholeBook() {
+  if (!(await saveCurrentChapter({ silent: true }))) return
+  if (!window.confirm('Поставить все непустые главы в последовательную очередь озвучивания?')) return
+  try {
+    const result = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/tts`, { method: 'POST' })
+    ttsJobs.value = [...(result.jobs || []), ...ttsJobs.value]
+    if (result.jobs?.length) pollTtsBook()
+    setNotice(`В очередь добавлено глав: ${result.queued}`, 'success')
+  } catch (error) {
+    setNotice(`Не удалось озвучить книгу: ${error.message}`, 'error')
+  }
+}
+
+function pollTtsBook() {
+  clearInterval(ttsPollTimer)
+  ttsPollTimer = setInterval(async () => {
+    try {
+      const result = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/tts-jobs`)
+      ttsJobs.value = result.jobs || []
+      if (!ttsJobs.value.some((job) => ['queued', 'running'].includes(job.status))) {
+        clearInterval(ttsPollTimer)
+        const record = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}`)
+        activeProjectRecord.value = record
+        hydrateBookState(record)
+        setNotice('Озвучивание книги завершено', 'success')
+      }
+    } catch {
+      clearInterval(ttsPollTimer)
+    }
+  }, 1500)
+}
+
+function pollTtsJob(jobUuid) {
+  clearInterval(ttsPollTimer)
+  ttsPollTimer = setInterval(async () => {
+    try {
+      const job = await apiRequest(`/tts-jobs/${encodeURIComponent(jobUuid)}`)
+      const index = ttsJobs.value.findIndex((item) => item.uuid === jobUuid)
+      if (index >= 0) ttsJobs.value[index] = job
+      if (!['queued', 'running'].includes(job.status)) {
+        clearInterval(ttsPollTimer)
+        const record = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}`)
+        activeProjectRecord.value = record
+        hydrateBookState(record)
+        if (job.status === 'done') setNotice('Озвучка главы готова', 'success')
+        else setNotice(`Ошибка озвучивания: ${job.error}`, 'error', 8000)
+      }
+    } catch {
+      clearInterval(ttsPollTimer)
+    }
+  }, 1200)
+}
+
+function ttsJobLabel(job) {
+  return ({
+    queued: 'Задача поставлена в очередь',
+    running: 'Озвучивание выполняется в фоне',
+    done: 'Озвучка готова',
+    failed: `Ошибка: ${job.error || 'неизвестная ошибка'}`,
+  }[job.status] || job.status)
+}
+
+function chapterTitleForAudio(asset) {
+  return activeProjectRecord.value?.chapters?.find((item) => item.id === asset.chapter_id)?.title || 'Аудиокнига'
+}
+
+async function createVideoEditionForActiveBook() {
+  if (!activeProjectUuid.value) return
+  try {
+    const edition = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/video-editions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: activeProjectRecord.value?.title || null }),
+    })
+    activeVideoEditionId.value = edition.id
+    replaceProject(edition.settings)
+    addBookAudioToVideo(activeProjectRecord.value)
+    await publishVideoCompatibility(activeProjectUuid.value, edition.id, serializeProject())
+    const refreshed = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}`)
+    activeProjectRecord.value = refreshed
+    await loadProjectCatalog()
+    setNotice('Видеоверсия создана', 'success')
+  } catch (error) {
+    setNotice(`Не удалось создать видеоверсию: ${error.message}`, 'error')
+  }
+}
+
+async function backupActiveProject() {
+  if (!activeProjectUuid.value) return
+  try {
+    const result = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/backup`, { method: 'POST' })
+    setNotice(`Резервная копия создана: ${result.path}`, 'success', 7000)
+  } catch (error) {
+    setNotice(`Не удалось создать резервную копию: ${error.message}`, 'error')
+  }
+}
+
 async function loadInitialProject() {
   loading.value = true
   hydrating.value = true
@@ -856,34 +1595,27 @@ async function loadInitialProject() {
 
   let restored = false
   if (backend.online) {
-    loadingMessage.value = 'Восстанавливаю проект…'
+    loadingMessage.value = 'Загружаю библиотеку проектов…'
     try {
-      const saved = await apiRequest('/editor-project')
-      if (saved.exists && saved.project) {
-        replaceProject(saved.project)
+      const activeUuid = await loadProjectCatalog()
+      if (activeUuid) {
+        await switchProject(activeUuid, { initial: true })
         restored = true
       }
-    } catch { /* endpoint may be absent on an older backend */ }
-
-    try {
-      const discovered = await apiRequest('/book-project')
-      hydrateDiscoveredMaterials(discovered)
-      if (!project.title || project.title === 'Новая аудиокнига') project.title = discovered.projectName || project.title
     } catch (error) {
-      setNotice(`Не удалось прочитать материалы: ${error.message}`, 'warning')
-    }
-
-    if (!project.chapters.length) {
+      // Compatibility fallback for an installation that has not run the
+      // ecosystem migration yet.
       try {
-        const chapterData = await apiRequest('/chapters')
-        if (chapterData.chapters?.length) project.chapters = chapterData.chapters.map(normalizeChapter)
-      } catch { /* chapters are optional at startup */ }
+        const saved = await apiRequest('/editor-project')
+        if (saved.exists && saved.project) {
+          replaceProject(saved.project)
+          activeWorkspace.value = 'video'
+          restored = true
+        }
+      } catch { /* recovery JSON is optional */ }
+      setNotice(`Библиотека проектов недоступна: ${error.message}`, 'warning')
     }
-
-    loadingMessage.value = 'Строю форму звука…'
-    // A very large audiobook must not hold the whole editor behind a waveform job.
-    // The cached/decoded shape arrives in the background and updates both canvases.
-    void refreshWaveform()
+    if (activeWorkspace.value === 'video') void refreshWaveform()
   } else {
     const local = localStorage.getItem('book-wunderwaffe-project')
     if (local) {
@@ -975,11 +1707,23 @@ async function saveProject({ silent = false } = {}) {
   localStorage.setItem('book-wunderwaffe-project', JSON.stringify(payload))
   try {
     if (backend.online) {
-      await apiRequest('/editor-project', {
+      if (activeProjectUuid.value && !activeVideoEditionId.value) {
+        const edition = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}/video-editions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: project.title || null }),
+        })
+        activeVideoEditionId.value = edition.id
+      }
+      const query = activeProjectUuid.value
+        ? `?project_uuid=${encodeURIComponent(activeProjectUuid.value)}&edition_id=${encodeURIComponent(activeVideoEditionId.value)}`
+        : ''
+      const saved = await apiRequest(`/editor-project${query}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       })
+      if (saved.edition_id) activeVideoEditionId.value = saved.edition_id
     }
     dirty.value = false
     if (!silent) setNotice(backend.online ? 'Проект сохранён' : 'Проект сохранён в браузере', 'success')
@@ -1839,8 +2583,9 @@ function handleKeydown(event) {
   const editing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
     event.preventDefault()
-    saveProject()
-  } else if (event.code === 'Space' && !editing && !showExport.value) {
+    if (activeWorkspace.value === 'book') saveCurrentChapter()
+    else saveProject()
+  } else if (activeWorkspace.value === 'video' && event.code === 'Space' && !editing && !showExport.value) {
     event.preventDefault()
     togglePlay()
   }
@@ -1891,6 +2636,7 @@ watch(project, () => {
 
 onMounted(() => {
   window.addEventListener('keydown', handleKeydown)
+  window.addEventListener('beforeunload', handleBeforeUnload)
   if (typeof ResizeObserver !== 'undefined') {
     titleResizeObserver = new ResizeObserver(scheduleTitleFit)
     if (titleLayerEl.value) titleResizeObserver.observe(titleLayerEl.value)
@@ -1903,14 +2649,23 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeydown)
+  window.removeEventListener('beforeunload', handleBeforeUnload)
   pauseAll()
   cancelAnimationFrame(visualFrame)
   clearInterval(renderPoll)
   clearTimeout(noticeTimer)
+  clearTimeout(bookAutosaveTimer)
+  clearInterval(ttsPollTimer)
   titleResizeObserver?.disconnect()
   if (titleFitFrame !== null) cancelAnimationFrame(titleFitFrame)
   disconnectLiveVisualizer()
   visualAudioContext?.close().catch(() => {})
   releaseObjectUrls()
 })
+
+function handleBeforeUnload(event) {
+  if (!dirty.value && !['modified', 'saving', 'error'].includes(bookSaveState.value)) return
+  event.preventDefault()
+  event.returnValue = ''
+}
 </script>
