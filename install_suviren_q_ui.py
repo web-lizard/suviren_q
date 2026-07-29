@@ -45,6 +45,7 @@ GITIGNORE_FILE = ROOT / ".gitignore"
 PY_DEPS = [
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
+    "edge-tts>=7.2.8,<8",
 ]
 
 NPM_PACKAGE_JSON = r"""

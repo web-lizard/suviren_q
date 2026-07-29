@@ -47,6 +47,7 @@ REQUIREMENTS = [
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
     "PySide6>=6.8,<7",
+    "edge-tts>=7.2.8,<8",
 ]
 
 
