@@ -18,6 +18,14 @@ test('chapter images and optional reading captions reach the video workspace', (
   assert.match(source, /currentReadingCaption/)
 })
 
+test('reading captions are a movable layer with adjustable typography', () => {
+  assert.match(source, /onLayerPointerDown\('caption'/)
+  assert.match(source, /caption:\s*\{[^}]+fontWeight:\s*400/)
+  assert.match(source, /selectedLayer\.fontWeight/)
+  assert.match(source, /--caption-weight/)
+  assert.match(source, /source\.layers\?\.caption/)
+})
+
 test('opening video rebuilds narrated chapters and exposes chapter audio clips', () => {
   assert.match(source, /workspace === 'video' && activeProjectRecord\.value\?\.book/)
   assert.match(source, /await openBookInVideo\(\)/)

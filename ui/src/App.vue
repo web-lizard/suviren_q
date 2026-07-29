@@ -196,10 +196,14 @@
             </span>
           </button>
 
-          <div v-if="project.captions?.enabled && currentReadingCaption"
-               class="reading-caption" aria-live="off">
+          <button v-if="project.captions?.enabled && layerVisible('caption') && currentReadingCaption"
+                  type="button" class="composition-layer reading-caption"
+                  :class="{ selected: selection.type === 'layer' && selection.id === 'caption' }"
+                  :style="layerStyle('caption')" aria-live="off"
+                  title="Перетащите текст в нужное место"
+                  @pointerdown.stop="onLayerPointerDown('caption', $event)">
             {{ currentReadingCaption }}
-          </div>
+          </button>
 
           <div v-if="videoPreparing" class="video-prepare-overlay">
             <i></i><b>Собираю озвученные главы</b><span>Создаю мастер-аудио и таймлайн…</span>
@@ -388,6 +392,22 @@
               <label class="field-label color-field">Цвет заголовка
                 <input v-model="selectedLayer.color" type="color" />
                 <span>{{ selectedLayer.color }}</span>
+              </label>
+            </template>
+            <template v-if="selection.id === 'caption'">
+              <p class="layer-drag-hint">Текст можно перетаскивать мышью прямо по кадру.</p>
+              <label class="field-label">Размер текста
+                <input v-model.number="selectedLayer.fontSize" type="range" min="16" max="48" step="1" />
+              </label>
+              <label class="field-label">Начертание
+                <select v-model.number="selectedLayer.fontWeight">
+                  <option :value="300">Тонкое</option>
+                  <option :value="400">Обычное</option>
+                  <option :value="500">Среднее</option>
+                </select>
+              </label>
+              <label class="field-label">Плотность подложки
+                <input v-model.number="selectedLayer.backgroundOpacity" type="range" min="0" max="0.9" step="0.05" />
               </label>
             </template>
             <button type="button" class="jump-button" @click="resetLayer(selection.id)">Вернуть положение</button>
@@ -913,6 +933,7 @@ const DEFAULT_LAYERS = {
   cover: { visible: true, x: 7, y: 17, w: 27, h: 66 },
   title: { visible: true, x: 39, y: 23, w: 54, h: 31, fontSize: 48, color: '#f4f0e8' },
   visualizer: { visible: true, x: 38, y: 59, w: 56, h: 23 },
+  caption: { visible: true, x: 14, y: 69, w: 72, h: 18, fontSize: 28, fontWeight: 400, backgroundOpacity: 0.68 },
 }
 
 function uid(prefix = 'id') {
@@ -1457,6 +1478,7 @@ function normalizeProject(value) {
       cover: { ...DEFAULT_LAYERS.cover, ...(source.layers?.cover || {}) },
       title: { ...DEFAULT_LAYERS.title, ...(source.layers?.title || {}) },
       visualizer: { ...DEFAULT_LAYERS.visualizer, ...(source.layers?.visualizer || {}) },
+      caption: { ...DEFAULT_LAYERS.caption, ...(source.layers?.caption || {}) },
     },
   }
   return normalized
@@ -3055,11 +3077,16 @@ function layerStyle(id) {
     style['--title-size'] = `${layer.fontSize || 48}px`
     style['--title-color'] = layer.color || '#f4f0e8'
   }
+  if (id === 'caption') {
+    style['--caption-size'] = `${layer.fontSize || 28}px`
+    style['--caption-weight'] = String(layer.fontWeight || 400)
+    style['--caption-background'] = `rgba(7, 5, 10, ${Number.isFinite(Number(layer.backgroundOpacity)) ? Number(layer.backgroundOpacity) : 0.68})`
+  }
   return style
 }
 
 function layerLabel(id) {
-  return ({ cover: 'Обложка', title: 'Заголовок', visualizer: 'Визуализатор' })[id] || 'Слой'
+  return ({ cover: 'Обложка', title: 'Заголовок', visualizer: 'Визуализатор', caption: 'Текст озвучки' })[id] || 'Слой'
 }
 
 function onLayerPointerDown(id, event) {

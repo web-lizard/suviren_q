@@ -3204,26 +3204,36 @@ input[type="range"] {
 }
 
 .reading-caption {
-  position: absolute;
   z-index: 13;
-  left: 50%;
-  bottom: 13.5%;
-  width: min(76%, 980px);
-  transform: translateX(-50%);
+  display: grid;
+  place-items: center;
   padding: clamp(9px, 1.1vw, 16px) clamp(15px, 1.8vw, 28px);
   border: 1px solid rgba(255, 255, 255, .12);
   border-radius: 10px;
-  background: rgba(7, 5, 10, .74);
+  background: var(--caption-background, rgba(7, 5, 10, .68));
   box-shadow: 0 12px 35px rgba(0, 0, 0, .42);
   color: #fff;
-  font-family: "Segoe UI", sans-serif;
-  font-size: clamp(13px, 1.45vw, 25px);
-  font-weight: 650;
+  font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
+  font-size: var(--caption-size, 28px);
+  font-weight: var(--caption-weight, 400);
   line-height: 1.35;
   text-align: center;
   text-wrap: balance;
-  pointer-events: none;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
   backdrop-filter: blur(8px);
+}
+
+.reading-caption:active {
+  cursor: grabbing;
+}
+
+.layer-drag-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
 }
 
 .video-prepare-overlay,

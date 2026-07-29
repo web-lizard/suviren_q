@@ -1840,6 +1840,7 @@ def reading_caption_chunks(
     duration: float,
     *,
     words_per_card: int = 14,
+    line_width: int = 48,
 ) -> list[tuple[float, float, str]]:
     words = re.findall(r"\S+", str(text or "").strip())
     if not words or duration <= 0:
@@ -1856,7 +1857,7 @@ def reading_caption_chunks(
         wrapped = "\n".join(
             textwrap.wrap(
                 " ".join(group),
-                width=48,
+                width=max(18, min(120, int(line_width or 48))),
                 break_long_words=False,
                 break_on_hyphens=False,
             )[:3]
@@ -2008,15 +2009,30 @@ def _render_segment_worker(args: dict[str, Any]) -> dict[str, Any]:
             )
             current_label = "with_time"
 
-    if captions.get("enabled") is True and caption_text.strip():
+    if (
+        captions.get("enabled") is True
+        and captions.get("visible") is not False
+        and caption_text.strip()
+    ):
         font_value = args.get("font")
+        try:
+            caption_weight = int(captions.get("fontWeight") or 400)
+        except (TypeError, ValueError):
+            caption_weight = 400
+        default_font_name = "segoeuil.ttf" if caption_weight <= 300 else "segoeui.ttf"
         font_path = (
             Path(font_value)
             if font_value
             else Path(os.environ.get("SystemRoot", "C:\\Windows"))
             / "Fonts"
-            / "segoeui.ttf"
+            / default_font_name
         )
+        if not font_path.is_file() and not font_value:
+            font_path = (
+                Path(os.environ.get("SystemRoot", "C:\\Windows"))
+                / "Fonts"
+                / "segoeui.ttf"
+            )
         if font_path.is_file():
             escaped_font = (
                 str(font_path.resolve())
@@ -2028,14 +2044,42 @@ def _render_segment_worker(args: dict[str, Any]) -> dict[str, Any]:
                 words_per_card = int(captions.get("wordsPerCard") or 14)
             except (TypeError, ValueError):
                 words_per_card = 14
-            caption_size = max(22, round(height * 0.033))
-            caption_y = round(height * 0.77)
+            try:
+                caption_font_size = float(captions.get("fontSize", 28))
+            except (TypeError, ValueError):
+                caption_font_size = 28
+
+            def caption_number(key: str, default: float) -> float:
+                try:
+                    return float(captions.get(key, default))
+                except (TypeError, ValueError):
+                    return default
+
+            caption_width_percent = max(5, min(100, caption_number("w", 72)))
+            caption_height_percent = max(5, min(100, caption_number("h", 18)))
+            caption_x_percent = max(
+                0,
+                min(100 - caption_width_percent, caption_number("x", 14)),
+            )
+            caption_y_percent = max(
+                0,
+                min(100 - caption_height_percent, caption_number("y", 69)),
+            )
+            caption_background = caption_number("backgroundOpacity", 0.68)
+            caption_background = max(0, min(0.9, caption_background))
+            caption_size = max(12, round(max(16, min(48, caption_font_size)) * height / 1080))
+            caption_x = round(width * caption_x_percent / 100)
+            caption_y = round(height * caption_y_percent / 100)
+            caption_width = round(width * caption_width_percent / 100)
+            caption_height = round(height * caption_height_percent / 100)
+            caption_line_width = max(18, round(caption_width / max(1, caption_size * 0.58)))
             border = max(12, round(width * 0.012))
             for index, (caption_start, caption_end, caption) in enumerate(
                 reading_caption_chunks(
                     caption_text,
                     duration,
                     words_per_card=words_per_card,
+                    line_width=caption_line_width,
                 )
             ):
                 next_label = f"with_caption_{index}"
@@ -2043,9 +2087,10 @@ def _render_segment_worker(args: dict[str, Any]) -> dict[str, Any]:
                     f"[{current_label}]drawtext=fontfile='{escaped_font}':"
                     f"text='{escape_drawtext_text(caption)}':"
                     f"fontcolor=white:fontsize={caption_size}:"
-                    "x=(w-text_w)/2:"
-                    f"y={caption_y}:line_spacing={max(5, round(caption_size * .22))}:"
-                    "box=1:boxcolor=black@0.68:"
+                    f"x={caption_x}+({caption_width}-text_w)/2:"
+                    f"y={caption_y}+({caption_height}-text_h)/2:"
+                    f"line_spacing={max(5, round(caption_size * .22))}:"
+                    f"box=1:boxcolor=black@{caption_background:.2f}:"
                     f"boxborderw={border}:fix_bounds=1:"
                     f"enable='between(t,{caption_start:.3f},{caption_end:.3f})'"
                     f"[{next_label}]"
@@ -2054,7 +2099,9 @@ def _render_segment_worker(args: dict[str, Any]) -> dict[str, Any]:
 
     filter_complex: Optional[str] = None
     if animated_visuals or (
-        captions.get("enabled") is True and caption_text.strip()
+        captions.get("enabled") is True
+        and captions.get("visible") is not False
+        and caption_text.strip()
     ):
         filter_parts.append(f"[{current_label}]format=yuv420p[v]")
         filter_complex = ";".join(filter_parts)
@@ -2586,6 +2633,12 @@ def cmd_render(args: argparse.Namespace) -> None:
         if isinstance(editor_project.get("captions"), dict)
         else {}
     )
+    caption_layer = (
+        project_layers.get("caption")
+        if isinstance(project_layers.get("caption"), dict)
+        else {}
+    )
+    captions_config = {**captions_config, **caption_layer}
     for i, ch in enumerate(chapters):
         if ch.start_seconds >= render_end - 0.001:
             break

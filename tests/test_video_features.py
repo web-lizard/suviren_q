@@ -25,6 +25,22 @@ class VideoBookFeatureTests(unittest.TestCase):
         self.assertTrue(all(start < end for start, end, _ in chunks))
         self.assertIn(r"\:", escape_drawtext_text("реплика: тест"))
 
+    def test_caption_wrap_width_follows_the_movable_layer(self) -> None:
+        text = " ".join(["длинныйфрагмент"] * 12)
+        narrow = reading_caption_chunks(
+            text,
+            4.0,
+            words_per_card=12,
+            line_width=18,
+        )
+        wide = reading_caption_chunks(
+            text,
+            4.0,
+            words_per_card=12,
+            line_width=120,
+        )
+        self.assertGreater(narrow[0][2].count("\n"), wide[0][2].count("\n"))
+
     def test_chapter_json_preserves_text_and_image(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "chapters.json"
