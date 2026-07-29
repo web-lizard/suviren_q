@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BOOK WUNDERWAFFE Studio API
+Bookender Studio API
 
 Provides endpoints for:
   - /api/book-project — data auto-discovery from data/
@@ -35,6 +35,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
+from bookender.paths import DATABASE_PATH, USER_DATA
+from bookender.repository import (
+    ProjectNotFoundError,
+    ProjectRepository,
+)
+from bookender.tts import TtsService
+
 
 ROOT = Path(__file__).resolve().parent
 MAIN_SCRIPT = ROOT / "suviren_q.py"
@@ -44,8 +51,8 @@ LAYOUT_PATH = BUILD_DIR / "layout.json"
 EDITOR_PROJECT_PATH = BUILD_DIR / "editor-project.json"
 CHAPTERS_PATH = BUILD_DIR / "chapters.detected.json"
 
-APP_NAME = "BOOK WUNDERWAFFE Studio"
-APP_VERSION = "1.1.0"
+APP_NAME = "Bookender Studio"
+APP_VERSION = "2.0.0"
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg", ".opus"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
@@ -77,7 +84,7 @@ app.add_middleware(
         "http://localhost:4178",
     ],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -85,6 +92,9 @@ JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 AUDIO_PROBE_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
 AUDIO_DISCOVERY_CACHE: dict[tuple[str, int, int], float] = {}
+PROJECT_REPOSITORY = ProjectRepository()
+PROJECT_REPOSITORY.initialize()
+TTS_SERVICE = TtsService(PROJECT_REPOSITORY)
 
 
 def console_python_executable() -> str:
@@ -119,6 +129,50 @@ class InspectRequest(BaseModel):
 class SaveChaptersRequest(BaseModel):
     path: str = "_suviren_q_build/chapters.manual.json"
     chapters: list[dict[str, Any]]
+
+
+class ProjectCreateRequest(BaseModel):
+    title: str
+    author: str = ""
+    description: str = ""
+    project_kind: str = "book"
+    language: str = "ru"
+    voice: str = ""
+    create_first_chapter: bool = False
+    source_project_uuid: str | None = None
+
+
+class ProjectUpdateRequest(BaseModel):
+    title: str | None = None
+    author: str | None = None
+    description: str | None = None
+
+
+class ChapterCreateRequest(BaseModel):
+    title: str = ""
+    content: str = ""
+
+
+class ChapterUpdateRequest(BaseModel):
+    title: str | None = None
+    content: str | None = None
+
+
+class ChapterOrderRequest(BaseModel):
+    chapter_ids: list[int]
+
+
+class TtsSettingsRequest(BaseModel):
+    voice: str = ""
+    rate: str = "+0%"
+    pitch: str = "+0Hz"
+    volume: str = "+0%"
+    provider: str = "edge-tts"
+    extra: dict[str, Any] = {}
+
+
+class VideoEditionCreateRequest(BaseModel):
+    title: str | None = None
 
 
 # ── Helpers ──────────────────────────────────────────────────────
@@ -634,7 +688,7 @@ def discover_data_files() -> dict[str, Any]:
 
 
 def get_default_layout() -> dict:
-    """Return the default BOOK WUNDERWAFFE Studio composition layout."""
+    """Return the default Bookender Studio composition layout."""
     return {
         "scene": {"width": 1920, "height": 1080, "fps": 30},
         "objects": {
@@ -1110,6 +1164,14 @@ def export_readiness_payload() -> dict[str, Any]:
 
 # ── Endpoints ────────────────────────────────────────────────────
 
+def project_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, ProjectNotFoundError):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=422, detail=str(exc))
+    return HTTPException(status_code=500, detail=str(exc))
+
+
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return {
@@ -1120,7 +1182,246 @@ def health() -> dict[str, Any]:
         "python": sys.executable,
         "main_script_exists": MAIN_SCRIPT.exists(),
         "build_dir": str(BUILD_DIR),
+        "database": str(DATABASE_PATH),
+        "database_integrity": PROJECT_REPOSITORY.database.integrity_check(),
     }
+
+
+@app.get("/api/projects")
+def list_bookender_projects(
+    search: str = Query(""),
+    kind: str | None = Query(None),
+    include_archived: bool = Query(False),
+) -> dict[str, Any]:
+    return {
+        "projects": PROJECT_REPOSITORY.list_projects(
+            search=search,
+            kind=kind,
+            include_archived=include_archived,
+        ),
+        "active_project_uuid": PROJECT_REPOSITORY.active_project_uuid(),
+    }
+
+
+@app.post("/api/projects")
+def create_bookender_project(data: ProjectCreateRequest) -> dict[str, Any]:
+    try:
+        if data.source_project_uuid:
+            return PROJECT_REPOSITORY.duplicate_project(data.source_project_uuid)
+        return PROJECT_REPOSITORY.create_project(
+            title=data.title,
+            author=data.author,
+            description=data.description,
+            project_kind=data.project_kind,
+            language=data.language,
+            voice=data.voice,
+            create_first_chapter=data.create_first_chapter,
+        )
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.get("/api/projects/{project_uuid}")
+def get_bookender_project(project_uuid: str) -> dict[str, Any]:
+    try:
+        return PROJECT_REPOSITORY.get_project(project_uuid, include_details=True)
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.post("/api/projects/{project_uuid}/open")
+def open_bookender_project(project_uuid: str) -> dict[str, Any]:
+    try:
+        return PROJECT_REPOSITORY.open_project(project_uuid)
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.patch("/api/projects/{project_uuid}")
+def update_bookender_project(
+    project_uuid: str, data: ProjectUpdateRequest
+) -> dict[str, Any]:
+    try:
+        return PROJECT_REPOSITORY.update_project(
+            project_uuid,
+            title=data.title,
+            author=data.author,
+            description=data.description,
+        )
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.post("/api/projects/{project_uuid}/archive")
+def archive_bookender_project(
+    project_uuid: str, archived: bool = Body(True, embed=True)
+) -> dict[str, Any]:
+    try:
+        PROJECT_REPOSITORY.archive_project(project_uuid, archived)
+        return {"ok": True, "archived": archived}
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.post("/api/projects/{project_uuid}/duplicate")
+def duplicate_bookender_project(project_uuid: str) -> dict[str, Any]:
+    try:
+        return PROJECT_REPOSITORY.duplicate_project(project_uuid)
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.post("/api/projects/{project_uuid}/backup")
+def backup_bookender_project(project_uuid: str) -> dict[str, Any]:
+    try:
+        destination = PROJECT_REPOSITORY.backup_project(project_uuid)
+        return {"ok": True, "path": str(destination)}
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.post("/api/projects/{project_uuid}/book")
+def create_project_book_part(
+    project_uuid: str,
+    title: str | None = Body(None),
+    language: str = Body("ru"),
+) -> dict[str, Any]:
+    try:
+        return PROJECT_REPOSITORY.create_book_part(
+            project_uuid, title=title, language=language
+        )
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.post("/api/projects/{project_uuid}/chapters")
+def create_project_chapter(
+    project_uuid: str, data: ChapterCreateRequest
+) -> dict[str, Any]:
+    try:
+        return PROJECT_REPOSITORY.create_chapter(
+            project_uuid, title=data.title, content=data.content
+        )
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.patch("/api/projects/{project_uuid}/chapters/{chapter_id}")
+def update_project_chapter(
+    project_uuid: str, chapter_id: int, data: ChapterUpdateRequest
+) -> dict[str, Any]:
+    try:
+        return PROJECT_REPOSITORY.update_chapter(
+            project_uuid,
+            chapter_id,
+            title=data.title,
+            content=data.content,
+        )
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.post("/api/projects/{project_uuid}/chapters/reorder")
+def reorder_project_chapters(
+    project_uuid: str, data: ChapterOrderRequest
+) -> dict[str, Any]:
+    try:
+        PROJECT_REPOSITORY.reorder_chapters(project_uuid, data.chapter_ids)
+        return {"ok": True, "chapter_ids": data.chapter_ids}
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.delete("/api/projects/{project_uuid}/chapters/{chapter_id}")
+def archive_project_chapter(project_uuid: str, chapter_id: int) -> dict[str, Any]:
+    try:
+        PROJECT_REPOSITORY.archive_chapter(project_uuid, chapter_id)
+        return {"ok": True, "archived": True}
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.put("/api/projects/{project_uuid}/tts-settings")
+def update_project_tts(
+    project_uuid: str, data: TtsSettingsRequest
+) -> dict[str, Any]:
+    try:
+        return PROJECT_REPOSITORY.update_tts_settings(
+            project_uuid, data.model_dump()
+        )
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.post("/api/projects/{project_uuid}/chapters/{chapter_id}/tts")
+def narrate_project_chapter(
+    project_uuid: str, chapter_id: int
+) -> dict[str, Any]:
+    try:
+        return TTS_SERVICE.queue_chapter(project_uuid, chapter_id)
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.post("/api/projects/{project_uuid}/tts")
+def narrate_project_book(project_uuid: str) -> dict[str, Any]:
+    try:
+        jobs = TTS_SERVICE.queue_book(project_uuid)
+        return {"jobs": jobs, "queued": len(jobs)}
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.get("/api/projects/{project_uuid}/tts-jobs")
+def list_project_tts_jobs(project_uuid: str) -> dict[str, Any]:
+    try:
+        return {"jobs": TTS_SERVICE.list_jobs(project_uuid)}
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.get("/api/tts-jobs/{job_uuid}")
+def get_project_tts_job(job_uuid: str) -> dict[str, Any]:
+    try:
+        return TTS_SERVICE.get_job(job_uuid)
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.post("/api/projects/{project_uuid}/video-editions")
+def create_project_video_edition(
+    project_uuid: str, data: VideoEditionCreateRequest
+) -> dict[str, Any]:
+    try:
+        return PROJECT_REPOSITORY.create_video_edition(
+            project_uuid, title=data.title
+        )
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.get("/api/projects/{project_uuid}/video-editions/{edition_id}")
+def get_project_video_edition(
+    project_uuid: str, edition_id: int
+) -> dict[str, Any]:
+    try:
+        return PROJECT_REPOSITORY.get_video_edition(project_uuid, edition_id)
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
+@app.put("/api/projects/{project_uuid}/video-editions/{edition_id}")
+def save_project_video_edition(
+    project_uuid: str,
+    edition_id: int,
+    payload: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    try:
+        return PROJECT_REPOSITORY.save_video_edition(
+            project_uuid, payload, edition_id=edition_id
+        )
+    except Exception as exc:
+        raise project_http_error(exc) from exc
 
 
 @app.get("/api/book-project")
@@ -1132,8 +1433,30 @@ def book_project() -> dict[str, Any]:
 
 
 @app.get("/api/editor-project")
-def get_editor_project() -> dict[str, Any]:
-    """Return the persisted editor document, or an empty compatible document."""
+def get_editor_project(
+    project_uuid: str | None = Query(None),
+    edition_id: int | None = Query(None),
+) -> dict[str, Any]:
+    """Return a SQLite video edition, falling back to the recovery JSON."""
+    if project_uuid:
+        try:
+            edition = PROJECT_REPOSITORY.get_video_edition(
+                project_uuid, edition_id
+            )
+            return {
+                "exists": True,
+                "storage": "sqlite",
+                "project_uuid": project_uuid,
+                "edition_id": edition["id"],
+                "project": edition["settings"],
+            }
+        except ProjectNotFoundError:
+            return {
+                "exists": False,
+                "storage": "sqlite",
+                "project_uuid": project_uuid,
+                "project": {"schemaVersion": 2, "materials": [], "chapters": []},
+            }
     if not EDITOR_PROJECT_PATH.exists():
         return {
             "exists": False,
@@ -1152,8 +1475,12 @@ def get_editor_project() -> dict[str, Any]:
 
 
 @app.post("/api/editor-project")
-def save_editor_project(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    """Atomically save editor state and its normalized renderer chapter file."""
+def save_editor_project(
+    payload: dict[str, Any] = Body(...),
+    project_uuid: str | None = Query(None),
+    edition_id: int | None = Query(None),
+) -> dict[str, Any]:
+    """Save canonical SQLite state plus the active renderer compatibility file."""
     project = dict(payload)
     project_duration = parse_seconds(
         project.get(
@@ -1178,13 +1505,30 @@ def save_editor_project(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         atomic_write_json(EDITOR_PROJECT_PATH, project)
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Cannot save editor project: {exc}")
-    return {
+    result = {
         "ok": True,
         "path": server_path(EDITOR_PROJECT_PATH),
         "chaptersPath": server_path(CHAPTERS_PATH),
         "chapterCount": len(chapters),
         "project": project,
     }
+    if project_uuid:
+        try:
+            edition = PROJECT_REPOSITORY.save_video_edition(
+                project_uuid, project, edition_id=edition_id
+            )
+            result.update(
+                {
+                    "storage": "sqlite",
+                    "project_uuid": project_uuid,
+                    "edition_id": edition["id"],
+                }
+            )
+        except Exception as exc:
+            raise project_http_error(exc) from exc
+    else:
+        result["storage"] = "compatibility_json"
+    return result
 
 
 @app.post("/api/book-project/refresh-chapters")
@@ -1758,6 +2102,16 @@ def media_data(filename: str):
     if not is_within(fp, DATA_DIR) or not fp.is_file():
         raise HTTPException(status_code=404, detail=f"File not found in data/: {filename}")
     return FileResponse(str(fp))
+
+
+@app.get("/api/project-media/{filename:path}")
+def project_media(filename: str):
+    """Serve project-owned media while preventing path traversal."""
+    path = (USER_DATA / filename).resolve()
+    projects_root = (USER_DATA / "projects").resolve()
+    if not is_within(path, projects_root) or not path.is_file():
+        raise HTTPException(status_code=404, detail="Project media not found")
+    return FileResponse(str(path))
 
 
 @app.get("/api/exports/{filename}")
