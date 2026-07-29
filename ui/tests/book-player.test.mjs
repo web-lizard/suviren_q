@@ -17,7 +17,7 @@ test('voice preview has one playback owner and never reloads after play', () => 
   const reloader = between('async function reloadBookPlayer', 'function seekBookPlayer')
   const sourceWatcher = between(
     'watch(() => bookPlayerUrl.value',
-    'watch([\n  () => previousChapter.value?.id',
+    'watch([',
   )
 
   assert.doesNotMatch(preview, /\.load\(/)

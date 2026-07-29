@@ -379,15 +379,21 @@ def resolve_editor_server_path(value: Any) -> Path | None:
     if text.startswith(media_prefix):
         text = f"data/{text[len(media_prefix):]}"
     candidate = Path(text)
-    if not candidate.is_absolute():
-        candidate = ROOT / candidate
-    try:
-        resolved = candidate.resolve()
-    except OSError:
-        return None
-    if not is_within(resolved, ROOT) or not resolved.is_file():
-        return None
-    return resolved
+    candidates = [candidate] if candidate.is_absolute() else [ROOT / candidate]
+    if not candidate.is_absolute() and text.replace("\\", "/").startswith("projects/"):
+        candidates.insert(0, USER_DATA / candidate)
+    projects_root = (USER_DATA / "projects").resolve()
+    for item in candidates:
+        try:
+            resolved = item.resolve()
+        except OSError:
+            continue
+        if (
+            (is_within(resolved, ROOT) or is_within(resolved, projects_root))
+            and resolved.is_file()
+        ):
+            return resolved
+    return None
 
 
 def append_job_line(job_id: str, line: str) -> None:
@@ -1420,6 +1426,14 @@ def narrate_project_book(project_uuid: str) -> dict[str, Any]:
         raise project_http_error(exc) from exc
 
 
+@app.post("/api/projects/{project_uuid}/video-audio/master")
+def build_project_video_audio_master(project_uuid: str) -> dict[str, Any]:
+    try:
+        return TTS_SERVICE.build_video_master(project_uuid)
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+
+
 @app.get("/api/projects/{project_uuid}/tts-jobs")
 def list_project_tts_jobs(project_uuid: str) -> dict[str, Any]:
     try:
@@ -1602,9 +1616,30 @@ def save_editor_project(
     if project_duration is None and project.get("durationMs") is not None:
         duration_ms = parse_seconds(project.get("durationMs"))
         project_duration = duration_ms / 1000 if duration_ms is not None else None
+    materials_by_id = {
+        str(material.get("id")): material
+        for material in project.get("materials", [])
+        if isinstance(material, dict) and material.get("id") is not None
+    }
+    enriched_chapters: list[Any] = []
+    for raw_chapter in project.get("chapters", []):
+        if not isinstance(raw_chapter, dict):
+            enriched_chapters.append(raw_chapter)
+            continue
+        chapter = dict(raw_chapter)
+        image_id = chapter.get("imageAssetId")
+        material = materials_by_id.get(str(image_id)) if image_id is not None else None
+        image_path = resolve_editor_server_path(
+            material.get("serverPath") if material else None
+        )
+        if image_path:
+            chapter["image_path"] = str(image_path)
+        else:
+            chapter.pop("image_path", None)
+        enriched_chapters.append(chapter)
     try:
         chapters = normalize_editor_chapters(
-            project.get("chapters", []),
+            enriched_chapters,
             project_duration=project_duration,
         )
     except ValueError as exc:
@@ -2122,14 +2157,17 @@ def sanitize_upload_filename(value: str) -> str:
     return f"{stem}{suffix}"
 
 
-def publish_upload(temp_path: Path, preferred_name: str) -> Path:
+def publish_upload_to(
+    temp_path: Path, preferred_name: str, destination_dir: Path
+) -> Path:
     """Publish a completed temp upload without ever replacing an existing file."""
+    destination_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(preferred_name).stem
     suffix = Path(preferred_name).suffix
     attempt = 1
     while True:
         filename = preferred_name if attempt == 1 else f"{stem}-{attempt}{suffix}"
-        candidate = DATA_DIR / filename
+        candidate = destination_dir / filename
         try:
             os.link(temp_path, candidate)
             return candidate
@@ -2153,6 +2191,89 @@ def publish_upload(temp_path: Path, preferred_name: str) -> Path:
                 except FileNotFoundError:
                     pass
                 raise
+
+
+def publish_upload(temp_path: Path, preferred_name: str) -> Path:
+    return publish_upload_to(temp_path, preferred_name, DATA_DIR)
+
+
+@app.put("/api/projects/{project_uuid}/chapters/{chapter_id}/image")
+async def upload_project_chapter_image(
+    project_uuid: str,
+    chapter_id: int,
+    request: Request,
+    filename: str | None = Query(default=None),
+) -> dict[str, Any]:
+    requested_name = upload_filename_from_request(request, filename)
+    if not requested_name:
+        raise HTTPException(status_code=400, detail="Не указано имя изображения.")
+    safe_name = sanitize_upload_filename(requested_name)
+    if Path(safe_name).suffix.lower() not in IMAGE_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail="Для главы можно выбрать PNG, JPG, WEBP, BMP или GIF.",
+        )
+    try:
+        project = PROJECT_REPOSITORY.get_project(project_uuid, include_details=False)
+        PROJECT_REPOSITORY.get_chapter(project_uuid, chapter_id)
+    except Exception as exc:
+        raise project_http_error(exc) from exc
+    image_dir = (USER_DATA / project["project_folder"] / "images").resolve()
+    project_root = (USER_DATA / project["project_folder"]).resolve()
+    if not is_within(image_dir, project_root):
+        raise HTTPException(status_code=400, detail="Некорректная папка проекта.")
+    temp_path = image_dir / f".upload-{uuid.uuid4().hex}.part"
+    size = 0
+    try:
+        image_dir.mkdir(parents=True, exist_ok=True)
+        with temp_path.open("xb") as handle:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                handle.write(chunk)
+                size += len(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if size == 0:
+            raise HTTPException(status_code=400, detail="Файл изображения пуст.")
+        destination = publish_upload_to(
+            temp_path,
+            f"chapter-{chapter_id}-{safe_name}",
+            image_dir,
+        )
+    finally:
+        temp_path.unlink(missing_ok=True)
+    relative_path = destination.relative_to(USER_DATA).as_posix()
+    try:
+        asset = PROJECT_REPOSITORY.add_chapter_visual_asset(
+            project_uuid,
+            chapter_id,
+            file_path=relative_path,
+            title=Path(safe_name).stem,
+            metadata={"size": size, "original_filename": requested_name},
+        )
+    except Exception as exc:
+        destination.unlink(missing_ok=True)
+        raise project_http_error(exc) from exc
+    return {
+        "ok": True,
+        "asset": asset,
+        "size": size,
+        "serverPath": relative_path,
+        "url": f"/api/project-media/{quote(relative_path, safe='/')}",
+    }
+
+
+@app.delete("/api/projects/{project_uuid}/chapters/{chapter_id}/image")
+def delete_project_chapter_image(
+    project_uuid: str, chapter_id: int
+) -> dict[str, Any]:
+    try:
+        return PROJECT_REPOSITORY.remove_chapter_visual_asset(
+            project_uuid, chapter_id
+        )
+    except Exception as exc:
+        raise project_http_error(exc) from exc
 
 
 @app.put("/api/media/import")

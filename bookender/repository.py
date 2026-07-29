@@ -680,6 +680,101 @@ class ProjectRepository:
         )
         return {"deleted": True, "file_removed": removed}
 
+    def add_chapter_visual_asset(
+        self,
+        project_uuid: str,
+        chapter_id: int,
+        *,
+        file_path: str,
+        title: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.database.transaction() as connection:
+            project = self._project_row(connection, project_uuid)
+            chapter = connection.execute(
+                """
+                SELECT c.id FROM chapters c
+                JOIN books b ON b.id=c.book_id
+                WHERE c.id=? AND b.project_id=? AND c.archived_at IS NULL
+                """,
+                (chapter_id, project["id"]),
+            ).fetchone()
+            if chapter is None:
+                raise ProjectNotFoundError(f"{project_uuid}/chapter/{chapter_id}")
+            cursor = connection.execute(
+                """
+                INSERT INTO visual_assets(
+                    project_id, chapter_id, file_path, asset_type, title,
+                    metadata_json, created_at
+                ) VALUES (?, ?, ?, 'chapter-image', ?, ?, ?)
+                """,
+                (
+                    project["id"],
+                    chapter_id,
+                    file_path,
+                    title.strip() or Path(file_path).stem,
+                    json_text(metadata or {}),
+                    now,
+                ),
+            )
+            self._touch_project(connection, project["id"], now)
+            asset = connection.execute(
+                "SELECT * FROM visual_assets WHERE id=?",
+                (int(cursor.lastrowid),),
+            ).fetchone()
+        log_event(
+            "chapter_visual_added",
+            project_uuid=project_uuid,
+            chapter_id=chapter_id,
+            asset_id=asset["id"],
+            file_path=file_path,
+        )
+        return dict(asset)
+
+    def remove_chapter_visual_asset(
+        self, project_uuid: str, chapter_id: int
+    ) -> dict[str, Any]:
+        with self.database.transaction() as connection:
+            project = self._project_row(connection, project_uuid)
+            assets = connection.execute(
+                """
+                SELECT * FROM visual_assets
+                WHERE project_id=? AND chapter_id=? AND asset_type='chapter-image'
+                ORDER BY id DESC
+                """,
+                (project["id"], chapter_id),
+            ).fetchall()
+            if not assets:
+                return {"deleted": False, "file_removed": False}
+            connection.execute(
+                """
+                DELETE FROM visual_assets
+                WHERE project_id=? AND chapter_id=? AND asset_type='chapter-image'
+                """,
+                (project["id"], chapter_id),
+            )
+            self._touch_project(connection, project["id"], utc_now())
+        removed_files = 0
+        for asset in assets:
+            path = (USER_DATA / str(asset["file_path"])).resolve()
+            try:
+                path.relative_to((USER_DATA / "projects").resolve())
+                path.unlink(missing_ok=True)
+                removed_files += 1
+            except (OSError, ValueError):
+                log_event(
+                    "chapter_visual_file_delete_failed",
+                    project_uuid=project_uuid,
+                    chapter_id=chapter_id,
+                    file_path=asset["file_path"],
+                )
+        return {
+            "deleted": True,
+            "deleted_assets": len(assets),
+            "removed_files": removed_files,
+        }
+
     def save_video_edition(
         self,
         project_uuid: str,

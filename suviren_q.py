@@ -27,13 +27,14 @@ import re
 import shutil
 import subprocess
 import sys
+import textwrap
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Optional
 
 APP_NAME = "book-wunderwaffe-studio"
-APP_VERSION = "1.1.0"
+APP_VERSION = "2.0.0"
 APP_TITLE = f"BOOK WUNDERWAFFE Studio {APP_VERSION}"
 BUILD_DIR_NAME = "_suviren_q_build"
 DEFAULT_WIDTH = 1920
@@ -152,6 +153,8 @@ class Chapter:
     raw_name: str = ""
     file: str = ""
     track: str = ""
+    text: str = ""
+    image_path: str = ""
 
     @property
     def duration_seconds(self) -> float:
@@ -169,6 +172,8 @@ class Chapter:
             "raw_name": self.raw_name,
             "file": self.file,
             "track": self.track,
+            "text": self.text,
+            "image_path": self.image_path,
         }
 
 
@@ -657,6 +662,8 @@ def load_chapters(path: Path) -> list[Chapter]:
                 raw_name=str(row.get("raw_name", "")),
                 file=str(row.get("file", "")),
                 track=str(row.get("track", "")),
+                text=str(row.get("text", row.get("content", ""))),
+                image_path=str(row.get("image_path", row.get("imagePath", ""))),
             ))
         return normalize_chapters(chapters)
     if suffix == ".csv":
@@ -1513,8 +1520,12 @@ def draw_panel(
     text_color = rgb_or_default(title_config.get("color"), palette["text"])
     text_dim = palette["text_dim"]
     title_glow = palette["title_glow"]
+    ch = chapters[current_index]
+    chapter_background = Path(ch.image_path) if ch.image_path else background
+    if chapter_background and not chapter_background.is_file():
+        chapter_background = background
     img = _prepare_panel_background(
-        background,
+        chapter_background,
         (W, H),
         bg_color,
         glitch=project_data.get("glitch", True) is not False,
@@ -1522,7 +1533,6 @@ def draw_panel(
     scale = max(0.5, min(W / 1920, H / 1080))
 
     # Cover image
-    ch = chapters[current_index]
     cover_x = layer_pixel(cover_config, "x", 7.0, W)
     cover_y = layer_pixel(cover_config, "y", 17.0, H)
     cover_w = max(32, layer_pixel(cover_config, "w", 27.0, W))
@@ -1825,6 +1835,50 @@ def concat_file_line(path: Path) -> str:
     return f"file '{s}'"
 
 
+def reading_caption_chunks(
+    text: str,
+    duration: float,
+    *,
+    words_per_card: int = 14,
+) -> list[tuple[float, float, str]]:
+    words = re.findall(r"\S+", str(text or "").strip())
+    if not words or duration <= 0:
+        return []
+    size = max(6, min(28, int(words_per_card or 14)))
+    groups = [words[index : index + size] for index in range(0, len(words), size)]
+    weights = [max(1, sum(len(word) for word in group)) for group in groups]
+    total_weight = max(1, sum(weights))
+    cursor = 0.0
+    chunks: list[tuple[float, float, str]] = []
+    for index, (group, weight) in enumerate(zip(groups, weights)):
+        start = cursor
+        cursor = duration if index + 1 == len(groups) else cursor + duration * weight / total_weight
+        wrapped = "\n".join(
+            textwrap.wrap(
+                " ".join(group),
+                width=48,
+                break_long_words=False,
+                break_on_hyphens=False,
+            )[:3]
+        )
+        chunks.append((start, cursor, wrapped))
+    return chunks
+
+
+def escape_drawtext_text(value: str) -> str:
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("'", "\\'")
+        .replace(":", "\\:")
+        .replace("%", "\\%")
+        .replace(",", "\\,")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+        .replace("\n", "\\n")
+    )
+
+
 # ── GPU-accelerated segment rendering ────────────────────────────
 
 def _render_segment_worker(args: dict[str, Any]) -> dict[str, Any]:
@@ -1846,6 +1900,8 @@ def _render_segment_worker(args: dict[str, Any]) -> dict[str, Any]:
     include_audio = bool(args.get("include_audio", True))
     timeline_duration = max(duration, float(args.get("timeline_duration") or duration))
     visualizer = dict(args.get("visualizer") or {})
+    captions = dict(args.get("captions") or {})
+    caption_text = str(args.get("caption_text") or "")
 
     ensure_dir(out.parent)
 
@@ -1952,8 +2008,54 @@ def _render_segment_worker(args: dict[str, Any]) -> dict[str, Any]:
             )
             current_label = "with_time"
 
+    if captions.get("enabled") is True and caption_text.strip():
+        font_value = args.get("font")
+        font_path = (
+            Path(font_value)
+            if font_value
+            else Path(os.environ.get("SystemRoot", "C:\\Windows"))
+            / "Fonts"
+            / "segoeui.ttf"
+        )
+        if font_path.is_file():
+            escaped_font = (
+                str(font_path.resolve())
+                .replace("\\", "/")
+                .replace(":", "\\:")
+                .replace("'", "\\'")
+            )
+            try:
+                words_per_card = int(captions.get("wordsPerCard") or 14)
+            except (TypeError, ValueError):
+                words_per_card = 14
+            caption_size = max(22, round(height * 0.033))
+            caption_y = round(height * 0.77)
+            border = max(12, round(width * 0.012))
+            for index, (caption_start, caption_end, caption) in enumerate(
+                reading_caption_chunks(
+                    caption_text,
+                    duration,
+                    words_per_card=words_per_card,
+                )
+            ):
+                next_label = f"with_caption_{index}"
+                filter_parts.append(
+                    f"[{current_label}]drawtext=fontfile='{escaped_font}':"
+                    f"text='{escape_drawtext_text(caption)}':"
+                    f"fontcolor=white:fontsize={caption_size}:"
+                    "x=(w-text_w)/2:"
+                    f"y={caption_y}:line_spacing={max(5, round(caption_size * .22))}:"
+                    "box=1:boxcolor=black@0.68:"
+                    f"boxborderw={border}:fix_bounds=1:"
+                    f"enable='between(t,{caption_start:.3f},{caption_end:.3f})'"
+                    f"[{next_label}]"
+                )
+                current_label = next_label
+
     filter_complex: Optional[str] = None
-    if animated_visuals:
+    if animated_visuals or (
+        captions.get("enabled") is True and caption_text.strip()
+    ):
         filter_parts.append(f"[{current_label}]format=yuv420p[v]")
         filter_complex = ";".join(filter_parts)
 
@@ -2479,6 +2581,11 @@ def cmd_render(args: argparse.Namespace) -> None:
     segment_args_list: list[dict[str, Any]] = []
     project_layers = editor_project.get("layers") if isinstance(editor_project.get("layers"), dict) else {}
     visualizer_config = project_layers.get("visualizer") if isinstance(project_layers.get("visualizer"), dict) else {}
+    captions_config = (
+        editor_project.get("captions")
+        if isinstance(editor_project.get("captions"), dict)
+        else {}
+    )
     for i, ch in enumerate(chapters):
         if ch.start_seconds >= render_end - 0.001:
             break
@@ -2513,6 +2620,8 @@ def cmd_render(args: argparse.Namespace) -> None:
             "style": args.style,
             "timeline_duration": timeline_duration,
             "visualizer": visualizer_config,
+            "captions": captions_config,
+            "caption_text": ch.text,
             "font": args.font,
             "include_audio": False,
             "gpu_codec": gpu_codec,

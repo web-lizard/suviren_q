@@ -95,6 +95,34 @@ class ProjectRepositoryTests(unittest.TestCase):
         self.assertTrue((backup / "project.json").is_file())
         self.assertTrue((backup / "manifest.json").is_file())
 
+    def test_chapter_visual_is_project_owned_and_removable(self) -> None:
+        project = self.repository.create_project(
+            title="Книга с иллюстрацией", create_first_chapter=True
+        )
+        chapter = project["chapters"][0]
+        relative_path = (
+            Path(project["project_folder"]) / "images" / "chapter.jpg"
+        ).as_posix()
+        image_path = self.user_data / relative_path
+        image_path.write_bytes(b"test-image")
+        asset = self.repository.add_chapter_visual_asset(
+            project["uuid"],
+            chapter["id"],
+            file_path=relative_path,
+            title="Иллюстрация",
+            metadata={"size": image_path.stat().st_size},
+        )
+        restored = self.repository.get_project(
+            project["uuid"], include_details=True
+        )
+        self.assertEqual(restored["visual_assets"][0]["id"], asset["id"])
+        self.assertEqual(restored["visual_assets"][0]["chapter_id"], chapter["id"])
+        removed = self.repository.remove_chapter_visual_asset(
+            project["uuid"], chapter["id"]
+        )
+        self.assertTrue(removed["deleted"])
+        self.assertFalse(image_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

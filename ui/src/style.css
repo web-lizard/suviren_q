@@ -120,10 +120,10 @@ input:disabled {
 }
 
 .studio.workspace-book {
-  --accent: #f0ad2f;
-  --accent-rgb: 240, 173, 47;
-  --accent-2: #c98522;
-  --accent-2-rgb: 201, 133, 34;
+  --accent: #c479ff;
+  --accent-rgb: 196, 121, 255;
+  --accent-2: #8058e8;
+  --accent-2-rgb: 128, 88, 232;
   grid-template-rows: var(--topbar-height) minmax(0, 1fr);
 }
 
@@ -2654,7 +2654,10 @@ input[type="range"] {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  background: radial-gradient(circle at 50% -10%, rgba(var(--accent-rgb), .06), transparent 35%), #0b0b0d;
+  background:
+    radial-gradient(circle at 54% -12%, rgba(var(--accent-rgb), .15), transparent 38%),
+    radial-gradient(circle at 25% 70%, rgba(var(--accent-2-rgb), .055), transparent 38%),
+    #0b0910;
 }
 .book-workspace.inspector-collapsed {
   grid-template-columns: minmax(238px, 16vw) minmax(520px, 1fr) 42px;
@@ -2789,6 +2792,7 @@ input[type="range"] {
   min-width: 0;
   min-height: 0;
   padding: 16px clamp(20px, 3.2vw, 54px) 12px;
+  background: linear-gradient(180deg, rgba(31, 17, 42, .32), rgba(10, 8, 14, .18));
 }
 
 .book-editor-header {
@@ -2865,18 +2869,49 @@ input[type="range"] {
   width: 100%;
   min-height: 0;
   resize: none;
-  padding: 12px 4px 24px;
-  border: 0;
+  padding: 18px 20px 26px;
+  border: 1px solid rgba(var(--accent-rgb), .14);
+  border-radius: 12px;
   outline: 0;
-  background: transparent;
-  color: #d9d5ce;
+  background:
+    linear-gradient(145deg, rgba(75, 32, 98, .22), rgba(24, 12, 35, .36)),
+    #0e0a13;
+  color: #e6dcef;
   caret-color: var(--accent);
   font-family: "Cascadia Mono", "Segoe UI Mono", Consolas, monospace;
   font-size: clamp(14px, 1.05vw, 17px);
   line-height: 1.65;
   tab-size: 4;
 }
+
+.reading-caption {
+  position: absolute;
+  z-index: 13;
+  left: 50%;
+  bottom: 13.5%;
+  width: min(76%, 980px);
+  transform: translateX(-50%);
+  padding: clamp(9px, 1.1vw, 16px) clamp(15px, 1.8vw, 28px);
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: 10px;
+  background: rgba(7, 5, 10, .74);
+  box-shadow: 0 12px 35px rgba(0, 0, 0, .42);
+  color: #fff;
+  font-family: "Segoe UI", sans-serif;
+  font-size: clamp(13px, 1.45vw, 25px);
+  font-weight: 650;
+  line-height: 1.35;
+  text-align: center;
+  text-wrap: balance;
+  pointer-events: none;
+  backdrop-filter: blur(8px);
+}
 .book-text-editor::placeholder { color: #55545b; }
+.book-text-editor:focus {
+  border-color: rgba(var(--accent-rgb), .38);
+  box-shadow: 0 0 0 3px rgba(var(--accent-rgb), .055), inset 0 0 45px rgba(var(--accent-rgb), .025);
+}
+.book-text-editor::selection { background: rgba(var(--accent-rgb), .32); color: #fff; }
 
 .book-editor-footer {
   display: flex;
@@ -2891,23 +2926,30 @@ input[type="range"] {
 
 .book-audio-player {
   display: grid;
-  grid-template-columns: minmax(150px, 240px) 30px 38px 30px 30px auto minmax(100px, 1fr) auto 92px;
+  grid-template-columns: minmax(150px, 220px) minmax(260px, 1fr) 32px 32px auto;
   align-items: center;
-  gap: 6px;
-  min-height: 48px;
+  gap: 8px;
+  min-height: 64px;
   margin-top: 8px;
-  padding: 7px 10px;
-  border: 1px solid rgba(var(--accent-rgb), .23);
-  border-radius: 8px;
-  background: linear-gradient(90deg, rgba(var(--accent-rgb), .075), #111115 38%);
+  padding: 9px 11px;
+  border: 1px solid rgba(var(--accent-rgb), .3);
+  border-radius: 11px;
+  background: linear-gradient(105deg, rgba(var(--accent-rgb), .15), rgba(22, 13, 29, .96) 35%, #111015);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .22);
 }
-.book-audio-player audio { display: none; }
+.book-audio-player audio {
+  display: block;
+  width: 100%;
+  height: 40px;
+  color-scheme: dark;
+}
 .book-player-copy {
   display: grid;
   min-width: 0;
 }
 .book-player-copy small { color: var(--accent); font-size: 8px; text-transform: uppercase; }
 .book-player-copy b { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.book-player-copy span { margin-top: 3px; color: var(--muted); font-size: 8px; }
 .book-audio-player > button {
   height: 29px;
   border: 1px solid #303037;
@@ -2917,20 +2959,53 @@ input[type="range"] {
   cursor: pointer;
 }
 .book-audio-player > button:disabled { opacity: .25; }
-.book-audio-player .book-player-play {
+.book-audio-player .book-player-video {
+  width: auto;
+  padding: 0 10px;
   border-color: rgba(var(--accent-rgb), .4);
   background: rgba(var(--accent-rgb), .13);
   color: var(--accent);
+  font-weight: 800;
 }
-.book-audio-player > span { color: var(--muted); font: 9px Consolas, monospace; }
-.book-player-scrubber { width: 100%; accent-color: var(--accent); }
-.book-audio-player > label {
-  display: flex;
-  align-items: center;
-  gap: 4px;
+
+.book-chapter-image-panel {
+  display: grid;
+  gap: 8px;
+  padding-bottom: 2px;
+}
+.book-chapter-image-preview {
+  display: grid;
+  place-items: center;
+  min-height: 128px;
+  overflow: hidden;
+  border: 1px solid rgba(var(--accent-rgb), .22);
+  border-radius: 8px;
+  background:
+    linear-gradient(rgba(14, 9, 19, .35), rgba(14, 9, 19, .35)),
+    radial-gradient(circle, rgba(var(--accent-rgb), .18), transparent 70%);
+  background-position: center;
+  background-size: cover;
+}
+.book-chapter-image-preview span {
+  max-width: 170px;
+  padding: 12px;
   color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+  text-align: center;
 }
-.book-audio-player > label input { width: 70px; accent-color: var(--accent); }
+.book-chapter-image-panel p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 8px;
+  line-height: 1.45;
+}
+.book-chapter-image-panel > div:last-child {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+}
+.book-chapter-image-panel .book-secondary { width: auto; padding-inline: 11px; }
 
 .book-empty-chapter,
 .book-missing {
@@ -3174,8 +3249,7 @@ input[type="range"] {
   .book-workspace { grid-template-columns: 220px minmax(420px, 1fr) 270px; }
   .book-workspace.inspector-collapsed { grid-template-columns: 220px minmax(420px, 1fr) 42px; }
   .book-workspace.inspector-hidden { grid-template-columns: 220px minmax(420px, 1fr); }
-  .book-audio-player { grid-template-columns: minmax(110px, 180px) 28px 34px 28px 28px auto minmax(70px, 1fr) auto; }
-  .book-audio-player > label { display: none; }
+  .book-audio-player { grid-template-columns: minmax(110px, 170px) minmax(220px, 1fr) 28px 28px auto; }
 }
 
 @media (max-width: 1300px) {

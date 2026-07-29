@@ -20,6 +20,7 @@ from .repository import ProjectNotFoundError, ProjectRepository, utc_now
 
 
 DEFAULT_VOICE = "ru-RU-SvetlanaNeural"
+TTS_CHUNK_LIMIT = 2_400
 RATE_PATTERN = re.compile(r"^[+-](?:100|[0-9]{1,2})%$")
 PITCH_PATTERN = re.compile(r"^[+-](?:[0-9]{1,3})Hz$")
 VOLUME_PATTERN = re.compile(r"^[+-](?:100|[0-9]{1,2})%$")
@@ -359,6 +360,98 @@ class TtsService:
                 ).fetchall()
             ]
 
+    def build_video_master(self, project_uuid: str) -> dict[str, Any]:
+        project = self.repository.get_project(project_uuid, include_details=True)
+        audio_by_chapter: dict[int, dict[str, Any]] = {}
+        for asset in project.get("audio_assets", []):
+            chapter_id = int(asset.get("chapter_id") or 0)
+            if not chapter_id:
+                continue
+            current = audio_by_chapter.get(chapter_id)
+            asset_rank = (
+                int(bool(asset.get("is_active"))),
+                int(asset.get("version_number") or 0),
+                int(asset["id"]),
+            )
+            current_rank = (
+                int(bool(current and current.get("is_active"))),
+                int((current or {}).get("version_number") or 0),
+                int((current or {}).get("id") or 0),
+            )
+            if current is None or asset_rank > current_rank:
+                audio_by_chapter[chapter_id] = asset
+
+        selected: list[tuple[dict[str, Any], dict[str, Any], Path, float]] = []
+        missing_chapter_ids: list[int] = []
+        for chapter in project.get("chapters", []):
+            asset = audio_by_chapter.get(int(chapter["id"]))
+            if not asset or not asset.get("file_path"):
+                missing_chapter_ids.append(int(chapter["id"]))
+                continue
+            path = self._absolute_project_path(project, str(asset["file_path"]))
+            if not path.is_file():
+                missing_chapter_ids.append(int(chapter["id"]))
+                continue
+            duration = float(asset.get("duration") or self._audio_duration(path) or 0)
+            if duration <= 0:
+                raise RuntimeError(f"Cannot determine duration of {path.name}")
+            selected.append((chapter, asset, path, duration))
+        if not selected:
+            raise ValueError("У книги пока нет готовых озвучек для передачи в видео.")
+
+        source_fingerprint = "|".join(
+            f"{asset['id']}:{path.stat().st_size}:{path.stat().st_mtime_ns}"
+            for _, asset, path, _ in selected
+        )
+        digest = uuidlib.uuid5(uuidlib.NAMESPACE_URL, source_fingerprint).hex[:12]
+        if len(selected) == 1:
+            relative_output = str(selected[0][1]["file_path"])
+            output = selected[0][2]
+        else:
+            relative_output = (
+                Path(project["project_folder"])
+                / "video"
+                / f"book-master-{digest}.mp3"
+            ).as_posix()
+            output = self._absolute_project_path(project, relative_output)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            if not output.is_file() or output.stat().st_size <= 0:
+                self._concat_mp3_files([item[2] for item in selected], output)
+
+        cursor = 0.0
+        chapters = []
+        for chapter, asset, _, chapter_duration in selected:
+            start = cursor
+            cursor += chapter_duration
+            chapters.append(
+                {
+                    "chapter_id": int(chapter["id"]),
+                    "title": chapter["title"],
+                    "text": chapter["content"],
+                    "audio_asset_id": int(asset["id"]),
+                    "start_seconds": round(start, 3),
+                    "end_seconds": round(cursor, 3),
+                    "duration_seconds": round(chapter_duration, 3),
+                }
+            )
+        result = {
+            "file_path": relative_output,
+            "file_size": output.stat().st_size,
+            "duration": round(cursor, 3),
+            "chapters": chapters,
+            "missing_chapter_ids": missing_chapter_ids,
+            "source_asset_ids": [int(item[1]["id"]) for item in selected],
+        }
+        log_event(
+            "book_video_master_ready",
+            project_uuid=project_uuid,
+            chapter_count=len(chapters),
+            missing_chapter_count=len(missing_chapter_ids),
+            output_path=relative_output,
+            duration=result["duration"],
+        )
+        return result
+
     def _run(
         self,
         job_uuid: str,
@@ -520,8 +613,111 @@ class TtsService:
             raise ValueError("Выбран неподдерживаемый TTS-провайдер.")
         return values
 
+    @classmethod
+    def _synthesize(cls, text: str, output: Path, settings: dict[str, str]) -> None:
+        chunks = cls._split_text_chunks(text)
+        if len(chunks) == 1:
+            cls._synthesize_chunk(chunks[0], output, settings)
+            return
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("FFmpeg is required to join long TTS chapters")
+        token = uuidlib.uuid4().hex
+        parts = [
+            output.with_name(f".{output.stem}-{token}-{index:04d}.mp3")
+            for index in range(len(chunks))
+        ]
+        concat_file = output.with_name(f".{output.stem}-{token}-concat.txt")
+        try:
+            for chunk, part in zip(chunks, parts):
+                cls._synthesize_chunk(chunk, part, settings)
+            cls._concat_mp3_files(parts, output, concat_file=concat_file)
+        finally:
+            concat_file.unlink(missing_ok=True)
+            for part in parts:
+                part.unlink(missing_ok=True)
+
     @staticmethod
-    def _synthesize(text: str, output: Path, settings: dict[str, str]) -> None:
+    def _concat_mp3_files(
+        parts: list[Path],
+        output: Path,
+        *,
+        concat_file: Path | None = None,
+    ) -> None:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("FFmpeg is required to join audio files")
+        owned_concat_file = concat_file is None
+        concat_file = concat_file or output.with_name(
+            f".{output.stem}-{uuidlib.uuid4().hex}-concat.txt"
+        )
+        try:
+            concat_file.write_text(
+                "\n".join(
+                    f"file '{part.resolve().as_posix().replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'"
+                    for part in parts
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            command = [
+                ffmpeg,
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_file),
+                "-c",
+                "copy",
+                str(output),
+            ]
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=max(120, len(parts) * 30),
+            )
+            if result.returncode or not output.is_file() or output.stat().st_size <= 0:
+                raise RuntimeError(
+                    f"FFmpeg could not join audio files: {(result.stderr or result.stdout)[-800:]}"
+                )
+        finally:
+            if owned_concat_file:
+                concat_file.unlink(missing_ok=True)
+
+    @staticmethod
+    def _split_text_chunks(text: str, limit: int = TTS_CHUNK_LIMIT) -> list[str]:
+        clean = str(text or "").strip()
+        if not clean:
+            return [""]
+        chunks: list[str] = []
+        while len(clean) > limit:
+            minimum = max(1, int(limit * 0.55))
+            window = clean[: limit + 1]
+            candidates = [
+                window.rfind(separator, minimum, limit + 1)
+                for separator in ("\n\n", ". ", "! ", "? ", "; ", ", ", " ")
+            ]
+            cut = max(candidates)
+            if cut < minimum:
+                cut = limit
+            elif window[cut : cut + 2] in {". ", "! ", "? ", "; ", ", "}:
+                cut += 1
+            chunk = clean[:cut].strip()
+            if chunk:
+                chunks.append(chunk)
+            clean = clean[cut:].strip()
+        if clean:
+            chunks.append(clean)
+        return chunks or [""]
+
+    @staticmethod
+    def _synthesize_chunk(text: str, output: Path, settings: dict[str, str]) -> None:
         import edge_tts
 
         last_error: Exception | None = None

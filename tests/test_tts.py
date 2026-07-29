@@ -85,6 +85,13 @@ class TtsServiceTests(unittest.TestCase):
         )
         self.assertEqual(restored["audio_assets"], [])
 
+    def test_long_text_is_split_on_readable_boundaries(self) -> None:
+        text = ("Первое предложение. Второе предложение! " * 180).strip()
+        chunks = self.service._split_text_chunks(text, limit=240)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(0 < len(chunk) <= 240 for chunk in chunks))
+        self.assertEqual(" ".join(chunks).split(), text.split())
+
     def test_chapter_versions_remain_isolated_and_become_stale(self) -> None:
         with (
             patch.object(self.service, "require_available"),
@@ -121,6 +128,45 @@ class TtsServiceTests(unittest.TestCase):
             self.project["uuid"], include_details=True
         )
         self.assertTrue(all(item["is_stale"] for item in changed["audio_assets"]))
+
+    def test_video_master_uses_active_chapter_audio_in_book_order(self) -> None:
+        second = self.repository.create_chapter(
+            self.project["uuid"],
+            title="Вторая глава",
+            content="Вторая нейтральная глава.",
+        )
+        with (
+            patch.object(self.service, "require_available"),
+            patch.object(self.service, "_synthesize", self.fake_synthesize),
+            patch.object(self.service, "_audio_duration", return_value=2.5),
+        ):
+            first_job = self.wait_for_job(
+                self.service.queue_chapter(
+                    self.project["uuid"], self.chapter["id"]
+                )["uuid"]
+            )
+            second_job = self.wait_for_job(
+                self.service.queue_chapter(
+                    self.project["uuid"], second["id"]
+                )["uuid"]
+            )
+        self.assertEqual(first_job["status"], "done")
+        self.assertEqual(second_job["status"], "done")
+
+        def fake_concat(parts: list[Path], output: Path, **_: object) -> None:
+            output.write_bytes(b"".join(path.read_bytes() for path in parts))
+
+        with patch.object(self.service, "_concat_mp3_files", fake_concat):
+            master = self.service.build_video_master(self.project["uuid"])
+        self.assertEqual(len(master["source_asset_ids"]), 2)
+        self.assertEqual(
+            [item["chapter_id"] for item in master["chapters"]],
+            [self.chapter["id"], second["id"]],
+        )
+        self.assertEqual(master["chapters"][0]["start_seconds"], 0)
+        self.assertEqual(master["chapters"][1]["start_seconds"], 2.5)
+        self.assertEqual(master["duration"], 5.0)
+        self.assertTrue((self.user_data / master["file_path"]).is_file())
 
 
 if __name__ == "__main__":

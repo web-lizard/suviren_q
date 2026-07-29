@@ -14,7 +14,8 @@
           <button type="button" role="tab" :aria-selected="activeWorkspace === 'book'"
                   :class="{ active: activeWorkspace === 'book' }" @click="setWorkspace('book')">Книга</button>
           <button type="button" role="tab" :aria-selected="activeWorkspace === 'video'"
-                  :class="{ active: activeWorkspace === 'video' }" @click="setWorkspace('video')">Видео</button>
+                  :class="{ active: activeWorkspace === 'video' }" @click="setWorkspace('video')"
+                  @dragover.prevent @drop.prevent="dropBookAudioOnVideoTab">Видео</button>
         </div>
         <label class="global-project-picker">
           <span>Проект</span>
@@ -72,6 +73,9 @@
       <input ref="assetInput" class="visually-hidden" type="file" multiple
              accept="audio/*,video/*,image/png,image/jpeg,image/webp,image/gif" @change="onAssetInput" />
       <input ref="projectInput" class="visually-hidden" type="file" accept="application/json,.json" @change="onProjectInput" />
+      <input ref="bookChapterImageInput" class="visually-hidden" type="file"
+             accept="image/png,image/jpeg,image/webp,image/bmp,image/gif"
+             @change="onBookChapterImageInput" />
     </header>
 
     <main v-if="activeWorkspace === 'video'" class="workspace">
@@ -163,6 +167,11 @@
             </span>
           </button>
 
+          <div v-if="project.captions?.enabled && currentReadingCaption"
+               class="reading-caption" aria-live="off">
+            {{ currentReadingCaption }}
+          </div>
+
           <a class="telegram-qr" :href="TELEGRAM_URL" target="_blank" rel="noopener noreferrer"
              title="Telegram · Temple of Lizard" draggable="false" @pointerdown.stop @click.stop>
             <span class="telegram-qr-code">
@@ -243,6 +252,10 @@
                 <span><b>Визуализатор</b><small>Реагирует на воспроизведение</small></span>
                 <input v-model="project.layers.visualizer.visible" type="checkbox" /><i></i>
               </label>
+              <label class="switch-row">
+                <span><b>Текст озвучки</b><small>Показывать читаемый фрагмент на экране и в MP4</small></span>
+                <input v-model="project.captions.enabled" type="checkbox" /><i></i>
+              </label>
             </div>
 
             <div class="project-readiness">
@@ -287,6 +300,12 @@
             </label>
             <div class="readonly-row"><span>Конец</span><b>{{ formatTimecode(chapterEnd(selectedChapter.id)) }}</b></div>
             <div class="readonly-row"><span>Длительность</span><b>{{ formatTime(chapterEnd(selectedChapter.id) - selectedChapter.start_seconds, true) }}</b></div>
+            <label class="field-label">Изображение главы
+              <select v-model="selectedChapter.imageAssetId">
+                <option :value="null">Общий фон проекта</option>
+                <option v-for="image in imageAssets" :key="image.id" :value="image.id">{{ image.name }}</option>
+              </select>
+            </label>
             <button type="button" class="jump-button" @click="seekTo(selectedChapter.start_seconds)">Перейти к главе</button>
             <button type="button" class="danger-button" @click="removeChapter(selectedChapter.id)">Удалить главу</button>
           </template>
@@ -387,24 +406,23 @@
           <textarea ref="bookTextEditor" v-model="bookChapterContent" class="book-text-editor"
                     spellcheck="true" aria-label="Текст главы"
                     placeholder="Начните писать…" @input="markBookDirty"></textarea>
-          <div v-if="bookPlayerAsset" class="book-audio-player">
-            <audio ref="bookAudioEl" :src="bookPlayerUrl" preload="metadata"
-                   @loadedmetadata="onBookAudioMetadata" @timeupdate="onBookAudioTime"
-                   @play="bookPlayerPlaying = true" @pause="bookPlayerPlaying = false"
-                   @ended="bookPlayerPlaying = false"></audio>
+          <div v-if="bookPlayerAsset" class="book-audio-player"
+               :draggable="!bookPlayerAsset.temporary"
+               @dragstart="startBookAudioDrag(bookPlayerAsset, $event)">
             <div class="book-player-copy">
               <small>{{ bookPlayerAsset.temporary ? 'Проба голоса' : 'Озвучка главы' }}</small>
               <b>{{ bookPlayerTitle }}</b>
+              <span>{{ formatTime(bookPlayerDuration, true) }} · {{ voiceShortLabel(bookPlayerAsset.voice) }}</span>
             </div>
+            <audio ref="bookAudioEl" :src="bookPlayerUrl" controls preload="metadata"
+                   @loadedmetadata="onBookAudioMetadata" @timeupdate="onBookAudioTime"
+                   @play="bookPlayerPlaying = true" @pause="bookPlayerPlaying = false"
+                   @ended="bookPlayerPlaying = false"></audio>
             <button type="button" :disabled="!previousChapterAudio" title="Предыдущая версия" @click="selectAdjacentChapterAudio(-1)">‹</button>
-            <button class="book-player-play" type="button" @click="toggleBookPlayer">{{ bookPlayerPlaying ? 'Ⅱ' : '▶' }}</button>
-            <button type="button" title="Остановить" @click="stopBookPlayer">■</button>
             <button type="button" :disabled="!nextChapterAudio" title="Следующая версия" @click="selectAdjacentChapterAudio(1)">›</button>
-            <span>{{ formatTime(bookPlayerTime, true) }}</span>
-            <input class="book-player-scrubber" type="range" min="0" :max="Math.max(bookPlayerDuration, .01)"
-                   step=".01" :value="bookPlayerTime" @input="seekBookPlayer(Number($event.target.value))" />
-            <span>{{ formatTime(bookPlayerDuration, true) }}</span>
-            <label title="Громкость"><span>◖</span><input v-model.number="bookPlayerVolume" type="range" min="0" max="1" step=".01" @input="applyBookPlayerVolume" /></label>
+            <button v-if="!bookPlayerAsset.temporary" class="book-player-video" type="button"
+                    title="Передать эту озвучку в видео"
+                    @click="sendBookAudioToVideo(bookPlayerAsset)">→ В видео</button>
           </div>
           <footer class="book-editor-footer">
             <span>{{ bookWordCount.toLocaleString('ru-RU') }} слов</span>
@@ -445,6 +463,25 @@
               <label class="field-label">Описание
                 <textarea v-model="bookMetadata.description" rows="4" @change="saveBookMetadata"></textarea>
               </label>
+            </details>
+
+            <details open>
+              <summary>Изображение главы</summary>
+              <div class="book-chapter-image-panel">
+                <div class="book-chapter-image-preview"
+                     :style="currentBookChapterImageUrl ? { backgroundImage: `url('${currentBookChapterImageUrl}')` } : {}">
+                  <span v-if="!currentBookChapterImageUrl">У главы пока нет отдельной картинки</span>
+                </div>
+                <p>В видеокниге изображение этой главы заменит общий фон на время её озвучки.</p>
+                <div>
+                  <button class="book-primary" type="button" :disabled="!currentBookChapter"
+                          @click="bookChapterImageInput?.click()">
+                    {{ currentBookChapterImage ? 'Заменить картинку' : 'Выбрать картинку' }}
+                  </button>
+                  <button v-if="currentBookChapterImage" class="book-secondary" type="button"
+                          @click="removeBookChapterImage">Убрать</button>
+                </div>
+              </div>
             </details>
 
             <details open>
@@ -514,7 +551,8 @@
                 <p v-if="!currentChapterAudios.length" class="book-audio-empty">
                   У текущей главы пока нет озвучки. Выберите голос и создайте первую версию.
                 </p>
-                <article v-for="asset in currentChapterAudios" :key="asset.id"
+                <article v-for="asset in currentChapterAudios" :key="asset.id" draggable="true"
+                         @dragstart="startBookAudioDrag(asset, $event)"
                          :class="{ active: asset.is_active, stale: asset.is_stale, selected: selectedBookAudioId === asset.id }">
                   <button class="audio-version-main" type="button" @click="selectBookAudio(asset, true)">
                     <span><b>{{ asset.title || `Версия ${asset.version_number}` }}</b><i v-if="asset.is_active">активная</i></span>
@@ -795,6 +833,7 @@ function freshProject() {
     videoAssetId: null,
     coverAssetId: null,
     backgroundAssetId: null,
+    captions: { enabled: false, wordsPerCard: 14 },
     materials: [],
     chapters: [],
     scenes: [{ id: uid('scene'), name: 'Основная сцена', start: 0, end: 60, backgroundAssetId: null }],
@@ -854,6 +893,7 @@ const saving = ref(false)
 const hydrating = ref(true)
 const assetInput = ref(null)
 const projectInput = ref(null)
+const bookChapterImageInput = ref(null)
 const bookTextEditor = ref(null)
 const bookAudioEl = ref(null)
 const audioEl = ref(null)
@@ -941,6 +981,20 @@ const currentChapterAudio = computed(() => (
   currentChapterAudios.value.find((asset) => asset.is_active)
   || currentChapterAudios.value[0]
   || null
+))
+const currentBookChapterImages = computed(() => (
+  (activeProjectRecord.value?.visual_assets || [])
+    .filter((asset) => (
+      asset.chapter_id === currentBookChapterId.value
+      && asset.asset_type === 'chapter-image'
+    ))
+    .sort((a, b) => Number(b.id) - Number(a.id))
+))
+const currentBookChapterImage = computed(() => currentBookChapterImages.value[0] || null)
+const currentBookChapterImageUrl = computed(() => (
+  currentBookChapterImage.value?.file_path
+    ? mediaUrl(currentBookChapterImage.value.file_path)
+    : ''
 ))
 const selectedBookAudio = computed(() => (
   currentChapterAudios.value.find((asset) => asset.id === selectedBookAudioId.value)
@@ -1047,7 +1101,12 @@ const currentScene = computed(() => {
     || null
 })
 
-const sceneBackgroundAsset = computed(() => assetById(currentScene.value?.backgroundAssetId) || backgroundAsset.value)
+const currentChapterImageAsset = computed(() => assetById(currentChapter.value?.imageAssetId))
+const sceneBackgroundAsset = computed(() => (
+  currentChapterImageAsset.value
+  || assetById(currentScene.value?.backgroundAssetId)
+  || backgroundAsset.value
+))
 const backgroundSource = computed(() => assetUrl(sceneBackgroundAsset.value))
 const backgroundStyle = computed(() => backgroundSource.value
   ? { backgroundImage: `url("${backgroundSource.value.replaceAll('"', '%22')}")` }
@@ -1055,6 +1114,17 @@ const backgroundStyle = computed(() => backgroundSource.value
 const backgroundThumbnailStyle = computed(() => backgroundSource.value
   ? { backgroundImage: `url("${backgroundSource.value.replaceAll('"', '%22')}")` }
   : {})
+const currentReadingCaption = computed(() => {
+  if (!project.captions?.enabled || !currentChapter.value?.text) return ''
+  const start = Number(currentChapter.value.start_seconds) || 0
+  const end = Math.max(start + 0.1, Number(currentChapter.value.end_seconds) || start + 0.1)
+  const fraction = Math.max(0, Math.min(0.999999, (currentTime.value - start) / (end - start)))
+  const chunks = readingCaptionChunks(
+    currentChapter.value.text,
+    Number(project.captions.wordsPerCard) || 14,
+  )
+  return chunks[Math.min(chunks.length - 1, Math.floor(fraction * chunks.length))] || ''
+})
 
 const selectedAsset = computed(() => selection.type === 'asset' ? assetById(selection.id) : null)
 const selectedChapter = computed(() => selection.type === 'chapter' ? project.chapters.find((item) => item.id === selection.id) || null : null)
@@ -1174,6 +1244,16 @@ function assetUrl(asset) {
   return asset.src || mediaUrl(asset.serverPath)
 }
 
+function readingCaptionChunks(text, wordsPerCard = 14) {
+  const words = String(text || '').trim().split(/\s+/).filter(Boolean)
+  const size = Math.max(6, Math.min(28, Number(wordsPerCard) || 14))
+  const chunks = []
+  for (let index = 0; index < words.length; index += size) {
+    chunks.push(words.slice(index, index + size).join(' '))
+  }
+  return chunks
+}
+
 function normalizeChapter(item, index) {
   const start = Number(item.start_seconds ?? parseTimecode(item.start ?? 0)) || 0
   const end = Number(item.end_seconds ?? parseTimecode(item.end ?? 0)) || 0
@@ -1192,6 +1272,7 @@ function normalizeProject(value) {
   const normalized = {
     ...base,
     ...source,
+    captions: { ...base.captions, ...(source.captions || {}) },
     renderPreset: RENDER_PRESETS[source.renderPreset] ? source.renderPreset : base.renderPreset,
     materials: Array.isArray(source.materials) ? source.materials.map((asset) => ({
       ...asset,
@@ -1464,6 +1545,110 @@ function addBookAudioToVideo(record) {
   }
 }
 
+function addBookVisualsToVideo(record) {
+  const latestByChapter = new Map()
+  for (const visual of record?.visual_assets || []) {
+    if (visual.asset_type !== 'chapter-image' || !visual.chapter_id || !visual.file_path) continue
+    const current = latestByChapter.get(visual.chapter_id)
+    if (!current || Number(visual.id) > Number(current.id)) {
+      latestByChapter.set(visual.chapter_id, visual)
+    }
+  }
+  const livePaths = new Set([...latestByChapter.values()].map((visual) => visual.file_path))
+  const retainedMaterials = project.materials.filter((item) => (
+    item.role !== 'chapter-image' || livePaths.has(item.serverPath)
+  ))
+  project.materials.splice(0, project.materials.length, ...retainedMaterials)
+  const materialByChapter = new Map()
+  for (const [chapterId, visual] of latestByChapter) {
+    let metadata = {}
+    try { metadata = JSON.parse(visual.metadata_json || '{}') } catch { /* optional metadata */ }
+    let material = project.materials.find((item) => item.serverPath === visual.file_path)
+    if (!material) {
+      material = {
+        id: `chapter-image-${visual.id}`,
+        type: 'image',
+        name: visual.title || `Глава ${chapterId}`,
+        size: Number(metadata.size || 0),
+        serverPath: visual.file_path,
+        src: mediaUrl(visual.file_path),
+        status: 'ready',
+        progress: 1,
+        chapterId,
+        role: 'chapter-image',
+      }
+      project.materials.push(material)
+    }
+    materialByChapter.set(chapterId, material)
+  }
+  return materialByChapter
+}
+
+function syncBookChaptersToVideo(record, master = null) {
+  addBookAudioToVideo(record)
+  const images = addBookVisualsToVideo(record)
+  if (!project.coverAssetId && images.size) {
+    project.coverAssetId = images.values().next().value.id
+  }
+  const timings = new Map((master?.chapters || []).map((item) => [item.chapter_id, item]))
+  const existing = new Map(project.chapters.map((item) => [item.chapterId, item]))
+  let cursor = 0
+  project.chapters = (record?.chapters || []).map((chapter, index) => {
+    const timing = timings.get(chapter.id)
+    const previous = existing.get(chapter.id) || {}
+    const start = timing ? Number(timing.start_seconds) : Math.max(cursor, Number(previous.start_seconds) || index)
+    const end = timing ? Number(timing.end_seconds) : Math.max(start + 1, Number(previous.end_seconds) || start + 1)
+    cursor = end
+    return {
+      ...previous,
+      id: previous.id || `book-chapter-${chapter.id}`,
+      chapterId: chapter.id,
+      title: chapter.title,
+      text: chapter.content,
+      start_seconds: start,
+      end_seconds: end,
+      imageAssetId: images.get(chapter.id)?.id || null,
+    }
+  })
+  if (master?.file_path) {
+    const retainedMaterials = project.materials.filter((item) => (
+      item.role !== 'book-master' || item.serverPath === master.file_path
+    ))
+    project.materials.splice(0, project.materials.length, ...retainedMaterials)
+    let material = project.materials.find((item) => item.serverPath === master.file_path)
+    if (!material) {
+      material = {
+        id: `book-master-${master.source_asset_ids.join('-')}`,
+        type: 'audio',
+        name: `${record?.book?.title || record?.title || 'Книга'} · мастер.mp3`,
+        size: Number(master.file_size || 0),
+        serverPath: master.file_path,
+        src: mediaUrl(master.file_path),
+        status: 'ready',
+        progress: 1,
+        role: 'book-master',
+      }
+      project.materials.push(material)
+    }
+    project.audioAssetId = material.id
+    const total = Number(master.duration) || cursor
+    for (const scene of project.scenes) scene.end = Math.max(scene.start + 0.1, total)
+  }
+}
+
+async function prepareBookVideoProject(record) {
+  let master = null
+  if ((record?.audio_assets || []).length) {
+    master = await apiRequest(
+      `/projects/${encodeURIComponent(activeProjectUuid.value)}/video-audio/master`,
+      { method: 'POST' },
+    )
+  }
+  syncBookChaptersToVideo(record, master)
+  dirty.value = true
+  return master
+}
+
 async function publishVideoCompatibility(projectUuid, editionId, payload) {
   if (!backend.online || !projectUuid || !editionId) return
   await apiRequest(
@@ -1514,7 +1699,7 @@ async function switchProject(projectUuid, { initial = false } = {}) {
     activeVideoEditionId.value = edition?.id || null
     if (edition) {
       replaceProject(edition.settings)
-      addBookAudioToVideo(record)
+      syncBookChaptersToVideo(record)
       await publishVideoCompatibility(projectUuid, edition.id, serializeProject())
     } else {
       const emptyVideo = freshProject()
@@ -2041,12 +2226,24 @@ async function deleteBookAudio(asset) {
 async function sendBookAudioToVideo(asset) {
   if (!asset.is_active) await activateBookAudio(asset)
   await openBookInVideo()
-  const material = project.materials.find((item) => item.serverPath === asset.file_path)
-  if (material) {
-    project.audioAssetId = material.id
-    dirty.value = true
+  if (activeWorkspace.value === 'video') {
     await saveProject({ silent: true })
+    setNotice('Озвучка собрана в мастер-аудио и добавлена на видеотаймлайн', 'success', 6500)
   }
+}
+
+function startBookAudioDrag(asset, event) {
+  if (!asset?.id || asset.temporary || !event?.dataTransfer) return
+  event.dataTransfer.effectAllowed = 'copy'
+  event.dataTransfer.setData('application/x-bookender-audio-id', String(asset.id))
+  event.dataTransfer.setData('text/plain', asset.title || asset.file_path || 'Озвучка главы')
+}
+
+async function dropBookAudioOnVideoTab(event) {
+  const assetId = Number(event.dataTransfer?.getData('application/x-bookender-audio-id'))
+  const asset = (activeProjectRecord.value?.audio_assets || []).find((item) => item.id === assetId)
+  if (!asset) return
+  await sendBookAudioToVideo(asset)
 }
 
 async function openTtsLog() {
@@ -2081,7 +2278,7 @@ async function createVideoEditionForActiveBook() {
     })
     activeVideoEditionId.value = edition.id
     replaceProject(edition.settings)
-    addBookAudioToVideo(activeProjectRecord.value)
+    await prepareBookVideoProject(activeProjectRecord.value)
     await publishVideoCompatibility(activeProjectUuid.value, edition.id, serializeProject())
     const refreshed = await apiRequest(`/projects/${encodeURIComponent(activeProjectUuid.value)}`)
     activeProjectRecord.value = refreshed
@@ -2100,7 +2297,19 @@ async function openBookInVideo() {
     await createVideoEditionForActiveBook()
     if (!activeVideoEditionId.value) return
   }
-  addBookAudioToVideo(activeProjectRecord.value)
+  try {
+    const master = await prepareBookVideoProject(activeProjectRecord.value)
+    if (master?.missing_chapter_ids?.length) {
+      setNotice(
+        `В видео переданы готовые озвучки. Без аудио пока глав: ${master.missing_chapter_ids.length}.`,
+        'warning',
+        7000,
+      )
+    }
+  } catch (error) {
+    syncBookChaptersToVideo(activeProjectRecord.value)
+    setNotice(`Книга открыта без мастер-аудио: ${error.message}`, 'warning', 7000)
+  }
   if (activeVideoEditionId.value) {
     await publishVideoCompatibility(
       activeProjectUuid.value,
@@ -2301,6 +2510,58 @@ function onProjectInput(event) {
 function onAssetInput(event) {
   importFiles(event.target.files)
   event.target.value = ''
+}
+
+async function onBookChapterImageInput(event) {
+  const file = event.target.files?.[0]
+  event.target.value = ''
+  const chapterId = currentBookChapterId.value
+  if (!file || !chapterId || !activeProjectUuid.value) return
+  try {
+    await apiRequest(
+      `/projects/${encodeURIComponent(activeProjectUuid.value)}/chapters/${chapterId}/image?filename=${encodeURIComponent(file.name)}`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': file.type || 'application/octet-stream' },
+        body: file,
+      },
+    )
+    const record = await refreshActiveProjectRecord()
+    if (activeVideoEditionId.value) {
+      syncBookChaptersToVideo(record)
+      await publishVideoCompatibility(
+        activeProjectUuid.value,
+        activeVideoEditionId.value,
+        serializeProject(),
+      )
+    }
+    setNotice('Изображение главы сохранено и будет использовано в видеокниге', 'success', 6000)
+  } catch (error) {
+    setNotice(`Не удалось сохранить изображение главы: ${error.message}`, 'error', 7000)
+  }
+}
+
+async function removeBookChapterImage() {
+  const chapterId = currentBookChapterId.value
+  if (!chapterId || !activeProjectUuid.value) return
+  try {
+    await apiRequest(
+      `/projects/${encodeURIComponent(activeProjectUuid.value)}/chapters/${chapterId}/image`,
+      { method: 'DELETE' },
+    )
+    const record = await refreshActiveProjectRecord()
+    if (activeVideoEditionId.value) {
+      syncBookChaptersToVideo(record)
+      await publishVideoCompatibility(
+        activeProjectUuid.value,
+        activeVideoEditionId.value,
+        serializeProject(),
+      )
+    }
+    setNotice('Изображение главы убрано', 'success')
+  } catch (error) {
+    setNotice(`Не удалось убрать изображение: ${error.message}`, 'error')
+  }
 }
 
 function onDrop(event) {
