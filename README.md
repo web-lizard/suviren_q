@@ -1,18 +1,33 @@
-# BOOK WUNDERWAFFE Studio
+# Bookender Studio
 
 <p align="center">
-  <img src="assets/book-wunderwaffe-icon.png" width="180" alt="BOOK WUNDERWAFFE Studio icon" />
+  <img src="assets/book-wunderwaffe-icon.png" width="180" alt="Bookender Studio icon" />
 </p>
 
 > **Local-first Audiobook Production Suite** — превращает мастер-аудио и разметку глав в аккуратный, готовый к публикации видеорелиз.
 
-![Version](https://img.shields.io/badge/version-1.1.0-ffb731?style=flat-square)
+![Version](https://img.shields.io/badge/version-2.0.0-ffb731?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows-4b8bbe?style=flat-square)
 ![Vue](https://img.shields.io/badge/Vue-3-42b883?style=flat-square)
 ![FastAPI](https://img.shields.io/badge/FastAPI-local-009688?style=flat-square)
 ![FFmpeg](https://img.shields.io/badge/FFmpeg-GPU%20%2F%20CPU-5cb85c?style=flat-square)
 
-BOOK WUNDERWAFFE Studio — локальная production-система для сборки аудиокниг в готовые видео. Она импортирует мастер-аудио, обложку, фон и главы из REAPER/RPP, показывает итоговую композицию в визуальном редакторе, синхронизирует waveform и прогресс, автоматически подбирает типографику и собирает стабильный MP4 через FFmpeg.
+Bookender Studio — локальная многопроектная desktop-экосистема для написания
+книг, озвучивания глав и сборки видеокниг. Вкладка «Книга» хранит текст,
+главы и TTS в SQLite; вкладка «Видео» сохраняет отдельные media, сцены и
+timeline каждого проекта и использует проверенный FFmpeg renderer.
+
+Рабочая база находится в `user_data/bookender.db`, пользовательские файлы —
+в `user_data/projects/<uuid>`. Legacy-книги импортируются идемпотентно:
+
+```powershell
+python -m bookender.cli init
+python book_wunderwaffe_desktop.py
+```
+
+Подробности: [RUNBOOK.md](RUNBOOK.md),
+[BOOKENDER_PROJECT_ARCHITECTURE.md](BOOKENDER_PROJECT_ARCHITECTURE.md) и
+[LEGACY_IMPORT_REPORT.md](LEGACY_IMPORT_REPORT.md).
 
 Без облака, подписки и ручной сборки десятков или сотен глав.
 
