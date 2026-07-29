@@ -1,7 +1,7 @@
 # Bookender Studio
 
 <p align="center">
-  <img src="assets/book-wunderwaffe-icon.png" width="180" alt="Bookender Studio icon" />
+  <img src="assets/bookender-studio-icon.png" width="180" alt="Bookender Studio icon" />
 </p>
 
 > **Local-first Audiobook Production Suite** — превращает мастер-аудио и разметку глав в аккуратный, готовый к публикации видеорелиз.
@@ -46,7 +46,8 @@ python book_wunderwaffe_desktop.py
 - тестовый 60-секундный и полный экспорт;
 - AMD AMF, NVIDIA NVENC, Intel QSV и автоматический CPU-fallback;
 - единое кодирование мастер-аудио без разрывов AAC между главами;
-- локальная работа: материалы проекта не отправляются в сторонние сервисы.
+- локальное хранение проектов, книг, аудио и видео; только при явном запуске
+  Edge TTS выбранный текст отправляется сетевому провайдеру озвучки.
 
 ## Быстрый запуск на Windows
 

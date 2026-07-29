@@ -5,6 +5,8 @@
 1. `001_initial.sql` — проекты, книги, главы, assets, video editions,
    timeline, settings, imports и app state.
 2. `002_jobs_and_backups.sql` — фоновые TTS jobs и история backups.
+3. `003_audio_versions.sql` — metadata версий озвучки, active/stale workflow
+   и расширенные состояния TTS jobs.
 
 Запуск:
 
